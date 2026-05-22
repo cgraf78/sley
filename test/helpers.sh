@@ -261,6 +261,18 @@ _with_timeout() {
     timeout "$secs" "$@"
   elif command -v gtimeout &>/dev/null; then
     gtimeout "$secs" "$@"
+  elif command -v python3 &>/dev/null; then
+    python3 - "$secs" "$@" <<'PY'
+import subprocess
+import sys
+
+secs = float(sys.argv[1])
+cmd = sys.argv[2:]
+try:
+    raise SystemExit(subprocess.run(cmd, timeout=secs).returncode)
+except subprocess.TimeoutExpired:
+    raise SystemExit(124)
+PY
   else
     "$@"
   fi

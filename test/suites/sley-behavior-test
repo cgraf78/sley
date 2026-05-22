@@ -970,6 +970,35 @@ export MOCK_LOG="$repo/gitleaks.log"
 : >"$MOCK_LOG"
 cat >"$mockbin/gitleaks" <<'MOCK'
 #!/usr/bin/env bash
+cat >/dev/null
+printf 'gitleaks:%s\n' "$*" >>"$MOCK_LOG"
+MOCK
+chmod +x "$mockbin/gitleaks"
+cat >"$repo/stdin.py" <<'EOF'
+token = "safe"
+EOF
+(cd "$repo" && git add stdin.py && git commit -q -m "seed")
+echo 'token = "changed"' >"$repo/stdin.py"
+
+set +e
+stdin_closed_out=$(
+  cd "$repo" &&
+    GIT_CONFIG_GLOBAL="$repo/.gitconfig-test" PATH="$mockbin:$PATH" \
+      _with_timeout 2 "$SLEY" secrets </dev/zero 2>&1
+)
+stdin_closed_rc=$?
+_assert_exit "secrets: worktree scan closes gitleaks stdin" 0 "$stdin_closed_rc"
+_assert_contains "secrets: stdin-reading worktree scan ran" \
+  "gitleaks:dir --redact --no-banner -- stdin.py" "$(cat "$MOCK_LOG")"
+_assert_contains "secrets: stdin-reading worktree scan summarizes files" \
+  "sley secrets: scanned 1 file" "$stdin_closed_out"
+
+repo=$(_new_repo)
+mockbin=$(_mock_bin)
+export MOCK_LOG="$repo/gitleaks.log"
+: >"$MOCK_LOG"
+cat >"$mockbin/gitleaks" <<'MOCK'
+#!/usr/bin/env bash
 printf '%s\n' "$*" >>"$MOCK_LOG"
 cat >>"$MOCK_LOG"
 echo "clean stdout"

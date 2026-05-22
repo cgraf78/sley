@@ -609,7 +609,7 @@ _sley_secrets_scan_batch() {
     stdout_file=$(mktemp "${TMPDIR:-/tmp}/sley-secrets-stdout.XXXXXX")
     stderr_file=$(mktemp "${TMPDIR:-/tmp}/sley-secrets-stderr.XXXXXX")
     (
-      gitleaks dir "${gitleaks_args[@]}" -- "$file"
+      gitleaks dir "${gitleaks_args[@]}" -- "$file" </dev/null
     ) >"$stdout_file" 2>"$stderr_file" &
     pid=$!
     pids+=("$pid")
@@ -653,7 +653,7 @@ _sley_secrets_scan_worktree_files() {
     ! command -v cat >/dev/null 2>&1 ||
     ! command -v rm >/dev/null 2>&1; then
     for file in "${files[@]}"; do
-      if out=$(gitleaks dir "${gitleaks_args[@]}" -- "$file" 2>&1); then
+      if out=$(gitleaks dir "${gitleaks_args[@]}" -- "$file" </dev/null 2>&1); then
         scan_rc=0
       else
         scan_rc=$?
