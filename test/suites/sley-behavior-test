@@ -1,0 +1,3057 @@
+#!/usr/bin/env bash
+# sley-test — unit tests for the sley repo workflow CLI.
+#
+# Each test uses isolated temp repos and mock tools. The suite exercises
+# user-visible CLI contracts before implementation details.
+
+# shellcheck disable=SC1091,SC2030,SC2031 # dynamic sources and subshell git fixtures.
+set -o pipefail
+export NO_COLOR=1
+
+SLEY_TEST_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
+SLEY_REPO_ROOT="$(cd -- "$SLEY_TEST_DIR/.." && pwd -P)"
+export SLEY_REPO_ROOT
+
+# shellcheck source=../helpers.sh
+. "$SLEY_TEST_DIR/helpers.sh"
+
+_require_compatible_libc "sley-test"
+
+SLEY="$SLEY_REPO_ROOT/bin/sley"
+SLEY_TEST_HOME="$HOME"
+SLEY_TEST_XDG_CONFIG_HOME=$(_tmpdir)/xdg-config
+SLEY_TEST_XDG_CACHE_HOME=$(_tmpdir)/xdg-cache
+
+echo "=== sley: public shell API ==="
+
+shell_completion_output=$(
+  SLEY_REPO_ROOT="$SLEY_REPO_ROOT" bash --noprofile --norc -c '
+    source "$SLEY_REPO_ROOT/share/sley/shell.sh"
+    COMP_WORDS=(sley "")
+    COMP_CWORD=1
+    _sley_shell_complete
+    printf "cmd:%s\n" "${COMPREPLY[@]}"
+    COMP_WORDS=(sley verify "")
+    COMP_CWORD=2
+    _sley_shell_complete
+    printf "opt:%s\n" "${COMPREPLY[@]}"
+    printf "schema:%s\n" "${SLEY_VERIFY_SCHEMA:-}"
+    printf "schema_fn:%s\n" "$(sley_verify_schema_path)"
+  '
+)
+_assert_contains "shell api: command completion includes verify" \
+  "cmd:verify" "$shell_completion_output"
+_assert_not_contains "shell api: command completion omits removed workflow" \
+  "cmd:workflow" "$shell_completion_output"
+_assert_contains "shell api: verify completion includes --commit" \
+  "opt:--commit" "$shell_completion_output"
+_assert_contains "shell api: verify completion includes --include-untracked" \
+  "opt:--include-untracked" "$shell_completion_output"
+_assert_contains "shell api: verify completion includes --repo-wide" \
+  "opt:--repo-wide" "$shell_completion_output"
+_assert_contains "shell api: verify completion includes --path" \
+  "opt:--path" "$shell_completion_output"
+_assert_contains "shell api: verify completion includes --json" \
+  "opt:--json" "$shell_completion_output"
+_assert_contains "shell api: exposes verify schema env var" \
+  "schema:$SLEY_REPO_ROOT/share/sley/schemas/verify.schema.json" \
+  "$shell_completion_output"
+_assert_contains "shell api: exposes verify schema helper" \
+  "schema_fn:$SLEY_REPO_ROOT/share/sley/schemas/verify.schema.json" \
+  "$shell_completion_output"
+
+cached_loader=$(_tmpdir)/sley.bash
+cp "$SLEY_REPO_ROOT/share/sley/shell.sh" "$cached_loader"
+cached_bin=$(_mock_bin)
+cat >"$cached_bin/shdeps" <<EOF
+#!/usr/bin/env bash
+if [[ "\$1" == "dep-file" &&
+  "\$2" == "cgraf78/sley" &&
+  "\$3" == "share/sley/schemas/verify.schema.json" ]]; then
+  printf '%s\n' "$SLEY_REPO_ROOT/share/sley/schemas/verify.schema.json"
+  exit 0
+fi
+exit 1
+EOF
+chmod +x "$cached_bin/shdeps"
+cached_schema_output=$(
+  PATH="$cached_bin:$PATH" bash --noprofile --norc -c '
+    source "$1"
+    printf "%s\n" "${SLEY_VERIFY_SCHEMA:-}"
+  ' bash "$cached_loader"
+)
+_assert_eq "shell api: cached loader resolves schema through shdeps" \
+  "$SLEY_REPO_ROOT/share/sley/schemas/verify.schema.json" \
+  "$cached_schema_output"
+
+if command -v zsh >/dev/null 2>&1; then
+  zsh_completion_output=$(
+    SLEY_REPO_ROOT="$SLEY_REPO_ROOT" zsh -fc '
+      autoload -Uz compinit
+      compinit -D -i
+      source "$SLEY_REPO_ROOT/share/sley/shell.sh"
+      compadd() {
+        while [[ "$1" == "--" ]]; do
+          shift
+        done
+        printf "match:%s\n" "$@"
+      }
+      words=(sley "")
+      CURRENT=2
+      _sley_zsh_complete
+      words=(sley verify "")
+      CURRENT=3
+      _sley_zsh_complete
+      print -r -- "registered=${+functions[_sley_zsh_complete]}"
+    '
+  )
+  _assert_contains "shell api: zsh completion function registers" \
+    "registered=1" "$zsh_completion_output"
+  _assert_contains "shell api: zsh command completion includes verify" \
+    "match:verify" "$zsh_completion_output"
+  _assert_contains "shell api: zsh verify completion includes --commit" \
+    "match:--commit" "$zsh_completion_output"
+  _assert_contains "shell api: zsh verify completion includes --include-untracked" \
+    "match:--include-untracked" "$zsh_completion_output"
+  _assert_contains "shell api: zsh verify completion includes --repo-wide" \
+    "match:--repo-wide" "$zsh_completion_output"
+  _assert_contains "shell api: zsh verify completion includes --path" \
+    "match:--path" "$zsh_completion_output"
+  _assert_contains "shell api: zsh verify completion includes --json" \
+    "match:--json" "$zsh_completion_output"
+  zsh_deferred_output=$(
+    SLEY_REPO_ROOT="$SLEY_REPO_ROOT" zsh -fc '
+      source "$SLEY_REPO_ROOT/share/sley/shell.sh"
+      autoload -Uz compinit
+      compinit -D -i
+      for hook in "${precmd_functions[@]}"; do "$hook"; done
+      print -r -- "registered=${_comps[sley]:-}"
+    '
+  )
+  _assert_contains "shell api: zsh registration defers until compinit" \
+    "registered=_sley_zsh_complete" "$zsh_deferred_output"
+else
+  echo "  SKIP: shell api zsh completion (zsh not installed)"
+fi
+
+_sley_test_xdg_config_home() {
+  # sley intentionally honors XDG_CONFIG_HOME, but this suite should not inherit
+  # a runner's user verify registry. Default calls get an empty suite-owned config
+  # root; tests that override HOME get that mock home's .config so they can
+  # exercise user-config discovery hermetically.
+  if [[ "$HOME" == "$SLEY_TEST_HOME" ]]; then
+    printf '%s\n' "$SLEY_TEST_XDG_CONFIG_HOME"
+  else
+    printf '%s/.config\n' "$HOME"
+  fi
+}
+
+_new_repo() {
+  local repo
+  repo=$(_tmpdir)
+  (
+    cd "$repo" || exit 1
+    export GIT_CONFIG_GLOBAL="$repo/.gitconfig-test"
+    : >"$GIT_CONFIG_GLOBAL"
+    git init -q
+    git config user.email test@test.local
+    git config user.name "Test User"
+    mkdir -p "$repo/.hooks"
+    git config core.hooksPath "$repo/.hooks"
+    git config commit.gpgsign false
+  )
+  (cd "$repo" && pwd -P)
+}
+
+_no_sley_tools_path() {
+  local bin
+  bin=$(_mock_bin)
+  ln -s "$(command -v bash)" "$bin/bash"
+  printf '%s:/usr/bin:/bin' "$bin"
+}
+
+_run_sley() {
+  local repo="$1"
+  shift
+  local xdg_config_home
+  xdg_config_home=$(_sley_test_xdg_config_home)
+  __SLEY_OUT=$(
+    cd "$repo" &&
+      XDG_CONFIG_HOME="$xdg_config_home" \
+        XDG_CACHE_HOME="$SLEY_TEST_XDG_CACHE_HOME" \
+        GIT_CONFIG_GLOBAL="$repo/.gitconfig-test" "$SLEY" "$@" 2>&1
+  )
+  __SLEY_RC=$?
+}
+
+_run_sley_from() {
+  local repo="$1" dir="$2"
+  shift 2
+  local xdg_config_home
+  xdg_config_home=$(_sley_test_xdg_config_home)
+  __SLEY_OUT=$(
+    cd "$dir" &&
+      XDG_CONFIG_HOME="$xdg_config_home" \
+        XDG_CACHE_HOME="$SLEY_TEST_XDG_CACHE_HOME" \
+        GIT_CONFIG_GLOBAL="$repo/.gitconfig-test" "$SLEY" "$@" 2>&1
+  )
+  __SLEY_RC=$?
+}
+
+_copy_sley_libs() {
+  local home="$1"
+  local root="$SLEY_REPO_ROOT"
+  local install="$home/sley-root"
+  mkdir -p "$install/bin" "$install/lib/sley"
+  cp "$root/lib/sley/sley.sh" "$install/lib/sley/sley.sh"
+  cp "$root/lib/sley/repo.sh" "$install/lib/sley/repo.sh"
+  cp "$root/lib/sley/scope.sh" "$install/lib/sley/scope.sh"
+  cp "$root/lib/sley/hooks.sh" "$install/lib/sley/hooks.sh"
+  cp "$root/lib/sley/verify.sh" "$install/lib/sley/verify.sh"
+  cp "$root/lib/sley/verify-cache.py" "$install/lib/sley/verify-cache.py"
+  cp "$root/lib/sley/ready.sh" "$install/lib/sley/ready.sh"
+  cp "$root/bin/sley" "$install/bin/sley"
+}
+
+_mock_ready_pass_tools() {
+  local bin="$1"
+  cat >"$bin/autolint" <<'MOCK'
+#!/usr/bin/env bash
+exit 0
+MOCK
+  cat >"$bin/gitleaks" <<'MOCK'
+#!/usr/bin/env bash
+exit 0
+MOCK
+  chmod +x "$bin/autolint" "$bin/gitleaks"
+}
+
+echo "=== sley: shdeps-installed symlink entry point ==="
+
+symlink_bin=$(_tmpdir)/bin
+mkdir -p "$symlink_bin"
+ln -s "$SLEY" "$symlink_bin/sley"
+
+set +e
+symlink_help=$("$symlink_bin/sley" --help 2>&1)
+symlink_rc=$?
+_assert_exit "symlink entry: resolves dependency library" 0 "$symlink_rc"
+_assert_contains "symlink entry: help still comes from sley" "Usage: sley" "$symlink_help"
+
+echo
+echo "=== sley: explicit bare repo fallback ==="
+
+home=$(_tmpdir)
+home=$(cd -- "$home" && pwd -P)
+mkdir -p "$home/sub" "$home/other"
+git --git-dir="$home/.bare-git" --work-tree="$home" init -q
+git --git-dir="$home/.bare-git" --work-tree="$home" config user.email test@test.local
+git --git-dir="$home/.bare-git" --work-tree="$home" config user.name "Test User"
+printf 'one\n' >"$home/sub/in-scope.txt"
+printf 'one\n' >"$home/other/out-of-scope.txt"
+git --git-dir="$home/.bare-git" --work-tree="$home" add sub/in-scope.txt other/out-of-scope.txt
+git --git-dir="$home/.bare-git" --work-tree="$home" commit -q -m "seed"
+printf 'untracked\n' >"$home/untracked.txt"
+
+set +e
+default_bare_home_out=$(
+  cd "$home" || exit 1
+  unset SLEY_BARE_REPO_GIT_DIR SLEY_BARE_REPO_WORK_TREE SLEY_SKIP_BARE_REPO_FALLBACK
+  HOME="$home" "$symlink_bin/sley" status 2>&1
+)
+default_bare_home_rc=$?
+_assert_exit "bare repo fallback: default leaves non-repo unsupported" 2 "$default_bare_home_rc"
+_assert_contains "bare repo fallback: default reports unsupported repo" "unsupported repo" "$default_bare_home_out"
+
+bare_home_status=$(
+  cd "$home" || exit 1
+  unset SLEY_SKIP_BARE_REPO_FALLBACK
+  HOME="$home" \
+    SLEY_BARE_REPO_GIT_DIR="$home/.bare-git" \
+    SLEY_BARE_REPO_WORK_TREE="$home" \
+    "$symlink_bin/sley" status
+)
+_assert_contains "bare repo fallback: explicit git dir detects repo" "root: $home" "$bare_home_status"
+_assert_contains "bare repo fallback: skips untracked HOME scan" "dirty: false" "$bare_home_status"
+
+printf 'two\n' >"$home/sub/in-scope.txt"
+printf 'two\n' >"$home/other/out-of-scope.txt"
+
+bare_home_changes=$(
+  cd "$home/sub" || exit 1
+  unset SLEY_SKIP_BARE_REPO_FALLBACK
+  HOME="$home" \
+    SLEY_BARE_REPO_GIT_DIR="$home/.bare-git" \
+    SLEY_BARE_REPO_WORK_TREE="$home" \
+    "$symlink_bin/sley" changes
+)
+_assert_contains "bare repo fallback: auto-scopes to current subtree" "sub/in-scope.txt" "$bare_home_changes"
+_assert_not_contains "bare repo fallback: excludes sibling changes" "other/out-of-scope.txt" "$bare_home_changes"
+
+set +e
+skip_out=$(
+  cd "$home" || exit 1
+  HOME="$home" \
+    SLEY_BARE_REPO_GIT_DIR="$home/.bare-git" \
+    SLEY_SKIP_BARE_REPO_FALLBACK=1 \
+    "$symlink_bin/sley" status 2>&1
+)
+skip_rc=$?
+_assert_exit "bare repo fallback: skip leaves non-repo unsupported" 2 "$skip_rc"
+_assert_contains "bare repo fallback: skip reports unsupported repo" "unsupported repo" "$skip_out"
+
+echo "=== sley: git status and changes ==="
+
+repo=$(_new_repo)
+cat >"$repo/tracked.py" <<'EOF'
+x = 1
+EOF
+(cd "$repo" && git add tracked.py && git commit -q -m "seed")
+echo "x = 2" >"$repo/tracked.py"
+cat >"$repo/untracked.py" <<'EOF'
+y = 1
+EOF
+
+_run_sley "$repo" changes
+_assert_exit "changes: default changed scope succeeds" 0 "$__SLEY_RC"
+_assert_contains "changes: default includes tracked change" "tracked.py" "$__SLEY_OUT"
+_assert_not_contains "changes: default excludes untracked" "untracked.py" "$__SLEY_OUT"
+
+_run_sley "$repo" changes --include-untracked
+_assert_exit "changes: include-untracked succeeds" 0 "$__SLEY_RC"
+_assert_contains "changes: include-untracked includes tracked" "tracked.py" "$__SLEY_OUT"
+_assert_contains "changes: include-untracked includes untracked" "untracked.py" "$__SLEY_OUT"
+
+_run_sley "$repo" changes --json
+_assert_exit "changes: json succeeds" 0 "$__SLEY_RC"
+_assert_contains "changes: json has repo_type" '"repo_type":"git"' "$__SLEY_OUT"
+_assert_contains "changes: json has files" '"files":[' "$__SLEY_OUT"
+_assert_contains "changes: json includes exists field" '"exists":true' "$__SLEY_OUT"
+
+no_json_encoder_path=$(_mock_bin)
+for cmd in bash git dirname; do
+  ln -s "$(command -v "$cmd")" "$no_json_encoder_path/$cmd"
+done
+__SLEY_OUT=$(
+  cd "$repo" &&
+    GIT_CONFIG_GLOBAL="$repo/.gitconfig-test" PATH="$no_json_encoder_path" "$SLEY" status --json 2>&1
+)
+__SLEY_RC=$?
+_assert_exit "status --json: missing encoder exits 2" 2 "$__SLEY_RC"
+_assert_contains "status --json: missing encoder reports error" \
+  "jq or python3 is required for JSON output" "$__SLEY_OUT"
+_assert_not_contains "status --json: missing encoder emits no partial JSON" \
+  '{"repo_type"' "$__SLEY_OUT"
+
+if command -v jq >/dev/null 2>&1 || command -v python3 >/dev/null 2>&1; then
+  _validate_json() {
+    local data="$1"
+    if command -v jq >/dev/null 2>&1; then
+      printf '%s' "$data" | jq -e . >/dev/null
+    else
+      printf '%s' "$data" | python3 -c 'import json, sys; json.loads(sys.stdin.read())'
+    fi
+  }
+  repo=$(_new_repo)
+  tab_file=$'tab\tname.py'
+  printf 'x = 1\n' >"$repo/$tab_file"
+  (cd "$repo" && git add "$tab_file")
+  _run_sley "$repo" changes --json --commit
+  if _validate_json "$__SLEY_OUT"; then
+    _pass "changes --json: tab filename emits valid JSON"
+  else
+    _fail "changes --json: tab filename emits valid JSON"
+  fi
+
+  # JSON escape coverage for quotes, backslashes, newlines, and a control byte.
+  # The fallback path was historically untested and shipped broken control-byte
+  # handling; this exercises whichever encoder backs `_repo_json_escape`.
+  repo=$(_new_repo)
+  for filename in $'quote".py' $'back\\slash.py' $'new\nline.py' $'ctrl\x01char.py'; do
+    printf 'x = 1\n' >"$repo/$filename"
+    (cd "$repo" && git add -- "$filename") 2>/dev/null
+  done
+  _run_sley "$repo" changes --json --commit
+  if _validate_json "$__SLEY_OUT"; then
+    _pass "changes --json: quotes/backslash/newline/control-byte emit valid JSON"
+  else
+    _fail "changes --json: quotes/backslash/newline/control-byte emit valid JSON"
+  fi
+fi
+
+mockbin=$(_mock_bin)
+cat >"$mockbin/sl" <<'MOCK'
+#!/usr/bin/env bash
+if [[ "$1" == "root" ]]; then
+  pwd
+  exit 0
+fi
+exit 1
+MOCK
+chmod +x "$mockbin/sl"
+
+PATH="$mockbin:$PATH" _run_sley "$repo" status --json
+_assert_exit "status: fake sl root still detects git repo" 0 "$__SLEY_RC"
+_assert_contains "status: fake sl root without metadata is git" '"repo_type":"git"' "$__SLEY_OUT"
+
+outer=$(_tmpdir)
+inner="$outer/nested"
+mkdir -p "$outer/.sl" "$inner"
+(
+  cd "$inner" || exit 1
+  export GIT_CONFIG_GLOBAL="$inner/.gitconfig-test"
+  : >"$GIT_CONFIG_GLOBAL"
+  git init -q
+  git config user.email test@test.local
+  git config user.name "Test User"
+)
+mockbin=$(_mock_bin)
+cat >"$mockbin/sl" <<'MOCK'
+#!/usr/bin/env bash
+if [[ "$1" == "root" ]]; then
+  printf '%s\n' "$SL_REPO"
+  exit 0
+fi
+exit 1
+MOCK
+chmod +x "$mockbin/sl"
+
+SL_REPO="$outer" PATH="$mockbin:$PATH" _run_sley "$inner" status --json
+_assert_exit "status: nested git inside sl root exits 0" 0 "$__SLEY_RC"
+_assert_contains "status: nested git root wins over outer sl root" '"repo_type":"git"' "$__SLEY_OUT"
+
+explicit_git=$(_new_repo)
+unrelated_sl=$(_tmpdir)
+mkdir -p "$unrelated_sl/.sl"
+mockbin=$(_mock_bin)
+cat >"$mockbin/sl" <<'MOCK'
+#!/usr/bin/env bash
+case "$1" in
+  root)
+    printf '%s\n' "$SL_REPO"
+    ;;
+  log)
+    printf 'slref'
+    ;;
+  status)
+    ;;
+esac
+MOCK
+chmod +x "$mockbin/sl"
+
+__SLEY_OUT=$(
+  cd "$unrelated_sl" || exit 1
+  SL_REPO="$unrelated_sl" \
+    PATH="$mockbin:$PATH" \
+    GIT_DIR="$explicit_git/.git" \
+    GIT_WORK_TREE="$explicit_git" \
+    GIT_CONFIG_GLOBAL="$explicit_git/.gitconfig-test" \
+    "$SLEY" status --json 2>&1
+)
+__SLEY_RC=$?
+_assert_exit "status: explicit git env outside sl root exits 0" 0 "$__SLEY_RC"
+_assert_contains "status: explicit git env outside sl root stays git" \
+  '"repo_type":"git"' "$__SLEY_OUT"
+_assert_contains "status: explicit git env reports git work tree" \
+  "\"root\":\"$explicit_git\"" "$__SLEY_OUT"
+
+repo=$(_tmpdir)
+mkdir -p "$repo/.sl" "$repo/.sley"
+mockbin=$(_mock_bin)
+cat >"$mockbin/sl" <<'MOCK'
+#!/usr/bin/env bash
+case "$1" in
+  root)
+    printf '%s\n' "$SL_REPO"
+    ;;
+  log)
+    case "$*" in
+      *'{phase}'*) printf 'draft' ;;
+      *'sort(draft() & ::., topo)'*) printf 'draftrev\n' ;;
+      *) printf '' ;;
+    esac
+    ;;
+  status)
+    if printf '%s\n' "$*" | grep -q 'ui.color=never'; then
+      color=0
+    else
+      color=1
+    fi
+    if printf '%s\n' "$*" | grep -q -- '--change draftrev'; then
+      if [[ "$color" == "1" ]]; then
+        printf '\033[31mdraft.py\033[0m\n'
+      else
+        printf 'draft.py\n'
+      fi
+    else
+      if [[ "$color" == "1" ]]; then
+        printf '\033[31mpending.py\033[0m\n'
+      else
+        printf 'pending.py\n'
+      fi
+    fi
+    ;;
+esac
+MOCK
+chmod +x "$mockbin/sl"
+cat >"$repo/.sley/verify.json" <<'EOF'
+{
+  "rules": [
+    {"paths": ["draft.py", "pending.py"], "commands": ["echo sl-color-test"]}
+  ]
+}
+EOF
+
+SL_REPO="$repo" PATH="$mockbin:$PATH" _run_sley "$repo" changes
+_assert_exit "changes: sl draft context succeeds" 0 "$__SLEY_RC"
+_assert_contains "changes: sl changed includes active draft commit" "draft.py" "$__SLEY_OUT"
+_assert_contains "changes: sl changed includes pending files" "pending.py" "$__SLEY_OUT"
+
+SL_REPO="$repo" PATH="$mockbin:$PATH" _run_sley "$repo" changes --commit
+_assert_exit "changes: sl commit scope succeeds" 0 "$__SLEY_RC"
+_assert_not_contains "changes: sl commit scope excludes active draft commit" "draft.py" "$__SLEY_OUT"
+_assert_contains "changes: sl commit scope includes pending files" "pending.py" "$__SLEY_OUT"
+
+SL_REPO="$repo" PATH="$mockbin:$PATH" _run_sley "$repo" verify
+_assert_exit "verify registry: sl colorized status exits 0" 0 "$__SLEY_RC"
+_assert_contains "verify registry: sl colorized status still maps command" "echo sl-color-test" "$__SLEY_OUT"
+
+echo "=== sley: empty and invalid path scopes ==="
+
+repo=$(_new_repo)
+_run_sley "$repo" check
+_assert_exit "check: empty scope exits 0" 0 "$__SLEY_RC"
+_assert_contains "check: empty scope message" "no matching changed files" "$__SLEY_OUT"
+
+no_sley_tools_path=$(_no_sley_tools_path)
+PATH="$no_sley_tools_path" _run_sley "$repo" fix
+_assert_exit "fix: empty scope does not require autoformat" 0 "$__SLEY_RC"
+PATH="$no_sley_tools_path" _run_sley "$repo" secrets
+_assert_exit "secrets: empty scope does not require gitleaks" 0 "$__SLEY_RC"
+
+_run_sley "$repo" changes --path ../outside
+_assert_exit "changes: path outside repo exits 2" 2 "$__SLEY_RC"
+_assert_contains "changes: path outside repo reports error" "outside repo" "$__SLEY_OUT"
+
+_run_sley "$repo" changes --path subdir
+_assert_exit "changes: empty path inside repo exits 0" 0 "$__SLEY_RC"
+
+mockbin=$(_mock_bin)
+cat >"$mockbin/realpath" <<'MOCK'
+#!/usr/bin/env bash
+exit 1
+MOCK
+chmod +x "$mockbin/realpath"
+PATH="$mockbin:$PATH" _run_sley "$repo" changes --path missing-subdir
+_assert_exit "changes: missing in-repo path does not require GNU realpath" 0 "$__SLEY_RC"
+
+_run_sley "$repo" changes --pending
+_assert_exit "changes: old pending flag rejected" 2 "$__SLEY_RC"
+_assert_contains "changes: old pending flag reports unknown option" "unknown option" "$__SLEY_OUT"
+
+_run_sley "$repo" changes --staged
+_assert_exit "changes: old staged flag rejected" 2 "$__SLEY_RC"
+_assert_contains "changes: old staged flag reports unknown option" "unknown option" "$__SLEY_OUT"
+
+_run_sley "$repo" changes --changed
+_assert_exit "changes: old changed flag rejected" 2 "$__SLEY_RC"
+_assert_contains "changes: old changed flag reports unknown option" "unknown option" "$__SLEY_OUT"
+
+repo=$(_new_repo)
+mkdir -p "$repo/sub" "$repo/other"
+cat >"$repo/sub/in_scope.py" <<'EOF'
+x = 1
+EOF
+cat >"$repo/other/out_scope.py" <<'EOF'
+y = 1
+EOF
+(cd "$repo" && git add sub/in_scope.py other/out_scope.py && git commit -q -m "seed")
+echo "x = 2" >"$repo/sub/in_scope.py"
+echo "y = 2" >"$repo/other/out_scope.py"
+
+_run_sley_from "$repo" "$repo/sub" changes --path .
+_assert_exit "changes: --path current dir from subdir exits 0" 0 "$__SLEY_RC"
+_assert_contains "changes: --path current dir from subdir includes cwd subtree" "sub/in_scope.py" "$__SLEY_OUT"
+_assert_not_contains "changes: --path current dir from subdir excludes sibling subtree" "other/out_scope.py" "$__SLEY_OUT"
+
+echo "=== sley: public selection API ==="
+
+repo=$(_new_repo)
+mkdir -p "$repo/sub" "$repo/other"
+cat >"$repo/sub/api.py" <<'EOF'
+x = 1
+EOF
+cat >"$repo/other/out.py" <<'EOF'
+y = 1
+EOF
+(cd "$repo" && git add sub/api.py other/out.py && git commit -q -m "seed")
+echo "x = 2" >"$repo/sub/api.py"
+echo "y = 2" >"$repo/other/out.py"
+
+out=$(
+  cd "$repo" || exit 1
+  # shellcheck source=../sley.sh
+  source "$SLEY_REPO_ROOT/lib/sley/sley.sh"
+  sley_select --path sub >"$repo/sley-select-files"
+  printf 'rc=%s\n' "$?"
+  printf 'repo_type=%s\n' "${SLEY_REPO_TYPE:-}"
+  printf 'root=%s\n' "${SLEY_REPO_ROOT:-}"
+  printf 'change_scope=%s\n' "${SLEY_CHANGE_SCOPE:-}"
+  printf 'repo_wide=%s\n' "${SLEY_REPO_WIDE:-}"
+  printf 'path_scope=%s\n' "${SLEY_PATH_SCOPE:-}"
+  printf 'selected=%s\n' "${SLEY_SELECTED_FILES:-}"
+  printf 'stdout=%s\n' "$(cat "$repo/sley-select-files")"
+)
+_assert_contains "select: public API exits 0" "rc=0" "$out"
+_assert_contains "select: exposes repo type" "repo_type=git" "$out"
+_assert_contains "select: exposes repo root" "root=$repo" "$out"
+_assert_contains "select: exposes change scope" "change_scope=changed" "$out"
+_assert_contains "select: exposes repo-wide flag" "repo_wide=0" "$out"
+_assert_contains "select: exposes path scope" "path_scope=sub" "$out"
+_assert_contains "select: exposes selected files" "selected=sub/api.py" "$out"
+_assert_contains "select: prints selected files" "stdout=sub/api.py" "$out"
+_assert_not_contains "select: excludes out-of-scope files" "other/out.py" "$out"
+
+repo=$(_new_repo)
+cat >"$repo/one.py" <<'EOF'
+one = 1
+EOF
+cat >"$repo/two.py" <<'EOF'
+two = 1
+EOF
+(cd "$repo" && git add one.py two.py && git commit -q -m "seed")
+echo "one = 2" >"$repo/one.py"
+cache_file="$(_tmpdir)/selected"
+set +e
+cache_output=$(
+  cd "$repo" &&
+    GIT_CONFIG_GLOBAL="$repo/.gitconfig-test" CACHE_FILE="$cache_file" bash <<'SCRIPT'
+source "$SLEY_REPO_ROOT/lib/sley/sley.sh"
+_sley_init_repo || exit $?
+_sley_parse_scope || exit $?
+filters=$(_sley_path_filters) || exit $?
+selected=$(_sley_selected_files_for_filters "$filters") || exit $?
+printf '%s\n' "$selected" >"$CACHE_FILE"
+_SLEY_SELECTED_FILES_CACHE_FILE="$CACHE_FILE"
+_SLEY_SELECTED_FILES_CACHE_KEY=$(_sley_selected_files_cache_key "$filters")
+echo "two = 2" >two.py
+_sley_selected_files_for_filters "$filters"
+SCRIPT
+)
+cache_rc=$?
+set +e
+_assert_exit "select cache: private helper exits 0" 0 "$cache_rc"
+_assert_eq "select cache: matching snapshot is reused" "one.py" "$cache_output"
+
+echo "=== sley: sourced API errors return instead of exiting ==="
+
+repo=$(_new_repo)
+cat >"$repo/api.py" <<'EOF'
+x = 1
+EOF
+(cd "$repo" && git add api.py && git commit -q -m "seed")
+echo "x = 2" >"$repo/api.py"
+
+out=$(
+  cd "$repo" || exit 1
+  # shellcheck source=../sley.sh
+  source "$SLEY_REPO_ROOT/lib/sley/sley.sh"
+  sley_select --bogus 2>&1
+  printf 'rc=%s\n' "$?"
+  printf 'survived=yes\n'
+)
+_assert_contains "select error: reports invalid option" "unknown option" "$out"
+_assert_contains "select error: returns 2" "rc=2" "$out"
+_assert_contains "select error: sourced caller survives" "survived=yes" "$out"
+
+echo "=== sley: hook file APIs ==="
+
+repo=$(_new_repo)
+cat >"$repo/hook.py" <<'EOF'
+x = 1
+EOF
+(cd "$repo" && git add hook.py && git commit -q -m "seed")
+echo "x = 2" >"$repo/hook.py"
+
+home=$(_tmpdir)
+_copy_sley_libs "$home"
+mockbin=$(_mock_bin)
+export MOCK_LOG="$repo/hook-file-api.log"
+cat >"$mockbin/autoformat" <<'MOCK'
+#!/usr/bin/env bash
+printf 'format:%s\n' "$*" >>"$MOCK_LOG"
+MOCK
+cat >"$mockbin/autolint" <<'MOCK'
+#!/usr/bin/env bash
+printf 'lint:%s\n' "$*" >>"$MOCK_LOG"
+MOCK
+chmod +x "$mockbin/autoformat" "$mockbin/autolint"
+
+hook_file_api_out=$(
+  cd "$repo" &&
+    HOME="$home" PATH="$mockbin:$PATH" bash -c '
+      source "$SLEY_REPO_ROOT/lib/sley/sley.sh"
+      sley_hook_init
+      sley_hook_format_file hook.py
+      sley_hook_lint_file hook.py
+      sley_hook_lint_file --json hook.py
+    ' 2>&1
+)
+hook_file_api_rc=$?
+_assert_exit "hook file api: format+lint calls succeed" 0 "$hook_file_api_rc"
+_assert_contains "hook file api: format file delegates" "format:-- hook.py" "$(cat "$MOCK_LOG" 2>/dev/null)"
+_assert_contains "hook file api: lint file delegates" "lint:hook.py" "$(cat "$MOCK_LOG" 2>/dev/null)"
+_assert_contains "hook file api: lint file passes through args" "lint:--json hook.py" "$(cat "$MOCK_LOG" 2>/dev/null)"
+_assert_eq "hook file api: no stderr noise" "" "$hook_file_api_out"
+
+echo "=== sley: hook CLI plumbing ==="
+
+: >"$MOCK_LOG"
+hook_cli_out=$(
+  cd "$repo" &&
+    HOME="$home" PATH="$mockbin:$PATH" "$SLEY" hook format-file "$repo/hook.py" &&
+    HOME="$home" PATH="$mockbin:$PATH" "$SLEY" hook lint-file --json "$repo/hook.py" &&
+    HOME="$home" PATH="$mockbin:$PATH" "$SLEY" hook lint-file --json hook.py
+)
+hook_cli_rc=$?
+_assert_exit "hook cli: format+lint plumbing succeeds" 0 "$hook_cli_rc"
+_assert_contains "hook cli: format-file delegates" "format:-- $repo/hook.py" "$(cat "$MOCK_LOG" 2>/dev/null)"
+_assert_contains "hook cli: lint-file passes through args" "lint:--json $repo/hook.py" "$(cat "$MOCK_LOG" 2>/dev/null)"
+_assert_contains "hook cli: relative lint-file keeps caller path" "lint:--json hook.py" "$(cat "$MOCK_LOG" 2>/dev/null)"
+_assert_eq "hook cli: no stdout" "" "$hook_cli_out"
+
+non_repo=$(_tmpdir)
+hook_changed_out=$(
+  cd "$non_repo" &&
+    HOME="$home" PATH="$mockbin:$PATH" "$SLEY" hook changed-files 2>&1
+)
+hook_changed_rc=$?
+_assert_exit "hook cli: changed-files outside repo exits unavailable" 2 "$hook_changed_rc"
+_assert_eq "hook cli: changed-files outside repo is quiet" "" "$hook_changed_out"
+
+echo "=== sley: root invocation stays bounded to active changes ==="
+
+repo=$(_new_repo)
+mockbin=$(_mock_bin)
+export MOCK_LOG="$repo/autoformat.log"
+: >"$MOCK_LOG"
+cat >"$mockbin/autoformat" <<'MOCK'
+#!/usr/bin/env bash
+printf '%s\n' "$@" >>"$MOCK_LOG"
+MOCK
+chmod +x "$mockbin/autoformat"
+
+mkdir -p "$repo/sub/project" "$repo/unrelated"
+cat >"$repo/sub/project/changed.py" <<'EOF'
+x = 1
+EOF
+cat >"$repo/unrelated/untouched.py" <<'EOF'
+y = 1
+EOF
+(cd "$repo" && git add sub/project/changed.py unrelated/untouched.py && git commit -q -m "seed")
+echo "x = 2" >"$repo/sub/project/changed.py"
+
+PATH="$mockbin:$PATH" _run_sley "$repo" fix
+_assert_exit "fix: root invocation exits 0" 0 "$__SLEY_RC"
+_assert_contains "fix: formats active changed file" "sub/project/changed.py" "$(cat "$MOCK_LOG")"
+_assert_not_contains "fix: does not enumerate unrelated files" "unrelated/untouched.py" "$(cat "$MOCK_LOG")"
+
+repo=$(_new_repo)
+home=$(_tmpdir)
+_copy_sley_libs "$home"
+mkdir -p "$home/.config/sley/extensions.d"
+cat >"$home/.config/sley/extensions.d/80-test.sh" <<'WORK'
+sley_hook_format_file() {
+  printf 'override-format:%s\n' "$*" >>"$MOCK_LOG"
+}
+WORK
+export MOCK_LOG="$repo/format-override.log"
+: >"$MOCK_LOG"
+cat >"$repo/override.py" <<'EOF'
+x = 1
+EOF
+(cd "$repo" && git add override.py && git commit -q -m "seed")
+echo "x = 2" >"$repo/override.py"
+
+HOME="$home" PATH="$no_sley_tools_path" _run_sley "$repo" fix
+_assert_exit "fix: uses sley format hook without autoformat" 0 "$__SLEY_RC"
+_assert_contains "fix: delegated to format hook override" "override-format:override.py" "$(cat "$MOCK_LOG")"
+
+repo=$(_new_repo)
+home=$(_tmpdir)
+_copy_sley_libs "$home"
+mkdir -p "$home/.config/sley/extensions.d" "$home/.local/share/sley/legacy.d"
+cat >"$home/.config/sley/extensions.d/80-test.sh" <<'WORK'
+sley_hook_format_file() {
+  printf 'native-format:%s\n' "$*" >>"$MOCK_LOG"
+}
+WORK
+cat >"$home/.local/share/sley/legacy.d/80-legacy.sh" <<'WORK'
+sley_hook_format_file() {
+  printf 'legacy-format:%s\n' "$*" >>"$MOCK_LOG"
+  return 9
+}
+WORK
+export MOCK_LOG="$repo/legacy-ignored.log"
+: >"$MOCK_LOG"
+cat >"$repo/native.py" <<'EOF'
+x = 1
+EOF
+(cd "$repo" && git add native.py && git commit -q -m "seed")
+echo "x = 2" >"$repo/native.py"
+
+HOME="$home" PATH="$no_sley_tools_path" _run_sley "$repo" fix
+_assert_exit "fix: ignores unrelated legacy hook path" 0 "$__SLEY_RC"
+_assert_contains "fix: uses native extension path" "native-format:native.py" "$(cat "$MOCK_LOG")"
+_assert_not_contains "fix: does not load legacy extension path" "legacy-format" "$(cat "$MOCK_LOG")"
+
+repo=$(_new_repo)
+mockbin=$(_mock_bin)
+cat >"$mockbin/autoformat" <<'MOCK'
+#!/usr/bin/env bash
+exit 9
+MOCK
+chmod +x "$mockbin/autoformat"
+cat >"$repo/fail.py" <<'EOF'
+x = 1
+EOF
+(cd "$repo" && git add fail.py && git commit -q -m "seed")
+echo "x = 2" >"$repo/fail.py"
+
+PATH="$mockbin:$PATH" _run_sley "$repo" fix
+_assert_exit "fix: formatter failure exits 1" 1 "$__SLEY_RC"
+_assert_contains "fix: formatter failure reports file" "fail.py" "$__SLEY_OUT"
+
+repo=$(_new_repo)
+home=$(_tmpdir)
+_copy_sley_libs "$home"
+mkdir -p "$home/.config/sley/extensions.d"
+cat >"$home/.config/sley/extensions.d/80-test.sh" <<'WORK'
+sley_hook_lint() {
+  printf 'caller=%s\n' "${SLEY_CALLER:-}" >> "$MOCK_LOG"
+  printf 'sley_scoped=%s\n' "${SLEY_SCOPED:-0}" >> "$MOCK_LOG"
+  printf '%s\n' "$1" >> "$MOCK_LOG"
+  return 0
+}
+WORK
+export MOCK_LOG="$repo/work-lint.log"
+: >"$MOCK_LOG"
+cat >"$repo/scoped.py" <<'EOF'
+x = 1
+EOF
+(cd "$repo" && git add scoped.py && git commit -q -m "seed")
+echo "x = 2" >"$repo/scoped.py"
+
+HOME="$home" SLEY_CALLER="agent-test" _run_sley "$repo" check
+_assert_exit "check: scoped extension lint exits 0" 0 "$__SLEY_RC"
+_assert_contains "check: successful run summarizes checked files" "sley check: checked 1 file" "$__SLEY_OUT"
+_assert_contains "check: passes sley caller to extension lint" "caller=agent-test" "$(cat "$MOCK_LOG")"
+_assert_contains "check: marks native sley extension lint scoped" "sley_scoped=1" "$(cat "$MOCK_LOG")"
+_assert_contains "check: passes selected file list to extension lint" "scoped.py" "$(cat "$MOCK_LOG")"
+
+repo=$(_new_repo)
+home=$(_tmpdir)
+_copy_sley_libs "$home"
+mkdir -p "$home/.config/sley/extensions.d"
+cat >"$home/.config/sley/extensions.d/80-test.sh" <<'WORK'
+sley_hook_lint() { return 0; }
+sley_hook_validate() {
+  echo "validate-called" >> "$MOCK_LOG"
+  return 9
+}
+WORK
+export MOCK_LOG="$repo/work-validate.log"
+: >"$MOCK_LOG"
+mkdir -p "$repo/sub" "$repo/other"
+cat >"$repo/sub/in.py" <<'EOF'
+x = 1
+EOF
+cat >"$repo/other/out.py" <<'EOF'
+y = 1
+EOF
+(cd "$repo" && git add sub/in.py other/out.py && git commit -q -m "seed")
+echo "x = 2" >"$repo/sub/in.py"
+echo "y = 2" >"$repo/other/out.py"
+
+HOME="$home" _run_sley "$repo" check --path sub
+_assert_exit "check --path: skips unscoped validation" 0 "$__SLEY_RC"
+_assert_contains "check --path: successful run summarizes checked files" "sley check: checked 1 file" "$__SLEY_OUT"
+_assert_eq "check --path: validate hook not called" "" "$(cat "$MOCK_LOG")"
+
+repo=$(_new_repo)
+no_sley_tools_path="/usr/local/bin:/usr/bin:/bin"
+home=$(_tmpdir)
+_copy_sley_libs "$home"
+cat >"$repo/needs-lint.py" <<'EOF'
+x = 1
+EOF
+(cd "$repo" && git add needs-lint.py && git commit -q -m "seed")
+echo "x = 2" >"$repo/needs-lint.py"
+
+HOME="$home" PATH="$no_sley_tools_path" _run_sley "$repo" check
+_assert_exit "check: missing autolint exits unavailable" 2 "$__SLEY_RC"
+
+echo "=== sley: fix --commit partial staging safety ==="
+
+repo=$(_new_repo)
+mockbin=$(_mock_bin)
+export MOCK_LOG="$repo/autoformat.log"
+: >"$MOCK_LOG"
+cat >"$mockbin/autoformat" <<'MOCK'
+#!/usr/bin/env bash
+printf 'autoformat:%s\n' "$*" >>"$MOCK_LOG"
+for file in "$@"; do
+  printf '\n# formatted\n' >>"$file"
+done
+MOCK
+chmod +x "$mockbin/autoformat"
+
+cat >"$repo/partial.py" <<'EOF'
+x = 1
+EOF
+(cd "$repo" && git add partial.py && git commit -q -m "seed")
+cat >"$repo/partial.py" <<'EOF'
+x = 2
+EOF
+(cd "$repo" && git add partial.py)
+cat >"$repo/partial.py" <<'EOF'
+x = 3
+EOF
+
+PATH="$mockbin:$PATH" _run_sley "$repo" fix --commit
+_assert_exit "fix --commit: partial staging exits 2" 2 "$__SLEY_RC"
+_assert_contains "fix --commit: partial staging explains refusal" "staged and unstaged changes" "$__SLEY_OUT"
+_assert_eq "fix --commit: partial staging formats no files" "" "$(cat "$MOCK_LOG")"
+_assert_file_content "fix --commit: partial staging leaves worktree unchanged" "x = 3" "$repo/partial.py"
+
+echo "=== sley: fix --commit does not update git index ==="
+
+repo=$(_new_repo)
+mockbin=$(_mock_bin)
+export MOCK_LOG="$repo/autoformat.log"
+: >"$MOCK_LOG"
+cat >"$mockbin/autoformat" <<'MOCK'
+#!/usr/bin/env bash
+printf 'autoformat:%s\n' "$*" >>"$MOCK_LOG"
+for file in "$@"; do
+  printf '\n# formatted\n' >>"$file"
+done
+MOCK
+chmod +x "$mockbin/autoformat"
+
+cat >"$repo/staged.py" <<'EOF'
+x = 1
+EOF
+(cd "$repo" && git add staged.py && git commit -q -m "seed")
+cat >"$repo/staged.py" <<'EOF'
+x = 2
+EOF
+(cd "$repo" && git add staged.py)
+
+PATH="$mockbin:$PATH" _run_sley "$repo" fix --commit
+_assert_exit "fix --commit: clean staged file exits 0" 0 "$__SLEY_RC"
+_assert_contains "fix --commit: reports modified file" "staged.py" "$__SLEY_OUT"
+_assert_contains "fix --commit: instructs git add" "git add" "$__SLEY_OUT"
+_assert_contains "fix --commit: calls autoformat" "autoformat:-- staged.py" "$(cat "$MOCK_LOG")"
+
+worktree_hash=$(git -C "$repo" hash-object -- staged.py)
+index_hash=$(git -C "$repo" rev-parse :staged.py)
+if [[ "$worktree_hash" != "$index_hash" ]]; then
+  _pass "fix --commit: git index is not updated"
+else
+  _fail "fix --commit: git index should not match formatted worktree"
+fi
+
+echo "=== sley: secrets scopes ==="
+
+repo=$(_new_repo)
+mockbin=$(_mock_bin)
+export MOCK_LOG="$repo/gitleaks.log"
+: >"$MOCK_LOG"
+cat >"$mockbin/gitleaks" <<'MOCK'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"$MOCK_LOG"
+cat >>"$MOCK_LOG"
+echo "clean stdout"
+echo "clean stderr" >&2
+exit 0
+MOCK
+chmod +x "$mockbin/gitleaks"
+cat >"$repo/secret.py" <<'EOF'
+token = "not-real"
+EOF
+(cd "$repo" && git add secret.py && git commit -q -m "seed")
+echo 'token = "changed"' >"$repo/secret.py"
+
+PATH="$mockbin:$PATH" _run_sley "$repo" secrets
+_assert_exit "secrets: default changed scope exits 0" 0 "$__SLEY_RC"
+_assert_contains "secrets: successful run summarizes scanned files" "sley secrets: scanned 1 file" "$__SLEY_OUT"
+_assert_not_contains "secrets: clean stdout is quiet" "clean stdout" "$__SLEY_OUT"
+_assert_not_contains "secrets: clean stderr is quiet" "clean stderr" "$__SLEY_OUT"
+# `--` separates flags from the path arg so a hostile filename starting with
+# `-` cannot impersonate a gitleaks option. The test asserts the path makes
+# it through with `--` in front.
+_assert_contains "secrets: scans selected changed file" "dir --redact --no-banner -- secret.py" "$(cat "$MOCK_LOG")"
+
+repo=$(_new_repo)
+mockbin=$(_mock_bin)
+sync_dir=$(_tmpdir)
+cat >"$mockbin/gitleaks" <<'MOCK'
+#!/usr/bin/env bash
+file="${@: -1}"
+case "$file" in
+  secret-a.py)
+    touch "$SLEY_SECRETS_SYNC/a-start"
+    for _i in $(seq 1 100); do
+      if [[ -f "$SLEY_SECRETS_SYNC/b-start" ]]; then
+        echo "a saw b"
+        exit 0
+      fi
+      sleep 0.02
+    done
+    echo "a timed out waiting for b" >&2
+    exit 7
+    ;;
+  secret-b.py)
+    touch "$SLEY_SECRETS_SYNC/b-start"
+    echo "b started"
+    exit 0
+    ;;
+esac
+MOCK
+chmod +x "$mockbin/gitleaks"
+cat >"$repo/secret-a.py" <<'EOF'
+token = "a"
+EOF
+cat >"$repo/secret-b.py" <<'EOF'
+token = "b"
+EOF
+(cd "$repo" && git add secret-a.py secret-b.py && git commit -q -m "seed")
+echo 'token = "changed-a"' >"$repo/secret-a.py"
+echo 'token = "changed-b"' >"$repo/secret-b.py"
+
+PATH="$mockbin:$PATH" SLEY_SECRETS_SYNC="$sync_dir" _run_sley "$repo" secrets
+_assert_exit "secrets: worktree scans run concurrently" 0 "$__SLEY_RC"
+_assert_contains "secrets: concurrent scan summarizes scanned files" "sley secrets: scanned 2 files" "$__SLEY_OUT"
+_assert_not_contains "secrets: clean concurrent scan output is quiet" "a saw b" "$__SLEY_OUT"
+
+repo=$(_new_repo)
+mockbin=$(_mock_bin)
+cat >"$mockbin/gitleaks" <<'MOCK'
+#!/usr/bin/env bash
+echo "gitleaks: synthetic leak detail" >&2
+exit 1
+MOCK
+chmod +x "$mockbin/gitleaks"
+cat >"$repo/secret.py" <<'EOF'
+token = "safe"
+EOF
+(cd "$repo" && git add secret.py && git commit -q -m "seed")
+echo 'token = "leaky"' >"$repo/secret.py"
+
+PATH="$mockbin:$PATH" _run_sley "$repo" secrets
+_assert_exit "secrets: failed scan exits nonzero" 1 "$__SLEY_RC"
+_assert_contains "secrets: failed scan surfaces detail" "synthetic leak detail" "$__SLEY_OUT"
+
+repo=$(_new_repo)
+mockbin=$(_mock_bin)
+export MOCK_LOG="$repo/gitleaks.log"
+: >"$MOCK_LOG"
+# Capture stdin into the log so the staged-blob assertion below can verify the
+# staged bytes actually flowed through the pipe — not just that `--stdin`
+# appeared in argv. Earlier the mock dropped stdin via `cat >/dev/null`, which
+# left the "staged blob differs from worktree" regression unverified.
+cat >"$mockbin/gitleaks" <<'MOCK'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"$MOCK_LOG"
+cat >>"$MOCK_LOG"
+exit 0
+MOCK
+chmod +x "$mockbin/gitleaks"
+cat >"$repo/staged-secret.py" <<'EOF'
+token = "safe"
+EOF
+(cd "$repo" && git add staged-secret.py && git commit -q -m "seed")
+cat >"$repo/staged-secret.py" <<'EOF'
+token = "SECRET_IN_INDEX"
+EOF
+(cd "$repo" && git add staged-secret.py)
+cat >"$repo/staged-secret.py" <<'EOF'
+token = "safe-again"
+EOF
+
+PATH="$mockbin:$PATH" _run_sley "$repo" secrets
+_assert_exit "secrets: default changed scope scans staged diff" 0 "$__SLEY_RC"
+_assert_contains "secrets: staged part uses stdin scan" "stdin --redact --no-banner" "$(cat "$MOCK_LOG")"
+_assert_contains "secrets: staged blob bytes reach gitleaks stdin" "SECRET_IN_INDEX" "$(cat "$MOCK_LOG")"
+
+repo=$(_new_repo)
+mockbin=$(_mock_bin)
+export MOCK_LOG="$repo/gitleaks.log"
+: >"$MOCK_LOG"
+cat >"$mockbin/gitleaks" <<'MOCK'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"$MOCK_LOG"
+cat >>"$MOCK_LOG"
+exit 0
+MOCK
+chmod +x "$mockbin/gitleaks"
+cat >"$repo/.gitleaks.toml" <<'EOF'
+title = "test"
+EOF
+cat >"$repo/staged-secret.py" <<'EOF'
+token = "safe"
+EOF
+cat >"$repo/worktree-secret.py" <<'EOF'
+token = "safe"
+EOF
+(cd "$repo" && git add .gitleaks.toml staged-secret.py worktree-secret.py && git commit -q -m "seed")
+cat >"$repo/staged-secret.py" <<'EOF'
+token = "SECRET_IN_INDEX"
+EOF
+(cd "$repo" && git add staged-secret.py)
+cat >"$repo/worktree-secret.py" <<'EOF'
+token = "SECRET_IN_WORKTREE"
+EOF
+
+PATH="$mockbin:$PATH" _run_sley "$repo" secrets
+_assert_exit "secrets: repo gitleaks config exits 0" 0 "$__SLEY_RC"
+_assert_contains "secrets: staged scan uses repo gitleaks config" \
+  "stdin --redact --no-banner --config $repo/.gitleaks.toml" "$(cat "$MOCK_LOG")"
+_assert_contains "secrets: worktree scan uses repo gitleaks config" \
+  "dir --redact --no-banner --config $repo/.gitleaks.toml -- worktree-secret.py" "$(cat "$MOCK_LOG")"
+
+repo=$(_new_repo)
+mockbin=$(_mock_bin)
+export MOCK_LOG="$repo/gitleaks.log"
+: >"$MOCK_LOG"
+cat >"$mockbin/gitleaks" <<'MOCK'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"$MOCK_LOG"
+cat >>"$MOCK_LOG"
+exit 0
+MOCK
+chmod +x "$mockbin/gitleaks"
+mkdir -p "$repo/sub" "$repo/other"
+echo "x = 1" >"$repo/sub/in.py"
+echo "y = 1" >"$repo/other/out.py"
+(cd "$repo" && git add sub/in.py other/out.py && git commit -q -m "seed")
+echo "x = 2" >"$repo/sub/in.py"
+echo "y = 2" >"$repo/other/out.py"
+(cd "$repo" && git add sub/in.py other/out.py)
+
+PATH="$mockbin:$PATH" _run_sley "$repo" secrets --commit --path sub
+_assert_exit "secrets: commit path scope exits 0" 0 "$__SLEY_RC"
+_assert_contains "secrets: commit path scope scans in-scope file" "sub/in.py" "$(cat "$MOCK_LOG")"
+_assert_not_contains "secrets: commit path scope excludes sibling file" "other/out.py" "$(cat "$MOCK_LOG")"
+
+repo=$(_new_repo)
+mockbin=$(_mock_bin)
+export MOCK_LOG="$repo/autolint.log"
+: >"$MOCK_LOG"
+cat >"$mockbin/autolint" <<'MOCK'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"$MOCK_LOG"
+exit 9
+MOCK
+chmod +x "$mockbin/autolint"
+mkdir -p "$repo/.github/workflows"
+cat >"$repo/.github/workflows/remove.yml" <<'EOF'
+name: remove
+on: push
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo ok
+EOF
+(cd "$repo" && git add .github/workflows/remove.yml && git commit -q -m "seed")
+rm "$repo/.github/workflows/remove.yml"
+
+PATH="$mockbin:$PATH" _run_sley "$repo" check
+_assert_exit "check: deleted workflow is empty scope" 0 "$__SLEY_RC"
+_assert_eq "check: deleted workflow does not call autolint" "" "$(cat "$MOCK_LOG")"
+
+# `SLEY_SKIP_UNTRACKED=1` disables the untracked-file walk in the dirty
+# counts. Designed for the bare-as-not-bare home-repo case where the work
+# tree is `$HOME`; the local launcher exports it for the base bare repo. Confirm
+# the env var path zeros the untracked count even when an untracked file
+# exists in the worktree.
+repo=$(_new_repo)
+echo "y = 1" >"$repo/floating.py"
+__SLEY_OUT=$(
+  cd "$repo" &&
+    SLEY_SKIP_UNTRACKED=1 GIT_CONFIG_GLOBAL="$repo/.gitconfig-test" \
+      "$SLEY" status --json 2>&1
+)
+__SLEY_RC=$?
+_assert_exit "status SLEY_SKIP_UNTRACKED=1: succeeds" 0 "$__SLEY_RC"
+_assert_contains "status SLEY_SKIP_UNTRACKED=1: untracked count is 0" \
+  '"untracked":0' "$__SLEY_OUT"
+
+# Confirm the default path still walks untracked. The fixture leaves
+# `.gitconfig-test` untracked alongside `floating.py`, so the count is 2.
+_run_sley "$repo" status --json
+_assert_exit "status default: succeeds" 0 "$__SLEY_RC"
+_assert_contains "status default: untracked count is non-zero" \
+  '"untracked":2' "$__SLEY_OUT"
+
+repo=$(_new_repo)
+mkdir -p "$repo/sub" "$repo/other"
+echo "x = 1" >"$repo/sub/in.py"
+echo "y = 1" >"$repo/other/out.py"
+(cd "$repo" && git add sub/in.py other/out.py && git commit -q -m "seed")
+echo "x = 2" >"$repo/sub/in.py"
+echo "y = 2" >"$repo/other/out.py"
+
+mockbin=$(_mock_bin)
+home=$(_tmpdir)
+_copy_sley_libs "$home"
+_mock_ready_pass_tools "$mockbin"
+
+HOME="$home" PATH="$mockbin:$PATH" _run_sley_from "$repo" "$repo/sub" ready --path .
+_assert_exit "ready: path current dir from subdir exits 0 despite optional phases" 0 "$__SLEY_RC"
+_assert_contains "ready: path current dir from subdir preserves caller cwd" "status:" "$__SLEY_OUT"
+_assert_contains "ready: path current dir from subdir reports out-of-scope sibling" "outside selected path scope: 1" "$__SLEY_OUT"
+
+repo=$(_new_repo)
+origin=$(_tmpdir)
+git init -q --bare "$origin"
+mkdir -p "$repo/src" "$repo/tests" "$repo/.sley"
+cat >"$repo/src/app.txt" <<'EOF'
+initial
+EOF
+cat >"$repo/tests/run.sh" <<'EOF'
+#!/usr/bin/env bash
+echo ready-verify > tests/ran
+EOF
+chmod +x "$repo/tests/run.sh"
+cat >"$repo/.sley/verify.json" <<'EOF'
+{"rules":[{"paths":["src/**"],"commands":["./tests/run.sh"]}]}
+EOF
+(cd "$repo" && git add . && git commit -q -m "seed ready upstream")
+git -C "$repo" remote add origin "$origin"
+branch=$(git -C "$repo" branch --show-current)
+git -C "$repo" push -q -u origin "$branch"
+echo "changed" >>"$repo/src/app.txt"
+(cd "$repo" && git add src/app.txt && git commit -q -m "change app")
+
+mockbin=$(_mock_bin)
+home=$(_tmpdir)
+_copy_sley_libs "$home"
+_mock_ready_pass_tools "$mockbin"
+
+HOME="$home" PATH="$mockbin:$PATH" _run_sley "$repo" ready
+_assert_exit "ready: clean ahead branch exits 0" 0 "$__SLEY_RC"
+_assert_contains "ready: clean ahead branch runs mapped verify" \
+  "running required fast command: ./tests/run.sh" "$__SLEY_OUT"
+_assert_file_exists "ready: clean ahead branch verify command ran" "$repo/tests/ran"
+
+repo=$(_new_repo)
+origin=$(_tmpdir)
+git init -q --bare "$origin"
+mkdir -p "$repo/src" "$repo/.sley"
+cat >"$repo/src/app.txt" <<'EOF'
+initial
+EOF
+cat >"$repo/.sley/verify.json" <<'EOF'
+{
+  "rules": [
+    {
+      "paths": ["src/**"],
+      "commands": [
+        {
+          "cmd": "printf x >> \"$READY_COUNTER\"",
+          "required": true,
+          "cache": {
+            "enabled": true,
+            "salt": "ready-cache-test"
+          }
+        }
+      ]
+    }
+  ]
+}
+EOF
+(cd "$repo" && git add . && git commit -q -m "seed ready cache upstream")
+git -C "$repo" remote add origin "$origin"
+branch=$(git -C "$repo" branch --show-current)
+git -C "$repo" push -q -u origin "$branch"
+echo "changed" >>"$repo/src/app.txt"
+(cd "$repo" && git add src/app.txt && git commit -q -m "change cached app")
+
+mockbin=$(_mock_bin)
+home=$(_tmpdir)
+counter=$(_tmpdir)/ready-counter
+_copy_sley_libs "$home"
+_mock_ready_pass_tools "$mockbin"
+
+READY_COUNTER="$counter" HOME="$home" PATH="$mockbin:$PATH" _run_sley "$repo" ready
+_assert_exit "ready: cacheable verify first run exits 0" 0 "$__SLEY_RC"
+_assert_eq "ready: cacheable verify first run executes command" "x" "$(cat "$counter")"
+
+READY_COUNTER="$counter" HOME="$home" PATH="$mockbin:$PATH" _run_sley "$repo" ready
+_assert_exit "ready: cached verify exits 0" 0 "$__SLEY_RC"
+_assert_contains "ready: cached verify annotates phase line" "verify: 0 (pass, cached 1/1)" "$__SLEY_OUT"
+_assert_eq "ready: cached verify does not rerun command" "x" "$(cat "$counter")"
+
+READY_COUNTER="$counter" HOME="$home" PATH="$mockbin:$PATH" _run_sley "$repo" ready --json
+_assert_exit "ready: cached verify json exits 0" 0 "$__SLEY_RC"
+_assert_contains "ready: cached verify json reports cached count" '"cached_passed":1' "$__SLEY_OUT"
+
+READY_COUNTER="$counter" HOME="$home" PATH="$mockbin:$PATH" _run_sley "$repo" ready --force
+_assert_exit "ready: force bypasses cached verify exits 0" 0 "$__SLEY_RC"
+_assert_eq "ready: force reruns cached verify command" "xx" "$(cat "$counter")"
+
+echo "=== sley: verify json contract ==="
+
+repo=$(_new_repo)
+cat >"$repo/app.txt" <<'EOF'
+initial
+EOF
+(cd "$repo" && git add app.txt && git commit -q -m "seed verify help")
+echo "changed" >>"$repo/app.txt"
+
+_run_sley "$repo" verify --help
+_assert_exit "verify help: exits 0" 0 "$__SLEY_RC"
+_assert_contains "verify help: mentions run-required" "--run-required" "$__SLEY_OUT"
+_assert_contains "verify help: mentions cache stats" "--cache-stats" "$__SLEY_OUT"
+_assert_contains "verify help: mentions scope flags" "--path PATH" "$__SLEY_OUT"
+_assert_contains "verify help: documents default scope" "default              use active change-context changes" "$__SLEY_OUT"
+_assert_contains "verify help: aligns commit scope" "--commit             use VCS commit-input changes" "$__SLEY_OUT"
+_assert_not_contains "verify help: omits old changed scope" "--changed" "$__SLEY_OUT"
+
+_old_cmd="c""i"
+_run_sley "$repo" "$_old_cmd" --help
+_assert_exit "old verify command: removed" 2 "$__SLEY_RC"
+_assert_contains "old verify command: reports unknown command" \
+  "unknown command: $_old_cmd" "$__SLEY_OUT"
+
+_old_workflows_cmd="work""flows"
+_run_sley "$repo" "$_old_workflows_cmd" --help
+_assert_exit "old workflow command: removed" 2 "$__SLEY_RC"
+_assert_contains "old workflow command: reports unknown command" \
+  "unknown command: $_old_workflows_cmd" "$__SLEY_OUT"
+
+_old_review_cmd="rev""iew"
+_run_sley "$repo" "$_old_review_cmd" --help
+_assert_exit "old review command: removed" 2 "$__SLEY_RC"
+_assert_contains "old review command: reports unknown command" \
+  "unknown command: $_old_review_cmd" "$__SLEY_OUT"
+
+_run_sley "$repo" ready --help
+_assert_exit "ready help: exits 0" 0 "$__SLEY_RC"
+_assert_contains "ready help: documents default scope" "default              use active change-context changes" "$__SLEY_OUT"
+_assert_contains "ready help: aligns commit scope" "--commit             use VCS commit-input changes" "$__SLEY_OUT"
+_assert_not_contains "ready help: omits old changed scope" "--changed" "$__SLEY_OUT"
+
+repo=$(_new_repo)
+cat >"$repo/package.json" <<'EOF'
+{
+  "scripts": {
+    "test": "npm test",
+    "lint": "npm run lint",
+    "build": "npm run build"
+  }
+}
+EOF
+cat >"$repo/pyproject.toml" <<'EOF'
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+[tool.ruff]
+line-length = 100
+EOF
+cat >"$repo/Makefile" <<'EOF'
+test:
+	@true
+lint:
+	@true
+EOF
+git -C "$repo" add package.json pyproject.toml Makefile
+
+_run_sley "$repo" verify --json
+_assert_exit "verify --json: succeeds" 0 "$__SLEY_RC"
+_assert_contains "verify --json: emits commands" '"commands":[' "$__SLEY_OUT"
+_assert_contains "verify --json: emits kind" '"kind":"test"' "$__SLEY_OUT"
+_assert_contains "verify --json: emits sources" '"sources":[' "$__SLEY_OUT"
+_assert_contains "verify --json: detects pyproject pytest" '"command":"pytest"' "$__SLEY_OUT"
+_assert_contains "verify --json: detects make target" '"command":"make test"' "$__SLEY_OUT"
+
+repo=$(_new_repo)
+mkdir -p "$repo/sub"
+cat >"$repo/package.json" <<'EOF'
+{"scripts":{"test":"npm test"}}
+EOF
+cat >"$repo/sub/package.json" <<'EOF'
+{"scripts":{"test":"npm test"}}
+EOF
+echo "x = 1" >"$repo/sub/app.js"
+git -C "$repo" add package.json sub/package.json sub/app.js
+git -C "$repo" commit -q -m "seed manifests"
+echo "x = 2" >"$repo/sub/app.js"
+
+_run_sley "$repo" verify --json
+_assert_exit "verify --json: duplicate command succeeds" 0 "$__SLEY_RC"
+command_count=$(printf '%s' "$__SLEY_OUT" | grep -o '"command":"npm test"' | wc -l | tr -d ' ')
+_assert_eq "verify --json: duplicate commands merged" "1" "$command_count"
+_assert_contains "verify --json: merged command has root source" '"package.json"' "$__SLEY_OUT"
+_assert_contains "verify --json: merged command has sub source" '"sub/package.json"' "$__SLEY_OUT"
+_assert_contains "verify --json: labels ancestor manifest source" \
+  '"source":"sub/package.json","context":"ancestor"' "$__SLEY_OUT"
+_assert_contains "verify --json: labels repo-root manifest source" \
+  '"source":"package.json","context":"repo-root"' "$__SLEY_OUT"
+source_order=$(
+  printf '%s' "$__SLEY_OUT" |
+    python3 -c 'import json,sys; d=json.load(sys.stdin); print(",".join(d["commands"][0]["sources"]))'
+)
+_assert_eq "verify --json: preserves nearest-to-root source order" "sub/package.json,package.json" "$source_order"
+
+_run_sley "$repo" verify
+_assert_exit "verify: human output succeeds" 0 "$__SLEY_RC"
+_assert_contains "verify: human output includes command and source context" \
+  "test: npm test [ancestor: sub/package.json, repo-root: package.json]" "$__SLEY_OUT"
+_assert_not_contains "verify: human output is not raw JSON" '{"command"' "$__SLEY_OUT"
+
+echo "=== sley: verify registry mapped commands ==="
+
+repo=$(_new_repo)
+mkdir -p "$repo/src" "$repo/tests" "$repo/.sley"
+cat >"$repo/src/app.txt" <<'EOF'
+initial
+EOF
+cat >"$repo/tests/run.sh" <<'EOF'
+#!/usr/bin/env bash
+set -u
+echo ok > tests/ran
+EOF
+chmod +x "$repo/tests/run.sh"
+cat >"$repo/.sley/verify.json" <<'EOF'
+{
+  "rules": [
+    {
+      "paths": ["src/**"],
+      "commands": ["./tests/run.sh"]
+    }
+  ]
+}
+EOF
+(cd "$repo" && git add . && git commit -q -m "seed verify registry")
+echo "changed" >>"$repo/src/app.txt"
+
+_run_sley "$repo" verify
+_assert_exit "verify registry: mapped command lists" 0 "$__SLEY_RC"
+_assert_contains "verify registry: source reported" "repo-config: .sley/verify.json" "$__SLEY_OUT"
+_assert_contains "verify registry: mapped command listed" "test required fast: ./tests/run.sh" "$__SLEY_OUT"
+
+_run_sley "$repo" verify --json
+_assert_exit "verify registry --json: mapped command lists" 0 "$__SLEY_RC"
+_assert_contains "verify registry --json: required field is true" '"required":true' "$__SLEY_OUT"
+_assert_contains "verify registry --json: tier field is fast" '"tier":"fast"' "$__SLEY_OUT"
+_assert_contains "verify registry --json: source context is repo config" \
+  '"source":".sley/verify.json","context":"repo-config"' "$__SLEY_OUT"
+
+_run_sley "$repo" verify --run-required --json
+_assert_exit "verify registry --run-required --json: mapped command exits 0" 0 "$__SLEY_RC"
+_assert_contains "verify registry --run-required --json: reports passed status" '"status":"passed"' "$__SLEY_OUT"
+_assert_contains "verify registry --run-required --json: records command result" \
+  '"command":"./tests/run.sh","tier":"fast","status":"passed","exit_code":0' "$__SLEY_OUT"
+_assert_not_contains "verify registry --run-required --json: no human preamble" "selected changed files" "$__SLEY_OUT"
+
+_run_sley "$repo" verify --run-required
+_assert_exit "verify registry: mapped command exits 0" 0 "$__SLEY_RC"
+_assert_contains "verify registry: changed file listed" "src/app.txt" "$__SLEY_OUT"
+_assert_contains "verify registry: running mapped command" "running required fast command: ./tests/run.sh" "$__SLEY_OUT"
+_assert_contains "verify registry: exit code recorded" "exit code: 0" "$__SLEY_OUT"
+_assert_file_exists "verify registry: mapped command ran" "$repo/tests/ran"
+
+repo=$(_new_repo)
+home=$(_tmpdir)
+_copy_sley_libs "$home"
+mkdir -p "$home/.config/sley/extensions.d" "$repo/src" "$repo/tests"
+cat >"$home/.config/sley/extensions.d/80-verify-extension.sh" <<'WORK'
+sley_ext_verify_commands() {
+  local files="${1:-}"
+  case "$files" in
+    *src/app.py*)
+      cat <<'JSON'
+{"command":"./tests/verify-ext.sh","kind":"typecheck","required":true,"tier":"fast","sources":["verify-extension"],"source_contexts":[{"source":"verify-extension","context":"extension"}]}
+JSON
+      ;;
+  esac
+}
+WORK
+cat >"$repo/src/app.py" <<'EOF'
+print("initial")
+EOF
+cat >"$repo/tests/verify-ext.sh" <<'EOF'
+#!/usr/bin/env bash
+set -u
+echo ok > tests/verify-ext-ran
+EOF
+chmod +x "$repo/tests/verify-ext.sh"
+(cd "$repo" && git add . && git commit -q -m "seed verify extension")
+echo "print('changed')" >>"$repo/src/app.py"
+
+HOME="$home" _run_sley "$repo" verify --json
+_assert_exit "verify extension --json: succeeds" 0 "$__SLEY_RC"
+_assert_contains "verify extension --json: emits extension command" '"command":"./tests/verify-ext.sh"' "$__SLEY_OUT"
+_assert_contains "verify extension --json: marks command required" '"required":true' "$__SLEY_OUT"
+_assert_contains "verify extension --json: preserves extension context" \
+  '"source":"verify-extension","context":"extension"' "$__SLEY_OUT"
+
+HOME="$home" _run_sley "$repo" verify --run-required
+_assert_exit "verify extension: required command exits 0" 0 "$__SLEY_RC"
+_assert_contains "verify extension: running mapped command" \
+  "running required fast command: ./tests/verify-ext.sh" "$__SLEY_OUT"
+_assert_file_exists "verify extension: required command ran" "$repo/tests/verify-ext-ran"
+
+repo=$(_new_repo)
+mkdir -p "$repo/src" "$repo/.sley"
+cat >"$repo/src/app.txt" <<'EOF'
+initial
+EOF
+cat >"$repo/.sley/verify.json" <<'EOF'
+{
+  "rules": [
+    {
+      "enabled": false,
+      "paths": ["src/**"],
+      "commands": ["echo disabled-rule"]
+    }
+  ]
+}
+EOF
+(cd "$repo" && git add . && git commit -q -m "seed disabled verify rule")
+echo "changed" >>"$repo/src/app.txt"
+
+_run_sley "$repo" verify --run-required
+_assert_exit "verify registry: disabled rule exits 0" 0 "$__SLEY_RC"
+_assert_contains "verify registry: disabled rule maps no commands" "no required verification commands mapped" "$__SLEY_OUT"
+_assert_not_contains "verify registry: disabled rule command omitted" "disabled-rule" "$__SLEY_OUT"
+
+repo=$(_new_repo)
+mkdir -p "$repo/src" "$repo/.sley"
+cat >"$repo/src/app.txt" <<'EOF'
+initial
+EOF
+cat >"$repo/.sley/verify.json" <<'EOF'
+{
+  "rules": [
+    {
+      "paths": ["src/**"],
+      "commands": [
+        {"cmd": "echo disabled-command", "enabled": false},
+        {"cmd": "echo enabled-command"}
+      ]
+    }
+  ]
+}
+EOF
+(cd "$repo" && git add . && git commit -q -m "seed disabled verify command")
+echo "changed" >>"$repo/src/app.txt"
+
+_run_sley "$repo" verify
+_assert_exit "verify registry: disabled command exits 0" 0 "$__SLEY_RC"
+_assert_not_contains "verify registry: disabled command omitted" "disabled-command" "$__SLEY_OUT"
+_assert_contains "verify registry: enabled sibling remains listed" "enabled-command" "$__SLEY_OUT"
+
+repo=$(_new_repo)
+mkdir -p "$repo/src" "$repo/.sley"
+cat >"$repo/src/app.txt" <<'EOF'
+initial
+EOF
+cat >"$repo/.sley/verify.json" <<'EOF'
+{
+  "rules": [
+    {
+      "paths": ["src/**"],
+      "commands": [
+        {
+          "cmd": "echo cacheable",
+          "required": true,
+          "tier": "fast",
+          "cache": {
+            "enabled": true,
+            "salt": "one"
+          }
+        },
+        {
+          "cmd": "echo cacheable",
+          "required": true,
+          "tier": "fast",
+          "cache": {
+            "enabled": true,
+            "salt": "two"
+          }
+        }
+      ]
+    }
+  ]
+}
+EOF
+(cd "$repo" && git add . && git commit -q -m "seed cache metadata verify")
+echo "changed" >>"$repo/src/app.txt"
+
+_run_sley "$repo" verify --json
+_assert_exit "verify registry --json: cache metadata exits 0" 0 "$__SLEY_RC"
+_assert_contains "verify registry --json: preserves cache enabled" '"cache":{"enabled":true,"salt":"one"}' "$__SLEY_OUT"
+cacheable_count=$(printf '%s' "$__SLEY_OUT" | grep -o '"command":"echo cacheable"' | wc -l | tr -d ' ')
+_assert_eq "verify registry --json: cache config participates in dedupe" "2" "$cacheable_count"
+
+repo=$(_new_repo)
+mkdir -p "$repo/src" "$repo/tests" "$repo/.sley"
+cat >"$repo/src/app.txt" <<'EOF'
+initial
+EOF
+cat >"$repo/tests/run.sh" <<'EOF'
+#!/usr/bin/env bash
+count=0
+[[ -f tests/count ]] && count=$(cat tests/count)
+count=$((count + 1))
+printf '%s\n' "$count" > tests/count
+EOF
+chmod +x "$repo/tests/run.sh"
+cat >"$repo/.sley/verify.json" <<'EOF'
+{
+  "rules": [
+    {
+      "paths": ["src/**"],
+      "commands": [
+        {
+          "cmd": "./tests/run.sh",
+          "required": true,
+          "tier": "fast",
+          "cache": {
+            "enabled": true,
+            "salt": "cache-hit-test"
+          }
+        }
+      ]
+    }
+  ]
+}
+EOF
+(cd "$repo" && git add . && git commit -q -m "seed cacheable verify")
+echo "changed" >>"$repo/src/app.txt"
+
+_run_sley "$repo" verify --run-required --json
+_assert_exit "verify registry cache: first run exits 0" 0 "$__SLEY_RC"
+_assert_contains "verify registry cache: first run reports passed" '"status":"passed"' "$__SLEY_OUT"
+_assert_contains "verify registry cache: first run executes command" '"status":"passed","exit_code":0' "$__SLEY_OUT"
+_assert_eq "verify registry cache: first run increments count" "1" "$(cat "$repo/tests/count")"
+
+_run_sley "$repo" verify --run-required --json
+_assert_exit "verify registry cache: second run exits 0" 0 "$__SLEY_RC"
+_assert_contains "verify registry cache: second run reports cached pass" '"status":"cached-pass"' "$__SLEY_OUT"
+_assert_contains "verify registry cache: second run reports receipt path" '"receipt":"' "$__SLEY_OUT"
+_assert_contains "verify registry cache: second run reports cached count" '"cached_passed":1' "$__SLEY_OUT"
+_assert_eq "verify registry cache: second run does not rerun command" "1" "$(cat "$repo/tests/count")"
+
+_run_sley "$repo" verify --run-required --explain-cache
+_assert_exit "verify registry cache: explain run exits 0" 0 "$__SLEY_RC"
+_assert_contains "verify registry cache: explain reports cache decision" "cache decision: hit" "$__SLEY_OUT"
+_assert_contains "verify registry cache: explain reports key" "cache key: sha256:" "$__SLEY_OUT"
+_assert_contains "verify registry cache: explain reports selected file count" "cache selected files: 1" "$__SLEY_OUT"
+_assert_contains "verify registry cache: explain reports base policy" "cache base policy: upstream-tip" "$__SLEY_OUT"
+_assert_contains "verify registry cache: explain still reports cached pass" "cached pass fast: ./tests/run.sh" "$__SLEY_OUT"
+
+_run_sley "$repo" verify --cache-stats
+_assert_exit "verify registry cache: stats exits 0" 0 "$__SLEY_RC"
+_assert_contains "verify registry cache: stats reports receipt count" "receipts:" "$__SLEY_OUT"
+_assert_contains "verify registry cache: stats reports verify root" "/sley/verify" "$__SLEY_OUT"
+_old_cache_root="/sley/c""i"
+_assert_not_contains "verify registry cache: stats does not report old root" "$_old_cache_root" "$__SLEY_OUT"
+
+_run_sley "$repo" verify --run-required --json --force
+_assert_exit "verify registry cache: force run exits 0" 0 "$__SLEY_RC"
+_assert_contains "verify registry cache: force run reports passed" '"status":"passed"' "$__SLEY_OUT"
+_assert_eq "verify registry cache: force reruns command" "2" "$(cat "$repo/tests/count")"
+
+echo "changed again" >>"$repo/src/app.txt"
+_run_sley "$repo" verify --run-required --json
+_assert_exit "verify registry cache: selected content change exits 0" 0 "$__SLEY_RC"
+_assert_contains "verify registry cache: selected content change reruns" '"status":"passed"' "$__SLEY_OUT"
+_assert_eq "verify registry cache: selected content change increments count" "3" "$(cat "$repo/tests/count")"
+
+repo=$(_new_repo)
+mkdir -p "$repo/src" "$repo/tests" "$repo/.sley"
+cat >"$repo/src/app.txt" <<'EOF'
+initial
+EOF
+cat >"$repo/tests/run.sh" <<'EOF'
+#!/usr/bin/env bash
+count=0
+[[ -f "$COUNT_FILE" ]] && count=$(cat "$COUNT_FILE")
+count=$((count + 1))
+printf '%s\n' "$count" >"$COUNT_FILE"
+EOF
+chmod +x "$repo/tests/run.sh"
+cat >"$repo/.sley/verify.json" <<'EOF'
+{
+  "rules": [
+    {
+      "paths": ["src/**"],
+      "commands": [
+        {
+          "cmd": "./tests/run.sh",
+          "required": true,
+          "cache": {
+            "enabled": true,
+            "salt": "identity-stdout-test",
+            "identity": {
+              "commands": ["cat \"$IDENTITY_FILE\""]
+            }
+          }
+        }
+      ]
+    }
+  ]
+}
+EOF
+(cd "$repo" && git add . && git commit -q -m "seed identity stdout verify")
+echo "changed" >>"$repo/src/app.txt"
+counter=$(_tmpdir)/identity-counter
+identity_file=$(_tmpdir)/identity-input
+printf 'one\n' >"$identity_file"
+
+COUNT_FILE="$counter" IDENTITY_FILE="$identity_file" _run_sley "$repo" verify --run-required --json
+_assert_exit "verify registry cache: identity stdout first run exits 0" 0 "$__SLEY_RC"
+_assert_eq "verify registry cache: identity stdout first run increments count" "1" "$(cat "$counter")"
+
+COUNT_FILE="$counter" IDENTITY_FILE="$identity_file" _run_sley "$repo" verify --run-required --json
+_assert_exit "verify registry cache: identity stdout cached run exits 0" 0 "$__SLEY_RC"
+_assert_contains "verify registry cache: identity stdout cached run reports cached pass" '"status":"cached-pass"' "$__SLEY_OUT"
+_assert_eq "verify registry cache: identity stdout cached run does not rerun" "1" "$(cat "$counter")"
+
+printf 'two\n' >"$identity_file"
+COUNT_FILE="$counter" IDENTITY_FILE="$identity_file" _run_sley "$repo" verify --run-required --json
+_assert_exit "verify registry cache: identity stdout change exits 0" 0 "$__SLEY_RC"
+_assert_contains "verify registry cache: identity stdout change reruns" '"status":"passed"' "$__SLEY_OUT"
+_assert_eq "verify registry cache: identity stdout change increments count" "2" "$(cat "$counter")"
+
+repo=$(_new_repo)
+mkdir -p "$repo/src" "$repo/tests" "$repo/.sley"
+cat >"$repo/src/app.txt" <<'EOF'
+initial
+EOF
+cat >"$repo/tests/run.sh" <<'EOF'
+#!/usr/bin/env bash
+count=0
+[[ -f tests/count ]] && count=$(cat tests/count)
+count=$((count + 1))
+printf '%s\n' "$count" > tests/count
+EOF
+chmod +x "$repo/tests/run.sh"
+cat >"$repo/.sley/verify.json" <<'EOF'
+{
+  "rules": [
+    {
+      "paths": ["src/**"],
+      "commands": [
+        {
+          "cmd": "./tests/run.sh \"${TEST_MODE:?TEST_MODE is not set}\"",
+          "required": true,
+          "cache": {
+            "enabled": true,
+            "salt": "identity-env-test",
+            "identity": {
+              "env": ["TEST_MODE"]
+            }
+          }
+        }
+      ]
+    }
+  ]
+}
+EOF
+(cd "$repo" && git add . && git commit -q -m "seed identity env verify")
+echo "changed" >>"$repo/src/app.txt"
+
+TEST_MODE=one _run_sley "$repo" verify --run-required --json
+_assert_exit "verify registry cache: identity env first run exits 0" 0 "$__SLEY_RC"
+_assert_eq "verify registry cache: identity env first run increments count" "1" "$(cat "$repo/tests/count")"
+
+TEST_MODE=one _run_sley "$repo" verify --run-required --json
+_assert_exit "verify registry cache: identity env cached run exits 0" 0 "$__SLEY_RC"
+_assert_contains "verify registry cache: identity env cached run reports cached pass" '"status":"cached-pass"' "$__SLEY_OUT"
+_assert_eq "verify registry cache: identity env cached run does not rerun" "1" "$(cat "$repo/tests/count")"
+
+TEST_MODE=two _run_sley "$repo" verify --run-required --json
+_assert_exit "verify registry cache: identity env change exits 0" 0 "$__SLEY_RC"
+_assert_contains "verify registry cache: identity env change reruns" '"status":"passed"' "$__SLEY_OUT"
+_assert_eq "verify registry cache: identity env change increments count" "2" "$(cat "$repo/tests/count")"
+
+_run_sley "$repo" verify --run-required --json
+_assert_exit "verify registry cache: missing identity env still runs command" 1 "$__SLEY_RC"
+_assert_contains "verify registry cache: missing identity env reports command failure" '"status":"failed"' "$__SLEY_OUT"
+_assert_eq "verify registry cache: missing identity env does not write receipt" "2" "$(cat "$repo/tests/count")"
+
+repo=$(_new_repo)
+origin=$(_tmpdir)
+git init -q --bare "$origin"
+mkdir -p "$repo/src" "$repo/tests" "$repo/.sley"
+cat >"$repo/src/app.txt" <<'EOF'
+initial
+EOF
+cat >"$repo/tests/run.sh" <<'EOF'
+#!/usr/bin/env bash
+count=0
+[[ -f "$COUNT_FILE" ]] && count=$(cat "$COUNT_FILE")
+count=$((count + 1))
+printf '%s\n' "$count" >"$COUNT_FILE"
+EOF
+chmod +x "$repo/tests/run.sh"
+cat >"$repo/.sley/verify.json" <<'EOF'
+{
+  "rules": [
+    {
+      "paths": ["src/**"],
+      "commands": [
+        {
+          "cmd": "./tests/run.sh",
+          "required": true,
+          "cache": {
+            "enabled": true,
+            "salt": "upstream-tip-test"
+          }
+        }
+      ]
+    }
+  ]
+}
+EOF
+(cd "$repo" && git add . && git commit -q -m "seed upstream-tip verify")
+git -C "$repo" remote add origin "$origin"
+branch=$(git -C "$repo" branch --show-current)
+git -C "$repo" push -q -u origin "$branch"
+echo "changed" >>"$repo/src/app.txt"
+(cd "$repo" && git add src/app.txt && git commit -q -m "local change")
+counter=$(_tmpdir)/upstream-tip-counter
+
+COUNT_FILE="$counter" _run_sley "$repo" verify --run-required --json
+_assert_exit "verify registry cache: upstream-tip first run exits 0" 0 "$__SLEY_RC"
+_assert_eq "verify registry cache: upstream-tip first run increments count" "1" "$(cat "$counter")"
+
+other=$(_tmpdir)
+git clone -q -b "$branch" "$origin" "$other"
+git -C "$other" config user.email test@test.local
+git -C "$other" config user.name "Test User"
+(cd "$other" && git commit -q --allow-empty -m "advance remote")
+git -C "$other" push -q origin "$branch"
+git -C "$repo" fetch -q origin
+
+COUNT_FILE="$counter" _run_sley "$repo" verify --run-required --json
+_assert_exit "verify registry cache: upstream-tip remote advance exits 0" 0 "$__SLEY_RC"
+_assert_contains "verify registry cache: upstream-tip remote advance reruns" '"status":"passed"' "$__SLEY_OUT"
+_assert_eq "verify registry cache: upstream-tip remote advance increments count" "2" "$(cat "$counter")"
+
+repo=$(_new_repo)
+origin=$(_tmpdir)
+git init -q --bare "$origin"
+mkdir -p "$repo/src" "$repo/tests" "$repo/.sley"
+cat >"$repo/src/app.txt" <<'EOF'
+initial
+EOF
+cat >"$repo/tests/run.sh" <<'EOF'
+#!/usr/bin/env bash
+count=0
+[[ -f "$COUNT_FILE" ]] && count=$(cat "$COUNT_FILE")
+count=$((count + 1))
+printf '%s\n' "$count" >"$COUNT_FILE"
+EOF
+chmod +x "$repo/tests/run.sh"
+cat >"$repo/.sley/verify.json" <<'EOF'
+{
+  "rules": [
+    {
+      "paths": ["src/**"],
+      "commands": [
+        {
+          "cmd": "./tests/run.sh",
+          "required": true,
+          "cache": {
+            "enabled": true,
+            "base_policy": "selected-content",
+            "salt": "selected-content-test"
+          }
+        }
+      ]
+    }
+  ]
+}
+EOF
+(cd "$repo" && git add . && git commit -q -m "seed selected-content verify")
+git -C "$repo" remote add origin "$origin"
+branch=$(git -C "$repo" branch --show-current)
+git -C "$repo" push -q -u origin "$branch"
+echo "changed" >>"$repo/src/app.txt"
+(cd "$repo" && git add src/app.txt && git commit -q -m "local change")
+counter=$(_tmpdir)/selected-content-counter
+
+COUNT_FILE="$counter" _run_sley "$repo" verify --run-required --json
+_assert_exit "verify registry cache: selected-content first run exits 0" 0 "$__SLEY_RC"
+_assert_eq "verify registry cache: selected-content first run increments count" "1" "$(cat "$counter")"
+
+other=$(_tmpdir)
+git clone -q -b "$branch" "$origin" "$other"
+git -C "$other" config user.email test@test.local
+git -C "$other" config user.name "Test User"
+(cd "$other" && git commit -q --allow-empty -m "advance remote")
+git -C "$other" push -q origin "$branch"
+git -C "$repo" fetch -q origin
+
+COUNT_FILE="$counter" _run_sley "$repo" verify --run-required --json
+_assert_exit "verify registry cache: selected-content remote advance exits 0" 0 "$__SLEY_RC"
+_assert_contains "verify registry cache: selected-content remote advance hits" '"status":"cached-pass"' "$__SLEY_OUT"
+_assert_eq "verify registry cache: selected-content remote advance does not rerun" "1" "$(cat "$counter")"
+
+repo=$(_new_repo)
+mkdir -p "$repo/src" "$repo/tests" "$repo/.sley"
+cat >"$repo/src/app.txt" <<'EOF'
+initial
+EOF
+cat >"$repo/tests/run.sh" <<'EOF'
+#!/usr/bin/env bash
+count=0
+[[ -f tests/count ]] && count=$(cat tests/count)
+count=$((count + 1))
+printf '%s\n' "$count" > tests/count
+EOF
+chmod +x "$repo/tests/run.sh"
+cat >"$repo/.sley/verify.json" <<'EOF'
+{
+  "rules": [
+    {
+      "paths": ["src/**"],
+      "commands": [
+        {
+          "cmd": "./tests/run.sh",
+          "required": true,
+          "cache": {
+            "enabled": true,
+            "salt": "identity-failure-test",
+            "identity": {
+              "commands": ["./tests/missing-identity"]
+            }
+          }
+        }
+      ]
+    }
+  ]
+}
+EOF
+(cd "$repo" && git add . && git commit -q -m "seed identity failure verify")
+echo "changed" >>"$repo/src/app.txt"
+
+_run_sley "$repo" verify --run-required --json
+_assert_exit "verify registry cache: identity failure still runs command" 0 "$__SLEY_RC"
+_assert_contains "verify registry cache: identity failure reports passed" '"status":"passed"' "$__SLEY_OUT"
+_assert_not_contains "verify registry cache: identity failure is not cached" '"cached-pass"' "$__SLEY_OUT"
+_assert_eq "verify registry cache: identity failure first run increments count" "1" "$(cat "$repo/tests/count")"
+
+_run_sley "$repo" verify --run-required --json
+_assert_exit "verify registry cache: identity failure rerun exits 0" 0 "$__SLEY_RC"
+_assert_contains "verify registry cache: identity failure rerun reports passed" '"status":"passed"' "$__SLEY_OUT"
+_assert_eq "verify registry cache: identity failure prevents receipt reuse" "2" "$(cat "$repo/tests/count")"
+
+repo=$(_new_repo)
+mkdir -p "$repo/src" "$repo/tests" "$repo/.sley"
+cat >"$repo/src/app.txt" <<'EOF'
+initial
+EOF
+cat >"$repo/tests/run.sh" <<'EOF'
+#!/usr/bin/env bash
+count=0
+[[ -f tests/count ]] && count=$(cat tests/count)
+count=$((count + 1))
+printf '%s\n' "$count" > tests/count
+EOF
+chmod +x "$repo/tests/run.sh"
+cat >"$repo/.sley/verify.json" <<'EOF'
+{
+  "rules": [
+    {
+      "paths": ["src/**"],
+      "commands": [
+        {
+          "cmd": "./tests/run.sh",
+          "required": true,
+          "cache": {
+            "enabled": true,
+            "salt": "malformed-receipt-test"
+          }
+        }
+      ]
+    }
+  ]
+}
+EOF
+(cd "$repo" && git add . && git commit -q -m "seed malformed receipt verify")
+echo "changed" >>"$repo/src/app.txt"
+
+_run_sley "$repo" verify --run-required --json
+_assert_exit "verify registry cache: malformed receipt first run exits 0" 0 "$__SLEY_RC"
+
+_run_sley "$repo" verify --run-required --json
+_assert_exit "verify registry cache: malformed receipt cached setup exits 0" 0 "$__SLEY_RC"
+_assert_contains "verify registry cache: malformed receipt cached setup hits" '"status":"cached-pass"' "$__SLEY_OUT"
+receipt=$(printf '%s\n' "$__SLEY_OUT" | sed -n 's/^sley verify: receipt: //p' | head -1)
+printf '{not-json\n' >"$receipt"
+
+_run_sley "$repo" verify --run-required --json
+_assert_exit "verify registry cache: malformed receipt is treated as miss" 0 "$__SLEY_RC"
+_assert_contains "verify registry cache: malformed receipt reruns command" '"status":"passed"' "$__SLEY_OUT"
+_assert_eq "verify registry cache: malformed receipt increments count" "2" "$(cat "$repo/tests/count")"
+
+repo=$(_new_repo)
+mkdir -p "$repo/src" "$repo/tests" "$repo/.sley"
+cat >"$repo/src/app.txt" <<'EOF'
+initial
+EOF
+cat >"$repo/tests/run.sh" <<'EOF'
+#!/usr/bin/env bash
+echo mutated >> src/app.txt
+EOF
+chmod +x "$repo/tests/run.sh"
+cat >"$repo/.sley/verify.json" <<'EOF'
+{
+  "rules": [
+    {
+      "paths": ["src/**"],
+      "commands": [
+        {
+          "cmd": "./tests/run.sh",
+          "required": true,
+          "cache": {
+            "enabled": true,
+            "salt": "post-key-mismatch-test"
+          }
+        }
+      ]
+    }
+  ]
+}
+EOF
+(cd "$repo" && git add . && git commit -q -m "seed post key mismatch verify")
+echo "changed" >>"$repo/src/app.txt"
+
+_run_sley "$repo" verify --run-required
+_assert_exit "verify registry cache: post-run mutation blocks receipt" 1 "$__SLEY_RC"
+_assert_contains "verify registry cache: post-run mutation explains mismatch" \
+  "changes changed during required command; not caching receipt" "$__SLEY_OUT"
+
+repo=$(_new_repo)
+mkdir -p "$repo/tests" "$repo/.sley"
+cat >"$repo/.sley/verify.json" <<'EOF'
+{
+  "rules": [
+    {
+      "paths": ["scratch.txt"],
+      "commands": [
+        {
+          "cmd": "./tests/run.sh",
+          "required": true,
+          "cache": {
+            "enabled": true,
+            "salt": "untracked-cache-test"
+          }
+        }
+      ]
+    }
+  ]
+}
+EOF
+cat >"$repo/tests/run.sh" <<'EOF'
+#!/usr/bin/env bash
+count=0
+[[ -f "$COUNT_FILE" ]] && count=$(cat "$COUNT_FILE")
+count=$((count + 1))
+printf '%s\n' "$count" >"$COUNT_FILE"
+EOF
+chmod +x "$repo/tests/run.sh"
+(cd "$repo" && git add . && git commit -q -m "seed untracked cache verify")
+echo "one" >"$repo/scratch.txt"
+counter=$(_tmpdir)/untracked-counter
+
+COUNT_FILE="$counter" _run_sley "$repo" verify --run-required --include-untracked --json
+_assert_exit "verify registry cache: untracked first run exits 0" 0 "$__SLEY_RC"
+_assert_eq "verify registry cache: untracked first run increments count" "1" "$(cat "$counter")"
+
+COUNT_FILE="$counter" _run_sley "$repo" verify --run-required --include-untracked --json
+_assert_exit "verify registry cache: untracked cached run exits 0" 0 "$__SLEY_RC"
+_assert_contains "verify registry cache: untracked cached run reports cached pass" '"status":"cached-pass"' "$__SLEY_OUT"
+_assert_eq "verify registry cache: untracked cached run does not rerun" "1" "$(cat "$counter")"
+
+echo "two" >"$repo/scratch.txt"
+COUNT_FILE="$counter" _run_sley "$repo" verify --run-required --include-untracked --json
+_assert_exit "verify registry cache: untracked content change exits 0" 0 "$__SLEY_RC"
+_assert_contains "verify registry cache: untracked content change reruns" '"status":"passed"' "$__SLEY_OUT"
+_assert_eq "verify registry cache: untracked content change increments count" "2" "$(cat "$counter")"
+
+home=$(_tmpdir)
+mkdir -p "$home/.local/bin"
+_copy_sley_libs "$home"
+cat >"$home/.bash_profile" <<'EOF'
+export SLEY_LOGIN_MARKER=from-login-profile
+EOF
+repo=$(_new_repo)
+mkdir -p "$repo/src" "$repo/tests" "$repo/.sley"
+cat >"$repo/src/app.txt" <<'EOF'
+initial
+EOF
+cat >"$repo/tests/shell-mode.sh" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "${SLEY_LOGIN_MARKER:-default-shell}" > tests/shell-mode
+EOF
+chmod +x "$repo/tests/shell-mode.sh"
+cat >"$repo/.sley/verify.json" <<'EOF'
+{
+  "rules": [
+    {
+      "paths": ["src/**"],
+      "commands": [
+        {
+          "cmd": "./tests/shell-mode.sh",
+          "required": true,
+          "cache": {
+            "enabled": true,
+            "salt": "default-shell"
+          }
+        }
+      ]
+    }
+  ]
+}
+EOF
+(cd "$repo" && git add . && git commit -q -m "seed default shell verify")
+echo "changed" >>"$repo/src/app.txt"
+
+HOME="$home" _run_sley "$repo" verify --run-required
+_assert_exit "verify registry cache: default shell run exits 0" 0 "$__SLEY_RC"
+_assert_eq "verify registry cache: default shell avoids login startup" "default-shell" "$(cat "$repo/tests/shell-mode")"
+
+cat >"$repo/.sley/verify.json" <<'EOF'
+{
+  "rules": [
+    {
+      "paths": ["src/**"],
+      "commands": [
+        {
+          "cmd": "./tests/shell-mode.sh",
+          "required": true,
+          "cache": {
+            "enabled": true,
+            "shell": "login",
+            "salt": "login-shell"
+          }
+        }
+      ]
+    }
+  ]
+}
+EOF
+(cd "$repo" && git add .sley/verify.json && git commit -q -m "switch to login shell verify")
+echo "changed again" >>"$repo/src/app.txt"
+
+HOME="$home" _run_sley "$repo" verify --run-required
+_assert_exit "verify registry cache: login shell run exits 0" 0 "$__SLEY_RC"
+_assert_eq "verify registry cache: login shell opts into startup files" "from-login-profile" "$(cat "$repo/tests/shell-mode")"
+
+repo=$(_new_repo)
+mkdir -p "$repo/src" "$repo/docs" "$repo/tests" "$repo/.sley"
+cat >"$repo/src/app.txt" <<'EOF'
+initial
+EOF
+cat >"$repo/docs/readme.md" <<'EOF'
+initial
+EOF
+cat >"$repo/tests/run.sh" <<'EOF'
+#!/usr/bin/env bash
+echo should-not-run > tests/ran
+EOF
+chmod +x "$repo/tests/run.sh"
+cat >"$repo/.sley/verify.json" <<'EOF'
+{"rules":[{"paths":["src/**"],"commands":["./tests/run.sh"]}]}
+EOF
+(cd "$repo" && git add . && git commit -q -m "seed unmatched verify registry")
+echo "changed" >"$repo/docs/readme.md"
+
+_run_sley "$repo" verify --run-required
+_assert_exit "verify registry: unmatched change exits 0" 0 "$__SLEY_RC"
+_assert_contains "verify registry: unmatched reports no mapped commands" "no required verification commands mapped" "$__SLEY_OUT"
+_assert_file_missing "verify registry: unmatched command not run" "$repo/tests/ran"
+
+repo=$(_new_repo)
+mkdir -p "$repo/src" "$repo/tests" "$repo/.sley"
+cat >"$repo/src/app.txt" <<'EOF'
+initial
+EOF
+cat >"$repo/tests/run.sh" <<'EOF'
+#!/usr/bin/env bash
+exit 7
+EOF
+chmod +x "$repo/tests/run.sh"
+cat >"$repo/.sley/verify.json" <<'EOF'
+{"rules":[{"paths":["src/**"],"commands":["./tests/run.sh"]}]}
+EOF
+(cd "$repo" && git add . && git commit -q -m "seed failing verify registry")
+echo "changed" >>"$repo/src/app.txt"
+
+_run_sley "$repo" verify --run-required
+_assert_exit "verify registry: failing mapped command blocks readiness" 1 "$__SLEY_RC"
+_assert_contains "verify registry: failing command exit recorded" "exit code: 7" "$__SLEY_OUT"
+
+repo=$(_new_repo)
+cat >"$repo/file.txt" <<'EOF'
+initial
+EOF
+(cd "$repo" && git add file.txt && git commit -q -m "seed no registry")
+echo "changed" >>"$repo/file.txt"
+
+_run_sley "$repo" verify --run-required
+_assert_exit "verify registry: missing registry exits 0" 0 "$__SLEY_RC"
+_assert_contains "verify registry: missing registry reports no required commands" "no required verification commands mapped" "$__SLEY_OUT"
+
+repo=$(_new_repo)
+mkdir -p "$repo/service/.sley" "$repo/service/src"
+cat >"$repo/service/src/app.txt" <<'EOF'
+initial
+EOF
+cat >"$repo/service/.sley/verify.json" <<'EOF'
+{"rules":[{"paths":["service/src/**"],"commands":["echo service-test"]}]}
+EOF
+(cd "$repo" && git add . && git commit -q -m "seed subtree verify")
+echo "changed" >>"$repo/service/src/app.txt"
+
+_run_sley "$repo" verify
+_assert_exit "verify registry: subtree config exits 0" 0 "$__SLEY_RC"
+_assert_contains "verify registry: subtree config is discovered" "repo-config: service/.sley/verify.json" "$__SLEY_OUT"
+_assert_contains "verify registry: subtree command is listed" "echo service-test" "$__SLEY_OUT"
+
+repo=$(_new_repo)
+home=$(_tmpdir)
+_copy_sley_libs "$home"
+mkdir -p "$home/.config/sley/verify.d"
+cat >"$repo/app.txt" <<'EOF'
+initial
+EOF
+cat >"$home/.config/sley/verify.d/private.json" <<EOF
+{
+  "repos": [
+    {
+      "match": {"root": "$repo"},
+      "rules": [
+        {"paths": ["app.txt"], "commands": ["echo private-test"]}
+      ]
+    }
+  ]
+}
+EOF
+(cd "$repo" && git add app.txt && git commit -q -m "seed private verify")
+echo "changed" >>"$repo/app.txt"
+
+HOME="$home" _run_sley "$repo" verify
+_assert_exit "verify registry: user config exits 0" 0 "$__SLEY_RC"
+_assert_contains "verify registry: user config is discovered" "user-config: $home/.config/sley/verify.d/private.json" "$__SLEY_OUT"
+_assert_contains "verify registry: user command is listed" "echo private-test" "$__SLEY_OUT"
+
+repo=$(_new_repo)
+home=$(_tmpdir)
+overlay=$(_tmpdir)
+_copy_sley_libs "$home"
+mkdir -p "$home/.config/sley/verify.d" "$overlay/verify.d"
+cat >"$repo/app.txt" <<'EOF'
+initial
+EOF
+cat >"$overlay/verify.d/linked.json" <<EOF
+{
+  "repos": [
+    {
+      "match": {"root": "$repo"},
+      "rules": [
+        {"paths": ["app.txt"], "commands": ["echo linked-test"]}
+      ]
+    }
+  ]
+}
+EOF
+ln -s "$overlay/verify.d/linked.json" "$home/.config/sley/verify.d/linked.json"
+(cd "$repo" && git add app.txt && git commit -q -m "seed linked private verify")
+echo "changed" >>"$repo/app.txt"
+
+HOME="$home" _run_sley "$repo" verify
+_assert_exit "verify registry: symlinked user config exits 0" 0 "$__SLEY_RC"
+_assert_contains "verify registry: symlinked user config is discovered" "user-config: $home/.config/sley/verify.d/linked.json" "$__SLEY_OUT"
+_assert_contains "verify registry: symlinked user command is listed" "echo linked-test" "$__SLEY_OUT"
+
+repo=$(_new_repo)
+home="$repo"
+_copy_sley_libs "$home"
+mkdir -p "$home/.config/sley/verify.d"
+git -C "$repo" remote add origin https://github.com/example/project.git
+cat >"$repo/app.txt" <<'EOF'
+initial
+EOF
+cat >"$home/.config/sley/verify.d/project.json" <<'EOF'
+{
+  "repos": [
+    {
+      "match": {"remote": "https://github.com/example/project.git"},
+      "rules": [
+        {"paths": ["app.txt"], "commands": ["echo project-test"]}
+      ]
+    }
+  ]
+}
+EOF
+(cd "$repo" && git add app.txt && git commit -q -m "seed home verify")
+echo "changed" >>"$repo/app.txt"
+
+HOME="$home" _run_sley "$repo" verify
+_assert_exit "verify registry: home user config exits 0" 0 "$__SLEY_RC"
+_assert_contains "verify registry: home user config keeps user context" \
+  "user-config: .config/sley/verify.d/project.json" "$__SLEY_OUT"
+_assert_contains "verify registry: home user config command is listed" "echo project-test" "$__SLEY_OUT"
+
+repo=$(_new_repo)
+config_dir=$(_tmpdir)
+mkdir -p "$config_dir/dir" "$repo"
+cat >"$repo/app.txt" <<'EOF'
+initial
+EOF
+cat >"$config_dir/file.json" <<EOF
+{
+  "repos": [
+    {
+      "match": {"root": "$repo"},
+      "rules": [
+        {"paths": ["app.txt"], "commands": ["echo env-file-test"]}
+      ]
+    }
+  ]
+}
+EOF
+cat >"$config_dir/dir/private.json" <<EOF
+{
+  "repos": [
+    {
+      "match": {"root": "$repo"},
+      "rules": [
+        {"paths": ["app.txt"], "commands": ["echo env-dir-test"]}
+      ]
+    }
+  ]
+}
+EOF
+cat >"$config_dir/old.json" <<EOF
+{
+  "repos": [
+    {
+      "match": {"root": "$repo"},
+      "rules": [
+        {"paths": ["app.txt"], "commands": ["echo old-env-test"]}
+      ]
+    }
+  ]
+}
+EOF
+(cd "$repo" && git add app.txt && git commit -q -m "seed env verify")
+echo "changed" >>"$repo/app.txt"
+
+SLEY_VERIFY_CONFIG="$config_dir/file.json" _run_sley "$repo" verify
+_assert_exit "verify registry: env file config exits 0" 0 "$__SLEY_RC"
+_assert_contains "verify registry: env file config is discovered" \
+  "user-config: $config_dir/file.json" "$__SLEY_OUT"
+_assert_contains "verify registry: env file command is listed" "echo env-file-test" "$__SLEY_OUT"
+
+SLEY_VERIFY_CONFIG="$config_dir/dir" _run_sley "$repo" verify
+_assert_exit "verify registry: env dir config exits 0" 0 "$__SLEY_RC"
+_assert_contains "verify registry: env dir config is discovered" \
+  "user-config: $config_dir/dir/private.json" "$__SLEY_OUT"
+_assert_contains "verify registry: env dir command is listed" "echo env-dir-test" "$__SLEY_OUT"
+
+_old_config_env="SLEY_C""I_CONFIG"
+export "$_old_config_env=$config_dir/old.json"
+_run_sley "$repo" verify --run-required
+unset "$_old_config_env"
+_assert_exit "verify registry: old env config is ignored" 0 "$__SLEY_RC"
+_assert_contains "verify registry: old env config maps no commands" \
+  "no required verification commands mapped" "$__SLEY_OUT"
+_assert_not_contains "verify registry: old env command is not listed" "old-env-test" "$__SLEY_OUT"
+
+repo=$(_new_repo)
+mkdir -p "$repo/src" "$repo/.sley"
+cat >"$repo/src/app.txt" <<'EOF'
+initial
+EOF
+cat >"$repo/.sley/verify.json" <<'EOF'
+{
+  "rules": [
+    {
+      "paths": ["src/**"],
+      "commands": [
+        {"cmd": "echo slow-test", "required": true, "tier": "slow"}
+      ]
+    }
+  ]
+}
+EOF
+(cd "$repo" && git add . && git commit -q -m "seed slow verify")
+echo "changed" >>"$repo/src/app.txt"
+
+_run_sley "$repo" verify --run-required
+_assert_exit "verify registry: slow required blocks default run" 1 "$__SLEY_RC"
+_assert_contains "verify registry: slow required explains full run" "slow required command not run" "$__SLEY_OUT"
+
+_run_sley "$repo" verify --run-required --full
+_assert_exit "verify registry: full run executes slow required" 0 "$__SLEY_RC"
+_assert_contains "verify registry: full run output" "slow-test" "$__SLEY_OUT"
+
+repo=$(_new_repo)
+mkdir -p "$repo/src" "$repo/.sley"
+cat >"$repo/src/app.txt" <<'EOF'
+initial
+EOF
+cat >"$repo/.sley/verify.json" <<'EOF'
+{
+  "rules": [
+    {
+      "paths": ["src/**"],
+      "commands": [
+        {
+          "cmd": "echo slow-cache",
+          "required": true,
+          "tier": "slow",
+          "cache": {
+            "enabled": true,
+            "salt": "slow-cache-test"
+          }
+        }
+      ]
+    }
+  ]
+}
+EOF
+(cd "$repo" && git add . && git commit -q -m "seed slow cached verify")
+echo "changed" >>"$repo/src/app.txt"
+
+_run_sley "$repo" verify --run-required --full --json
+_assert_exit "verify registry: full run writes slow receipt" 0 "$__SLEY_RC"
+_assert_contains "verify registry: full run reports slow pass" '"status":"passed"' "$__SLEY_OUT"
+
+_run_sley "$repo" verify --run-required --json
+_assert_exit "verify registry: cached slow passes without full" 0 "$__SLEY_RC"
+_assert_contains "verify registry: cached slow reports cached pass" '"status":"cached-pass"' "$__SLEY_OUT"
+_assert_not_contains "verify registry: cached slow is not skipped" '"status":"skipped-slow"' "$__SLEY_OUT"
+
+repo=$(_tmpdir)
+mkdir -p "$repo/.sl" "$repo/base" "$repo/tip" "$repo/tests" "$repo/.sley"
+mockbin=$(_mock_bin)
+cat >"$mockbin/sl" <<'MOCK'
+#!/usr/bin/env bash
+case "$1" in
+  root)
+    printf '%s\n' "$SL_REPO"
+    ;;
+  log)
+    case "$*" in
+      *'{phase}'*) printf 'draft' ;;
+      *'sort(draft() & ::., topo)'*) printf 'lowerrev\ntiprev\n' ;;
+      *'last(public() & ::.)'*) printf 'public-ancestor' ;;
+      *'last(public())'*) printf 'public-tip' ;;
+    esac
+    ;;
+  status)
+    case "$*" in
+      *'--change lowerrev'*) printf 'base/lower.txt\n' ;;
+      *'--change tiprev'*) printf 'tip/tip.txt\n' ;;
+      *'--change .'*) printf 'tip/tip.txt\n' ;;
+      *) printf 'tip/pending.txt\n' ;;
+    esac
+    ;;
+esac
+MOCK
+chmod +x "$mockbin/sl"
+cat >"$repo/base/lower.txt" <<'EOF'
+lower v1
+EOF
+cat >"$repo/tip/tip.txt" <<'EOF'
+tip v1
+EOF
+cat >"$repo/tip/pending.txt" <<'EOF'
+pending
+EOF
+cat >"$repo/tests/run.sh" <<'EOF'
+#!/usr/bin/env bash
+count=0
+[[ -f tests/count ]] && count=$(cat tests/count)
+count=$((count + 1))
+printf '%s\n' "$count" > tests/count
+EOF
+chmod +x "$repo/tests/run.sh"
+cat >"$repo/.sley/verify.json" <<'EOF'
+{
+  "rules": [
+    {
+      "paths": ["**"],
+      "commands": [
+        {
+          "cmd": "./tests/run.sh",
+          "required": true,
+          "cache": {
+            "enabled": true,
+            "salt": "sl-stack-cache-test"
+          }
+        }
+      ]
+    }
+  ]
+}
+EOF
+
+SL_REPO="$repo" PATH="$mockbin:$PATH" _run_sley "$repo" changes
+_assert_exit "changes: sl stack-aware changed scope exits 0" 0 "$__SLEY_RC"
+_assert_contains "changes: sl stack includes lower draft file" "base/lower.txt" "$__SLEY_OUT"
+_assert_contains "changes: sl stack includes tip draft file" "tip/tip.txt" "$__SLEY_OUT"
+_assert_contains "changes: sl stack includes pending file" "tip/pending.txt" "$__SLEY_OUT"
+
+SL_REPO="$repo" PATH="$mockbin:$PATH" _run_sley "$repo" verify --run-required --json
+_assert_exit "verify registry cache: sl stack first run exits 0" 0 "$__SLEY_RC"
+_assert_eq "verify registry cache: sl stack first run executes command" "1" "$(cat "$repo/tests/count")"
+
+cat >"$repo/base/lower.txt" <<'EOF'
+lower v2
+EOF
+SL_REPO="$repo" PATH="$mockbin:$PATH" _run_sley "$repo" verify --run-required --json
+_assert_exit "verify registry cache: sl lower stack change exits 0" 0 "$__SLEY_RC"
+_assert_contains "verify registry cache: sl lower stack change reruns" '"status":"passed"' "$__SLEY_OUT"
+_assert_eq "verify registry cache: sl lower stack change invalidates receipt" "2" "$(cat "$repo/tests/count")"
+
+repo=$(_new_repo)
+mkdir -p "$repo/src" "$repo/.sley"
+cat >"$repo/src/app.txt" <<'EOF'
+initial
+EOF
+cat >"$repo/.sley/verify.json" <<'EOF'
+{"rules":[
+EOF
+(cd "$repo" && git add . && git commit -q -m "seed malformed verify")
+echo "changed" >>"$repo/src/app.txt"
+
+_run_sley "$repo" verify --run-required
+_assert_exit "verify registry: malformed config blocks" 1 "$__SLEY_RC"
+_assert_contains "verify registry: malformed config reports source" "invalid verify registry" "$__SLEY_OUT"
+
+repo=$(_new_repo)
+mkdir -p "$repo/src" "$repo/.sley"
+cat >"$repo/src/app.txt" <<'EOF'
+initial
+EOF
+cat >"$repo/.sley/verify.json" <<'EOF'
+{"rules":[{"paths":["src/**"]}]}
+EOF
+(cd "$repo" && git add . && git commit -q -m "seed invalid verify rule")
+echo "changed" >>"$repo/src/app.txt"
+
+_run_sley "$repo" verify --run-required
+_assert_exit "verify registry: invalid rule blocks" 1 "$__SLEY_RC"
+_assert_contains "verify registry: invalid rule reports source" "invalid verify registry" "$__SLEY_OUT"
+
+echo "=== sley: verify registry schema ==="
+
+schema="$SLEY_REPO_ROOT/share/sley/schemas/verify.schema.json"
+_assert_file_exists "verify registry schema: repo schema file is tracked" "$schema"
+
+if command -v jq >/dev/null 2>&1; then
+  jq empty "$schema" >/dev/null
+  _assert_exit "verify registry schema: schema is valid json" 0 "$?"
+
+  jq -e '
+    (any(.["$defs"].rule.anyOf[]?; .properties.enabled.const == false)) and
+    (any(.["$defs"].rule.anyOf[]?; .properties.enabled.type == "boolean")) and
+    (.["$defs"].cache.properties.base_policy.enum | index("selected-content") != null) and
+    (.["$defs"].cache.properties.identity_timeout.type == "integer") and
+    (any(.["$defs"].command.anyOf[]?; .properties.enabled.const == false)) and
+    (any(.["$defs"].command.anyOf[]?; .properties.enabled.type == "boolean"))
+  ' "$schema" >/dev/null
+  _assert_exit "verify registry schema: documents rule and command enabled flags" 0 "$?"
+
+  sample_verify=$(_tmpdir)/verify.json
+  cat >"$sample_verify" <<'EOF'
+{
+  "repos": [
+    {
+      "match": { "name": "example" },
+      "rules": [
+        {
+          "enabled": false,
+          "paths": ["src/**"],
+          "commands": [
+            {
+              "cmd": "test/smoke",
+              "enabled": false,
+              "cache": {
+                "enabled": true,
+                "base_policy": "selected-content",
+                "identity_timeout": 5
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
+EOF
+  jq -e '
+    .repos[0].rules[0].enabled = false
+    | .repos[0].rules[0].commands[0].enabled = false
+    | .repos[0].rules[0].commands[0].cache.enabled == true
+  ' "$sample_verify" >/dev/null
+  _assert_exit "verify registry schema: sample uses enabled flags" 0 "$?"
+else
+  echo "  SKIP: jq not installed"
+fi
+
+echo "=== sley: ready json contract ==="
+
+repo=$(_new_repo)
+
+_run_sley "$repo" ready --json
+_assert_exit "ready --json: optional unavailable phases do not fail run" 0 "$__SLEY_RC"
+_assert_contains "ready --json: emits phases" '"phases":[' "$__SLEY_OUT"
+_assert_contains "ready --json: emits status phase" '"name":"status"' "$__SLEY_OUT"
+_assert_contains "ready --json: emits secrets phase" '"name":"secrets"' "$__SLEY_OUT"
+_assert_contains "ready --json: emits verify phase" '"name":"verify"' "$__SLEY_OUT"
+_assert_not_contains "ready --json: omits removed review phase" '"name":"review"' "$__SLEY_OUT"
+_assert_contains "ready --json: phase includes summary" '"summary":' "$__SLEY_OUT"
+
+_old_phase="c""i"
+_run_sley "$repo" ready --exclude "$_old_phase"
+_assert_exit "ready: stale verify exclude errors" 2 "$__SLEY_RC"
+_assert_contains "ready: stale verify exclude reports unknown phase" \
+  "unknown phase for --exclude: $_old_phase" "$__SLEY_OUT"
+
+_old_workflows_phase="work""flows"
+_run_sley "$repo" ready --exclude "$_old_workflows_phase"
+_assert_exit "ready: stale workflow exclude errors" 2 "$__SLEY_RC"
+_assert_contains "ready: stale workflow exclude reports unknown phase" \
+  "unknown phase for --exclude: $_old_workflows_phase" "$__SLEY_OUT"
+
+_old_review_phase="rev""iew"
+_run_sley "$repo" ready --exclude "$_old_review_phase"
+_assert_exit "ready: stale review exclude errors" 2 "$__SLEY_RC"
+_assert_contains "ready: stale review exclude reports unknown phase" \
+  "unknown phase for --exclude: $_old_review_phase" "$__SLEY_OUT"
+
+repo=$(_new_repo)
+home=$(_tmpdir)
+_copy_sley_libs "$home"
+mkdir -p "$home/.config/sley/extensions.d"
+cat >"$home/.config/sley/extensions.d/80-ready-phase.sh" <<'WORK'
+sley_ext_ready_phases() {
+  echo custom-phase
+}
+sley_ext_ready_phase() {
+  case "$1" in
+    custom-phase)
+      echo "custom ready phase ran"
+      return 0
+      ;;
+    *)
+      return 2
+      ;;
+  esac
+}
+WORK
+
+HOME="$home" _run_sley "$repo" ready
+_assert_exit "ready: extension phase exits 0" 0 "$__SLEY_RC"
+_assert_contains "ready: extension phase is included" "custom-phase: 0 (pass)" "$__SLEY_OUT"
+_assert_contains "ready: extension phase output surfaces" "custom ready phase ran" "$__SLEY_OUT"
+
+HOME="$home" _run_sley "$repo" ready --exclude custom-phase
+_assert_exit "ready: excluded extension phase exits 0" 0 "$__SLEY_RC"
+_assert_not_contains "ready: excluded extension phase is suppressed" "custom-phase:" "$__SLEY_OUT"
+_assert_not_contains "ready: excluded extension phase output is suppressed" \
+  "custom ready phase ran" "$__SLEY_OUT"
+
+repo=$(_new_repo)
+home=$(_tmpdir)
+sync_dir=$(_tmpdir)
+_copy_sley_libs "$home"
+mkdir -p "$home/.config/sley/extensions.d"
+cat >"$home/.config/sley/extensions.d/80-ready-parallel.sh" <<'WORK'
+sley_ext_ready_phases() {
+  printf '%s\n' phase-a phase-b
+}
+sley_ext_ready_phase() {
+  case "$1" in
+    phase-a)
+      touch "$SLEY_READY_SYNC/a-start"
+      for _i in $(seq 1 100); do
+        if [[ -f "$SLEY_READY_SYNC/b-start" ]]; then
+          echo "phase-a saw phase-b"
+          return 0
+        fi
+        sleep 0.02
+      done
+      echo "phase-a timed out waiting for phase-b" >&2
+      return 7
+      ;;
+    phase-b)
+      touch "$SLEY_READY_SYNC/b-start"
+      echo "phase-b started"
+      return 0
+      ;;
+    *)
+      return 2
+      ;;
+  esac
+}
+WORK
+
+HOME="$home" SLEY_READY_SYNC="$sync_dir" _run_sley "$repo" ready
+_assert_exit "ready: extension phases run concurrently" 0 "$__SLEY_RC"
+_assert_contains "ready: concurrent phase output surfaces" "phase-a saw phase-b" "$__SLEY_OUT"
+
+echo "=== sley: --path argument validation ==="
+
+repo=$(_new_repo)
+# A flag-like value after --path is almost certainly a misplaced option, not a
+# real path. The parser must reject it instead of consuming the next flag as
+# the path scope.
+_run_sley "$repo" check --path --json
+_assert_exit "check: --path rejects flag-like argument" 2 "$__SLEY_RC"
+_assert_contains "check: --path flag-like argument is reported" "looks like a flag" "$__SLEY_OUT"
+
+echo "=== sley: check passes lint stderr through ==="
+
+# Use an isolated HOME without Sley extensions so the base autolint path runs
+# rather than a locally installed lint override.
+repo=$(_new_repo)
+home=$(_tmpdir)
+_copy_sley_libs "$home"
+mockbin=$(_mock_bin)
+cat >"$mockbin/autolint" <<'MOCK'
+#!/usr/bin/env bash
+printf 'autolint: synthetic diagnostic on %s\n' "$1" >&2
+exit 9
+MOCK
+chmod +x "$mockbin/autolint"
+echo "x = 1" >"$repo/lint-me.py"
+(cd "$repo" && git add lint-me.py && git commit -q -m "seed")
+echo "x = 2" >"$repo/lint-me.py"
+
+HOME="$home" PATH="$mockbin:$PATH" _run_sley "$repo" check
+_assert_exit "check: autolint failure exits 1" 1 "$__SLEY_RC"
+_assert_contains "check: surfaces autolint diagnostics on stderr" "synthetic diagnostic" "$__SLEY_OUT"
+
+echo "=== sley: ready surfaces phase failure detail in human output ==="
+
+repo=$(_new_repo)
+home=$(_tmpdir)
+_copy_sley_libs "$home"
+mockbin=$(_mock_bin)
+cat >"$mockbin/autolint" <<'MOCK'
+#!/usr/bin/env bash
+printf 'autolint: ready-phase synthetic diagnostic\n' >&2
+exit 9
+MOCK
+chmod +x "$mockbin/autolint"
+cat >"$mockbin/gitleaks" <<'MOCK'
+#!/usr/bin/env bash
+exit 0
+MOCK
+chmod +x "$mockbin/gitleaks"
+echo "x = 1" >"$repo/ready-detail.py"
+(cd "$repo" && git add ready-detail.py && git commit -q -m "seed")
+echo "x = 2" >"$repo/ready-detail.py"
+
+HOME="$home" PATH="$mockbin:$PATH" _run_sley "$repo" ready
+_assert_exit "ready: blocking phase surfaces in aggregate exit" 1 "$__SLEY_RC"
+_assert_contains "ready: human output includes phase failure detail" "ready-phase synthetic diagnostic" "$__SLEY_OUT"
+
+echo "=== sley: missing-tool exit codes for direct commands ==="
+
+repo=$(_new_repo)
+no_sley_tools_path=$(_no_sley_tools_path)
+echo "x = 1" >"$repo/missing-tool.py"
+(cd "$repo" && git add missing-tool.py && git commit -q -m "seed")
+echo "x = 2" >"$repo/missing-tool.py"
+
+PATH="$no_sley_tools_path" _run_sley "$repo" fix
+_assert_exit "fix: missing formatter exits 2" 2 "$__SLEY_RC"
+_assert_contains "fix: missing formatter reports error" "formatter unavailable" "$__SLEY_OUT"
+
+repo=$(_new_repo)
+echo "x = 1" >"$repo/secret.py"
+(cd "$repo" && git add secret.py && git commit -q -m "seed")
+echo "x = 2" >"$repo/secret.py"
+
+PATH="$no_sley_tools_path" _run_sley "$repo" secrets
+_assert_exit "secrets: missing gitleaks exits 2" 2 "$__SLEY_RC"
+_assert_contains "secrets: missing gitleaks reports error" "gitleaks not found" "$__SLEY_OUT"
+
+echo "=== sley: sl status surfaces bookmark and untracked ==="
+
+repo=$(_tmpdir)
+mkdir -p "$repo/.sl"
+mockbin=$(_mock_bin)
+cat >"$mockbin/sl" <<'MOCK'
+#!/usr/bin/env bash
+case "$1" in
+  root) printf '%s\n' "$SL_REPO" ;;
+  log)
+    # First arg pattern: -r . -T '<template>'.  Surface the active bookmark
+    # for `{activebookmark}` and the short hash for `{node|short}`.
+    case "$*" in
+      *activebookmark*) printf 'main' ;;
+      *phase*) printf 'public' ;;
+      *node*) printf 'deadbeef' ;;
+    esac
+    ;;
+  status)
+    case "$*" in
+      *-u*) printf 'untracked.py\n' ;;
+      *) printf '' ;;
+    esac
+    ;;
+esac
+MOCK
+chmod +x "$mockbin/sl"
+
+SL_REPO="$repo" PATH="$mockbin:$PATH" _run_sley "$repo" status --json
+_assert_exit "status: sl repo with bookmark exits 0" 0 "$__SLEY_RC"
+_assert_contains "status: sl ref prefers active bookmark over node hash" '"ref":"main"' "$__SLEY_OUT"
+_assert_contains "status: sl untracked count is populated" '"untracked":1' "$__SLEY_OUT"
+
+# Without an active bookmark, fall back to the short node hash so the ref is
+# still human-readable rather than empty.
+cat >"$mockbin/sl" <<'MOCK'
+#!/usr/bin/env bash
+case "$1" in
+  root) printf '%s\n' "$SL_REPO" ;;
+  log)
+    case "$*" in
+      *activebookmark*) printf '' ;;
+      *node*) printf 'deadbeef' ;;
+    esac
+    ;;
+  status) printf '' ;;
+esac
+MOCK
+chmod +x "$mockbin/sl"
+
+SL_REPO="$repo" PATH="$mockbin:$PATH" _run_sley "$repo" status --json
+_assert_contains "status: sl ref falls back to node hash without bookmark" '"ref":"deadbeef"' "$__SLEY_OUT"
+
+echo "=== sley: --path symlink-via-non-existent path is rejected ==="
+
+# Non-existent paths used to resolve via `realpath -m`, which canonicalizes
+# lexically and skips parent-chain symlinks. A symlinked subdir + missing leaf
+# could then escape the repo boundary. Resolve through the existing parent
+# with pwd -P so the symlink is followed before judging the boundary.
+repo=$(_new_repo)
+escape_target=$(_tmpdir)
+ln -s "$escape_target" "$repo/escape-link"
+_run_sley "$repo" changes --path escape-link/missing-file
+_assert_exit "changes: symlinked subdir with missing leaf is treated as outside repo" 2 "$__SLEY_RC"
+_assert_contains "changes: symlinked subdir with missing leaf reports outside-repo" "outside repo" "$__SLEY_OUT"
+
+echo "=== sley: sourced API survives a usage error in every public wrapper ==="
+
+# Per the spec, sley.sh is a library that can be sourced by humans, agents,
+# tests, and editor integrations. A `--path /outside` should `return 2` from
+# every public wrapper, NOT `exit 2` (which would terminate the caller's
+# interactive shell). This regression coverage checks every wrapper that
+# routes through `_sley_selected_files` plus the path-validating ones.
+repo=$(_new_repo)
+home=$(_tmpdir)
+_copy_sley_libs "$home"
+mockbin=$(_mock_bin)
+for tool in autoformat autolint gitleaks; do
+  cat >"$mockbin/$tool" <<MOCK
+#!/usr/bin/env bash
+exit 0
+MOCK
+  chmod +x "$mockbin/$tool"
+done
+echo "x = 1" >"$repo/seed.py"
+(cd "$repo" && git add seed.py && git commit -q -m "seed")
+echo "x = 2" >"$repo/seed.py"
+
+for cmd in status changes fix check secrets verify ready; do
+  out=$(
+    cd "$repo" || exit 99
+    HOME="$home" PATH="$mockbin:$PATH" GIT_CONFIG_GLOBAL="$repo/.gitconfig-test" \
+      bash -c "
+        source \"$home/sley-root/lib/sley/sley.sh\";
+        sley_$cmd --path /tmp >/dev/null 2>&1
+        echo survived=\$?
+      "
+  )
+  if [[ "$out" == survived=2 ]]; then
+    _pass "sourced sley_$cmd --path /outside returns 2 (caller shell survives)"
+  else
+    _fail "sourced sley_$cmd --path /outside returns 2 (got: $out)"
+  fi
+done
+
+echo "=== sley: public wrappers preserve caller CWD ==="
+
+# `_sley_init_repo` cds into the repo root so the implementation can run
+# git/sl commands. Public wrappers must restore the caller's CWD afterward
+# so a sourced consumer's interactive shell does not silently inherit the cd.
+repo=$(_new_repo)
+home=$(_tmpdir)
+_copy_sley_libs "$home"
+caller_dir=$(_tmpdir)
+
+for cmd in status changes select; do
+  cwd_after=$(
+    cd "$caller_dir" || exit 99
+    HOME="$home" GIT_CONFIG_GLOBAL="$repo/.gitconfig-test" bash -c "
+      source \"$home/sley-root/lib/sley/sley.sh\";
+      cd '$repo' || exit 99
+      sley_$cmd >/dev/null 2>&1
+      pwd
+    "
+  )
+  if [[ "$cwd_after" == "$repo" ]]; then
+    _pass "sley_$cmd preserves caller CWD ($repo)"
+  else
+    _fail "sley_$cmd preserves caller CWD (got: $cwd_after, expected: $repo)"
+  fi
+done
+
+echo "=== sley: status validates --path against repo boundary ==="
+
+repo=$(_new_repo)
+_run_sley "$repo" status --path /tmp
+_assert_exit "status: --path outside repo exits 2" 2 "$__SLEY_RC"
+_assert_contains "status: --path outside repo reports error" "outside repo" "$__SLEY_OUT"
+
+echo "=== sley: ready validates --path before phase aggregation ==="
+
+# Without orchestrator-level path-scope validation, an outside-repo --path
+# would have each phase return 2 (which `ready` downgrades to "unavailable"),
+# masking the spec-required exit-2 behavior under a green run.
+repo=$(_new_repo)
+home=$(_tmpdir)
+_copy_sley_libs "$home"
+HOME="$home" _run_sley "$repo" ready --path /tmp
+_assert_exit "ready: --path outside repo exits 2" 2 "$__SLEY_RC"
+_assert_contains "ready: --path outside repo reports error" "outside repo" "$__SLEY_OUT"
+
+echo "=== sley: secrets --commit --include-untracked scans untracked files ==="
+
+# `_repo_changed_names("staged", 1)` adds untracked files to the change set,
+# but the staged-blob scan only covers the index. Without an explicit
+# untracked worktree pass, those files were silently skipped — a security
+# gap for the secrets gate.
+repo=$(_new_repo)
+mockbin=$(_mock_bin)
+export MOCK_LOG="$repo/gitleaks.log"
+: >"$MOCK_LOG"
+cat >"$mockbin/gitleaks" <<'MOCK'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"$MOCK_LOG"
+cat >>"$MOCK_LOG"
+exit 0
+MOCK
+chmod +x "$mockbin/gitleaks"
+echo "x = 1" >"$repo/staged.py"
+(cd "$repo" && git add staged.py && git commit -q -m "seed")
+echo "x = 2" >"$repo/staged.py"
+(cd "$repo" && git add staged.py)
+# Untracked file added to the worktree but never staged.
+echo "secret_token = \"unstaged-secret\"" >"$repo/untracked-secret.py"
+
+PATH="$mockbin:$PATH" _run_sley "$repo" secrets --commit --include-untracked
+_assert_exit "secrets --commit --include-untracked: succeeds" 0 "$__SLEY_RC"
+_assert_contains "secrets --commit --include-untracked: scans staged blob via stdin" \
+  "stdin --redact --no-banner" "$(cat "$MOCK_LOG")"
+_assert_contains "secrets --commit --include-untracked: scans untracked file via worktree" \
+  "untracked-secret.py" "$(cat "$MOCK_LOG")"
+
+echo "=== sley: dash-prefixed filename does not get parsed as a flag ==="
+
+# Files with leading `-` were the missing-`--` regression slot. Each entry
+# point that forwards filenames to autoformat/autolint/gitleaks needs a `--`
+# separator so a hostile or unusual filename like `-rf.py` is treated as a
+# positional path argument, not as a flag.
+repo=$(_new_repo)
+mockbin=$(_mock_bin)
+export MOCK_LOG="$repo/dash-prefix.log"
+: >"$MOCK_LOG"
+cat >"$mockbin/autoformat" <<'MOCK'
+#!/usr/bin/env bash
+printf 'autoformat:%s\n' "$*" >>"$MOCK_LOG"
+MOCK
+cat >"$mockbin/autolint" <<'MOCK'
+#!/usr/bin/env bash
+printf 'autolint:%s\n' "$*" >>"$MOCK_LOG"
+MOCK
+chmod +x "$mockbin/autoformat" "$mockbin/autolint"
+# Stage a file whose name begins with `-`. Use `git add --` so the leading
+# dash is not interpreted by git itself either.
+echo "x = 1" >"$repo/-rf.py"
+(cd "$repo" && git add -- -rf.py && git commit -q -m "seed")
+echo "x = 2" >"$repo/-rf.py"
+
+PATH="$mockbin:$PATH" _run_sley "$repo" fix
+_assert_exit "fix: dash-prefixed filename succeeds" 0 "$__SLEY_RC"
+_assert_contains "fix: passes -- before dash-prefixed filename" "-- -rf.py" "$(cat "$MOCK_LOG")"
+
+echo "=== sley: autoformat reading stdin does not drain the herestring loop ==="
+
+# The fix loop reads filenames from a herestring. If autoformat ever reads
+# stdin (interactive prompt, tty probe), it would drain the rest and silently
+# skip files. Each autoformat invocation must redirect stdin from /dev/null.
+repo=$(_new_repo)
+mockbin=$(_mock_bin)
+export MOCK_LOG="$repo/stdin-drain.log"
+: >"$MOCK_LOG"
+cat >"$mockbin/autoformat" <<'MOCK'
+#!/usr/bin/env bash
+# Pretend the formatter slurps stdin. Without `</dev/null` in the caller, this
+# would drain the rest of the herestring and orphan the second file. Print
+# the trailing positional arg (the filename) — autoformat is invoked as
+# `autoformat -- <file>` so the last arg is the file path.
+cat >/dev/null
+printf 'autoformat:%s\n' "${@: -1}" >>"$MOCK_LOG"
+MOCK
+chmod +x "$mockbin/autoformat"
+echo "x = 1" >"$repo/first.py"
+echo "x = 1" >"$repo/second.py"
+(cd "$repo" && git add first.py second.py && git commit -q -m "seed")
+echo "x = 2" >"$repo/first.py"
+echo "x = 2" >"$repo/second.py"
+
+PATH="$mockbin:$PATH" _run_sley "$repo" fix
+_assert_contains "fix: stdin-reading formatter still gets first file" "autoformat:first.py" "$(cat "$MOCK_LOG")"
+_assert_contains "fix: stdin-reading formatter still gets second file" "autoformat:second.py" "$(cat "$MOCK_LOG")"
+
+echo "=== sley: JSON escape python3 fallback does not trail with newline ==="
+
+# `_repo_json_escape` falls back to python3 when jq is missing. The herestring
+# fix here is critical: without it the encoded value silently gains a literal
+# `\n` because `<<<` adds a trailing newline that `sys.stdin.read()` then
+# encodes. Verify the JSON value matches the input bytes exactly.
+if command -v python3 >/dev/null 2>&1; then
+  no_jq_path=$(_mock_bin)
+  out=$(
+    HOME="$HOME" PATH="$no_jq_path:/usr/bin:/bin" bash -c '
+      source "$SLEY_REPO_ROOT/lib/sley/repo.sh"
+      _repo_json_escape "abc"
+    '
+  )
+  if [[ "$out" == "abc" ]]; then
+    _pass "json escape: python3 fallback preserves value bytes"
+  else
+    _fail "json escape: python3 fallback added trailing characters (got: $(printf '%q' "$out"))"
+  fi
+fi
+
+_test_summary

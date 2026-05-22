@@ -1,0 +1,218 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://cgraf78.github.io/sley/schemas/verify.schema.json",
+  "title": "Sley verify registry",
+  "type": "object",
+  "additionalProperties": false,
+  "oneOf": [{ "required": ["rules"] }, { "required": ["repos"] }],
+  "properties": {
+    "$schema": {
+      "type": "string"
+    },
+    "rules": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/rule" }
+    },
+    "repos": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/repo" }
+    }
+  },
+  "$defs": {
+    "repo": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["match", "rules"],
+      "properties": {
+        "match": { "$ref": "#/$defs/repoMatch" },
+        "rules": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/rule" }
+        }
+      }
+    },
+    "repoMatch": {
+      "type": "object",
+      "additionalProperties": false,
+      "minProperties": 1,
+      "properties": {
+        "root": { "$ref": "#/$defs/stringOrStrings" },
+        "roots": { "$ref": "#/$defs/stringOrStrings" },
+        "name": { "$ref": "#/$defs/stringOrStrings" },
+        "names": { "$ref": "#/$defs/stringOrStrings" },
+        "remote": { "$ref": "#/$defs/stringOrStrings" },
+        "remotes": { "$ref": "#/$defs/stringOrStrings" }
+      }
+    },
+    "rule": {
+      "anyOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["enabled"],
+          "properties": {
+            "enabled": {
+              "const": false,
+              "description": "When false, this rule is ignored."
+            },
+            "paths": {
+              "type": "array",
+              "items": { "type": "string" }
+            },
+            "commands": {
+              "type": "array",
+              "items": { "$ref": "#/$defs/command" }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["commands"],
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "description": "When false, this rule is ignored."
+            },
+            "paths": {
+              "type": "array",
+              "items": { "type": "string" }
+            },
+            "commands": {
+              "type": "array",
+              "items": { "$ref": "#/$defs/command" }
+            }
+          }
+        }
+      ]
+    },
+    "command": {
+      "anyOf": [
+        {
+          "type": "string",
+          "minLength": 1
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["enabled"],
+          "properties": {
+            "cmd": {
+              "type": "string",
+              "minLength": 1
+            },
+            "command": {
+              "type": "string",
+              "minLength": 1
+            },
+            "enabled": {
+              "const": false,
+              "description": "When false, this command is ignored."
+            },
+            "kind": {
+              "type": "string"
+            },
+            "required": {
+              "type": "boolean"
+            },
+            "tier": {
+              "type": "string",
+              "enum": ["fast", "slow", "full", "suggested"]
+            },
+            "cache": { "$ref": "#/$defs/cache" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "anyOf": [{ "required": ["cmd"] }, { "required": ["command"] }],
+          "properties": {
+            "cmd": {
+              "type": "string",
+              "minLength": 1
+            },
+            "command": {
+              "type": "string",
+              "minLength": 1
+            },
+            "enabled": {
+              "type": "boolean",
+              "description": "When false, this command is ignored."
+            },
+            "kind": {
+              "type": "string"
+            },
+            "required": {
+              "type": "boolean"
+            },
+            "tier": {
+              "type": "string",
+              "enum": ["fast", "slow", "full", "suggested"]
+            },
+            "cache": { "$ref": "#/$defs/cache" }
+          }
+        }
+      ]
+    },
+    "cache": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "salt": {
+          "type": "string"
+        },
+        "base_policy": {
+          "type": "string",
+          "enum": ["upstream-tip", "merge-base", "selected-content"]
+        },
+        "shell": {
+          "type": "string",
+          "enum": ["default", "login"]
+        },
+        "identity_timeout": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "identity": { "$ref": "#/$defs/cacheIdentity" }
+      }
+    },
+    "cacheIdentity": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "commands": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "env": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    },
+    "stringOrStrings": {
+      "oneOf": [
+        {
+          "type": "string",
+          "minLength": 1
+        },
+        {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      ]
+    }
+  }
+}

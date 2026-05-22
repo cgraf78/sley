@@ -1,0 +1,123 @@
+#!/usr/bin/env bash
+# sley command-line entry point.
+
+set -u
+
+_sley_die() {
+  printf 'sley: %s\n' "$*" >&2
+  exit 2
+}
+
+_sley_script_parent() {
+  case "$1" in
+    */*) printf '%s\n' "${1%/*}" ;;
+    *) printf '.\n' ;;
+  esac
+}
+
+_sley_script_dir() {
+  local path="$1" dir target
+  while [[ -L "$path" ]]; do
+    dir=$(cd -P -- "$(_sley_script_parent "$path")" && pwd) || return 1
+    target=$(readlink "$path") || return 1
+    [[ "$target" == /* ]] || target="$dir/$target"
+    path="$target"
+  done
+  cd -P -- "$(_sley_script_parent "$path")" && pwd
+}
+
+_bin_dir=$(_sley_script_dir "${BASH_SOURCE[0]}") ||
+  _sley_die "cannot resolve executable path"
+_sley_dir="$_bin_dir/../lib/sley"
+
+# shellcheck disable=SC1091 # resolved relative to this executable.
+source "$_sley_dir/sley.sh"
+
+_sley_physical_dir() {
+  cd -- "$1" 2>/dev/null && pwd -P
+}
+
+_sley_inside_git_worktree() {
+  command -v git >/dev/null 2>&1 || return 1
+  local root
+  root=$(git rev-parse --show-toplevel 2>/dev/null) || return 1
+  # Without explicit Git env, Sley only treats real worktrees as normal repos.
+  # Optional bare worktree handling belongs to the SLEY_BARE_REPO_* contract
+  # below, which keeps launcher-specific conventions out of default detection.
+  [[ -e "$root/.git" ]]
+}
+
+_sley_inside_real_sl_worktree() {
+  command -v sl >/dev/null 2>&1 || return 1
+  local root
+  root=$(sl root --config ui.color=never 2>/dev/null) || return 1
+  [[ -d "$root/.sl" || -d "$root/.hg" ]]
+}
+
+_sley_auto_path_ok() {
+  [[ $# -gt 0 ]] || return 1
+  case "$1" in
+    status | changes | fix | check | secrets | verify | ready) ;;
+    *) return 1 ;;
+  esac
+
+  local arg
+  for arg in "$@"; do
+    case "$arg" in
+      -h | --help | --path | --repo-wide | --commit)
+        return 1
+        ;;
+    esac
+  done
+  return 0
+}
+
+_sley_run() {
+  sley_main "$@"
+  exit $?
+}
+
+_sley_apply_bare_repo_fallback() {
+  local git_dir="${SLEY_BARE_REPO_GIT_DIR:-}"
+  local work_tree="${SLEY_BARE_REPO_WORK_TREE:-${HOME:-}}"
+  local work_tree_phys pwd_phys git_dir_phys
+
+  [[ "${SLEY_SKIP_BARE_REPO_FALLBACK:-0}" == "1" ]] && return 1
+  [[ -n "$git_dir" && -n "$work_tree" ]] || return 1
+
+  work_tree_phys=$(_sley_physical_dir "$work_tree") ||
+    _sley_die "SLEY_BARE_REPO_WORK_TREE is not a directory: $work_tree"
+  pwd_phys=$(pwd -P)
+  case "$pwd_phys" in
+    "$work_tree_phys" | "$work_tree_phys"/*) ;;
+    *) return 1 ;;
+  esac
+
+  git_dir_phys=$(_sley_physical_dir "$git_dir") ||
+    _sley_die "SLEY_BARE_REPO_GIT_DIR is not a directory: $git_dir"
+
+  export GIT_DIR="$git_dir_phys"
+  export GIT_WORK_TREE="$work_tree_phys"
+  export SLEY_SKIP_UNTRACKED=1
+  if _sley_auto_path_ok "$@"; then
+    set -- "$@" --path "$pwd_phys"
+  fi
+  _sley_run "$@"
+}
+
+# Honor explicit Git context. Callers that set either variable are already
+# choosing a repository, including bare Git worktrees.
+if [[ -n "${GIT_DIR:-}" || -n "${GIT_WORK_TREE:-}" ]]; then
+  _sley_run "$@"
+fi
+
+# Normal repositories should win over any optional bare-repo fallback. The
+# generic library still owns the actual VCS operations.
+if _sley_inside_git_worktree || _sley_inside_real_sl_worktree; then
+  _sley_run "$@"
+fi
+
+_sley_apply_bare_repo_fallback "$@"
+
+sley_main "$@"
+exit $?
