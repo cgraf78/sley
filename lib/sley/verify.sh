@@ -254,6 +254,71 @@ _sley_verify_rules_for_config() {
   fi
 }
 
+_sley_verify_validate_config() {
+  local config="$1"
+  jq -e '
+    def keys_in($allowed):
+      (keys_unsorted - $allowed) | length == 0;
+    def string_or_strings:
+      (type == "string" and length > 0) or
+      (type == "array" and all(.[]; type == "string" and length > 0));
+    def cache_identity:
+      type == "object" and
+      keys_in(["commands", "env"]) and
+      ((.commands? // []) | type == "array") and
+      all((.commands? // [])[]; type == "string" and length > 0) and
+      ((.env? // []) | type == "array") and
+      all((.env? // [])[]; type == "string" and length > 0);
+    def cache:
+      type == "object" and
+      keys_in(["enabled", "salt", "base_policy", "shell", "identity_timeout", "identity"]) and
+      ((.enabled? // false) | type == "boolean") and
+      ((has("salt") | not) or (.salt | type == "string")) and
+      ((has("base_policy") | not) or (.base_policy | IN("upstream-tip", "merge-base", "selected-content"))) and
+      ((has("shell") | not) or (.shell | IN("default", "login"))) and
+      ((has("identity_timeout") | not) or (.identity_timeout | type == "number" and . >= 1 and floor == .)) and
+      ((has("identity") | not) or (.identity | cache_identity));
+    def command_item:
+      (type == "string" and length > 0) or
+      (
+        type == "object" and
+        keys_in(["cmd", "command", "enabled", "kind", "required", "tier", "cache"]) and
+        (
+          (.enabled? == false) or
+          ((has("cmd") and (.cmd | type == "string" and length > 0)) or
+           (has("command") and (.command | type == "string" and length > 0)))
+        ) and
+        ((has("enabled") | not) or (.enabled | type == "boolean")) and
+        ((has("kind") | not) or (.kind | type == "string")) and
+        ((has("required") | not) or (.required | type == "boolean")) and
+        ((has("tier") | not) or (.tier | IN("fast", "slow", "full", "suggested"))) and
+        ((has("cache") | not) or (.cache | cache))
+      );
+    def rule:
+      type == "object" and
+      keys_in(["enabled", "paths", "commands"]) and
+      ((has("enabled") | not) or (.enabled | type == "boolean")) and
+      ((.enabled? == false) or (has("commands") and (.commands | type == "array"))) and
+      ((has("paths") | not) or (.paths | type == "array" and all(.[]; type == "string"))) and
+      ((has("commands") | not) or (.commands | type == "array" and all(.[]; command_item)));
+    def repo_match:
+      type == "object" and
+      length > 0 and
+      keys_in(["root", "roots", "name", "names", "remote", "remotes"]) and
+      all(.[]; string_or_strings);
+    def repo:
+      type == "object" and
+      keys_in(["match", "rules"]) and
+      (.match | repo_match) and
+      (.rules | type == "array" and all(.[]; rule));
+    type == "object" and
+    keys_in(["$schema", "rules", "repos"]) and
+    ((has("$schema") | not) or (.["$schema"] | type == "string")) and
+    ((has("rules") and (has("repos") | not) and (.rules | type == "array" and all(.[]; rule))) or
+     (has("repos") and (has("rules") | not) and (.repos | type == "array" and all(.[]; repo))))
+  ' "$config" >/dev/null
+}
+
 _sley_verify_registry_commands() {
   local files="$1" configs origin config context source base rules rule matched file pattern
   local -a patterns
@@ -276,10 +341,7 @@ _sley_verify_registry_commands() {
     context=$(_sley_verify_config_context "$origin")
     source=$(_sley_verify_config_source "$config")
     base=$(_sley_verify_config_base "$config" "$context")
-    if ! jq -e '
-      type == "object" and
-      (((.rules // null) | type) == "array" or ((.repos // null) | type) == "array")
-    ' "$config" >/dev/null 2>&1; then
+    if ! _sley_verify_validate_config "$config" 2>/dev/null; then
       echo "sley verify: invalid verify registry: $source" >&2
       return 1
     fi

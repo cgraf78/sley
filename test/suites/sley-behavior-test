@@ -2586,6 +2586,66 @@ _run_sley "$repo" verify --run-required
 _assert_exit "verify registry: invalid rule blocks" 1 "$__SLEY_RC"
 _assert_contains "verify registry: invalid rule reports source" "invalid verify registry" "$__SLEY_OUT"
 
+repo=$(_new_repo)
+mkdir -p "$repo/src" "$repo/.sley"
+cat >"$repo/src/app.txt" <<'EOF'
+initial
+EOF
+cat >"$repo/.sley/verify.json" <<'EOF'
+{"rules":[],"repos":[]}
+EOF
+(cd "$repo" && git add . && git commit -q -m "seed ambiguous verify top level")
+echo "changed" >>"$repo/src/app.txt"
+
+_run_sley "$repo" verify --run-required
+_assert_exit "verify registry: top-level oneOf blocks" 1 "$__SLEY_RC"
+_assert_contains "verify registry: top-level oneOf reports source" "invalid verify registry" "$__SLEY_OUT"
+
+repo=$(_new_repo)
+mkdir -p "$repo/src" "$repo/.sley"
+cat >"$repo/src/app.txt" <<'EOF'
+initial
+EOF
+cat >"$repo/.sley/verify.json" <<'EOF'
+{"$schema":false,"rules":[]}
+EOF
+(cd "$repo" && git add . && git commit -q -m "seed invalid verify schema field")
+echo "changed" >>"$repo/src/app.txt"
+
+_run_sley "$repo" verify --run-required
+_assert_exit "verify registry: invalid schema field blocks" 1 "$__SLEY_RC"
+_assert_contains "verify registry: invalid schema field reports source" "invalid verify registry" "$__SLEY_OUT"
+
+repo=$(_new_repo)
+mkdir -p "$repo/src" "$repo/.sley"
+cat >"$repo/src/app.txt" <<'EOF'
+initial
+EOF
+cat >"$repo/.sley/verify.json" <<'EOF'
+{"rules":[{"paths":["src/**"],"commands":[{"cmd":"echo bad-tier","tier":"urgent"}]}]}
+EOF
+(cd "$repo" && git add . && git commit -q -m "seed invalid verify tier")
+echo "changed" >>"$repo/src/app.txt"
+
+_run_sley "$repo" verify --run-required
+_assert_exit "verify registry: invalid command tier blocks" 1 "$__SLEY_RC"
+_assert_contains "verify registry: invalid command tier reports source" "invalid verify registry" "$__SLEY_OUT"
+
+repo=$(_new_repo)
+mkdir -p "$repo/src" "$repo/.sley"
+cat >"$repo/src/app.txt" <<'EOF'
+initial
+EOF
+cat >"$repo/.sley/verify.json" <<'EOF'
+{"rules":[{"paths":["src/**"],"commands":[{"cmd":"echo unknown","extra":true}]}]}
+EOF
+(cd "$repo" && git add . && git commit -q -m "seed unknown verify field")
+echo "changed" >>"$repo/src/app.txt"
+
+_run_sley "$repo" verify --run-required
+_assert_exit "verify registry: unknown command field blocks" 1 "$__SLEY_RC"
+_assert_contains "verify registry: unknown command field reports source" "invalid verify registry" "$__SLEY_OUT"
+
 echo "=== sley: verify registry schema ==="
 
 schema="$SLEY_REPO_ROOT/share/sley/schemas/verify.schema.json"
