@@ -283,10 +283,12 @@ _sley_verify_validate_config() {
       (
         type == "object" and
         keys_in(["cmd", "command", "enabled", "kind", "required", "tier", "cache"]) and
+        ((has("cmd") | not) or (.cmd | type == "string" and length > 0)) and
+        ((has("command") | not) or (.command | type == "string" and length > 0)) and
         (
           (.enabled? == false) or
-          ((has("cmd") and (.cmd | type == "string" and length > 0)) or
-           (has("command") and (.command | type == "string" and length > 0)))
+          has("cmd") or
+          has("command")
         ) and
         ((has("enabled") | not) or (.enabled | type == "boolean")) and
         ((has("kind") | not) or (.kind | type == "string")) and

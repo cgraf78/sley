@@ -2646,6 +2646,21 @@ _run_sley "$repo" verify --run-required
 _assert_exit "verify registry: unknown command field blocks" 1 "$__SLEY_RC"
 _assert_contains "verify registry: unknown command field reports source" "invalid verify registry" "$__SLEY_OUT"
 
+repo=$(_new_repo)
+mkdir -p "$repo/.sley" "$repo/src"
+cat >"$repo/src/app.txt" <<'EOF'
+initial
+EOF
+cat >"$repo/.sley/verify.json" <<'EOF'
+{"rules":[{"paths":["src/**"],"commands":[{"enabled":false,"cmd":""}]}]}
+EOF
+(cd "$repo" && git add . && git commit -q -m "seed invalid disabled verify command")
+echo "changed" >>"$repo/src/app.txt"
+
+_run_sley "$repo" verify --run-required
+_assert_exit "verify registry: invalid disabled command blocks" 1 "$__SLEY_RC"
+_assert_contains "verify registry: invalid disabled command reports source" "invalid verify registry" "$__SLEY_OUT"
+
 echo "=== sley: verify registry schema ==="
 
 schema="$SLEY_REPO_ROOT/share/sley/schemas/verify.schema.json"
