@@ -3203,4 +3203,123 @@ _assert_not_contains "changed-names: newline-bearing name not emitted as a path 
 _assert_not_contains "changed-names: split fake-second fragment not emitted as a path entry" "fake-second.txt" "$nl_stdout"
 _assert_contains "changed-names: warns on dropped newline-bearing filename" "embedded newline" "$nl_stderr"
 
+echo "=== sley: verify cache lock reclaims stale lock owned by dead PID ==="
+
+# Regression test for the stale-lock hang where `_sley_verify_cache_lock_acquire`
+# used `mkdir` as the lock primitive without any owner metadata. A SIGKILL
+# (or power loss) between mkdir and the explicit `rmdir` release would leave
+# the lock dir on disk forever; every subsequent run for the same cache key
+# spent the full 5s mkdir-polling budget before falling through unlocked,
+# AND a duplicate same-key execution could happen because the post-poll
+# branch ran uncached without holding the lock. The fix records PID + host
+# in `owner.meta` and reclaims locks whose recorded PID is no longer alive
+# on this host.
+#
+# This test fails (and the bug returns) if any one of these regresses:
+#   - `_sley_verify_cache_lock_acquire` stops writing owner.meta
+#   - `_sley_verify_cache_lock_is_stale` stops checking PID liveness with `kill -0`
+#   - The reclaim path in the acquire loop is removed
+
+verify_lock_root=$(_tmpdir)/locks
+mkdir -p "$verify_lock_root"
+# Build a receipt path that matches what the function expects:
+#   dirname(dirname(receipt))/locks/basename(receipt).lock
+verify_receipt_parent=$(_tmpdir)/cache/receipts
+mkdir -p "$verify_receipt_parent"
+verify_receipt="$verify_receipt_parent/test-key.json"
+verify_expected_lock_root="$(dirname "$(dirname "$verify_receipt")")/locks"
+verify_expected_lock_dir="$verify_expected_lock_root/$(basename "$verify_receipt").lock"
+
+# Seed a stale lock that claims to be owned by PID 999999999 (effectively
+# guaranteed to not exist on a Linux system; max PID is typically <2^22).
+mkdir -p "$verify_expected_lock_dir"
+{
+  printf 'pid=999999999\n'
+  printf 'host=%s\n' "${HOSTNAME:-$(uname -n)}"
+  printf 'started=%s\n' "$(date +%s)"
+} >"$verify_expected_lock_dir/owner.meta"
+
+# Force the lock mtime well into the past so any future age-based heuristic
+# would also classify it as stale. (Current fix uses PID liveness, not age,
+# but the seed should remain stale under either policy.)
+touch -d '2 hours ago' "$verify_expected_lock_dir" 2>/dev/null || true
+
+lock_stderr_file=$(_tmpdir)/verify_lock_stderr.txt
+lock_stdout=$(
+  bash -c '
+    source "$SLEY_REPO_ROOT/lib/sley/repo.sh"
+    source "$SLEY_REPO_ROOT/lib/sley/scope.sh"
+    source "$SLEY_REPO_ROOT/lib/sley/hooks.sh"
+    source "$SLEY_REPO_ROOT/lib/sley/verify.sh"
+    _sley_verify_cache_lock_acquire "'"$verify_receipt"'"
+  ' 2>"$lock_stderr_file"
+)
+lock_stderr=$(cat "$lock_stderr_file")
+lock_rc=$?
+
+_assert_eq "verify lock: acquire reclaims stale lock and returns the lock dir path" "$verify_expected_lock_dir" "$lock_stdout"
+_assert_eq "verify lock: acquire returns success rc after reclaim" "0" "$lock_rc"
+_assert_contains "verify lock: emits stderr notice when reclaiming a stale lock" "reclaiming stale cache lock" "$lock_stderr"
+
+# Confirm the new acquisition wrote fresh owner metadata that is NOT the
+# bogus 999999999 PID from our seed — proves we reclaimed and re-acquired
+# rather than just reusing the seed. We cannot assert against `$$` of the
+# outer test shell because the bash subshell that ran the acquire has its
+# own PID; the meaningful invariant is "PID is numeric, not the seed".
+verify_owner_meta="$verify_expected_lock_dir/owner.meta"
+if [[ -f "$verify_owner_meta" ]]; then
+  reclaimed_pid=$(awk -F= '$1=="pid" {print $2; exit}' "$verify_owner_meta")
+  if [[ "$reclaimed_pid" =~ ^[0-9]+$ ]] && [[ "$reclaimed_pid" != "999999999" ]]; then
+    _pass "verify lock: reclaimed acquisition stamps fresh owner PID"
+  else
+    _fail "verify lock: reclaim left stale PID metadata (got '$reclaimed_pid')"
+  fi
+else
+  _fail "verify lock: owner.meta missing after reclaim"
+fi
+
+# Clean up our seeded lock so other tests aren't polluted.
+rm -rf "$verify_expected_lock_dir" 2>/dev/null || true
+
+echo "=== sley: verify cache lock leaves live-PID locks alone ==="
+
+# Counterpart to the reclaim test: a stale-looking lock owned by an ALIVE
+# PID (our own shell) must NOT be reclaimed. This pins the conservative
+# branch of `_sley_verify_cache_lock_is_stale`.
+
+mkdir -p "$verify_expected_lock_dir"
+{
+  printf 'pid=%s\n' "$$"
+  printf 'host=%s\n' "${HOSTNAME:-$(uname -n)}"
+  printf 'started=%s\n' "$(date +%s)"
+} >"$verify_expected_lock_dir/owner.meta"
+
+lock_live_stderr_file=$(_tmpdir)/verify_lock_live_stderr.txt
+lock_live_stdout=$(
+  bash -c '
+    source "$SLEY_REPO_ROOT/lib/sley/repo.sh"
+    source "$SLEY_REPO_ROOT/lib/sley/scope.sh"
+    source "$SLEY_REPO_ROOT/lib/sley/hooks.sh"
+    source "$SLEY_REPO_ROOT/lib/sley/verify.sh"
+    _sley_verify_cache_lock_acquire "'"$verify_receipt"'"
+  ' 2>"$lock_live_stderr_file"
+)
+lock_live_rc=$?
+lock_live_stderr=$(cat "$lock_live_stderr_file")
+
+_assert_eq "verify lock: alive-PID lock not reclaimed (rc=1 after polling timeout)" "1" "$lock_live_rc"
+_assert_eq "verify lock: alive-PID lock holds — no path printed" "" "$lock_live_stdout"
+_assert_not_contains "verify lock: alive-PID lock does not emit reclaim notice" "reclaiming stale" "$lock_live_stderr"
+
+# Verify the seed PID is still recorded (proves we did not silently
+# reclaim+rewrite owner.meta).
+if [[ -f "$verify_owner_meta" ]]; then
+  preserved_pid=$(awk -F= '$1=="pid" {print $2; exit}' "$verify_owner_meta")
+  _assert_eq "verify lock: alive-PID lock preserves original owner.meta" "$$" "$preserved_pid"
+else
+  _fail "verify lock: alive-PID lock owner.meta unexpectedly removed"
+fi
+
+rm -rf "$verify_expected_lock_dir" 2>/dev/null || true
+
 _test_summary
