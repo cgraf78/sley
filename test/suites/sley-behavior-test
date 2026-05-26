@@ -363,19 +363,25 @@ if command -v jq >/dev/null 2>&1 || command -v python3 >/dev/null 2>&1; then
     _fail "changes --json: tab filename emits valid JSON"
   fi
 
-  # JSON escape coverage for quotes, backslashes, newlines, and a control byte.
-  # The fallback path was historically untested and shipped broken control-byte
+  # JSON escape coverage for quotes, backslashes, and a control byte. The
+  # fallback path was historically untested and shipped broken control-byte
   # handling; this exercises whichever encoder backs `_repo_json_escape`.
+  # Embedded-newline filenames are intentionally NOT covered here — they are
+  # dropped with a stderr warning by `_repo_emit_safe_paths` because the
+  # downstream bash pipeline (`sley secrets`, `sley fix`) is line-delimited
+  # and cannot represent them safely. The dedicated regression test below
+  # ("changed-file enumeration drops filenames with embedded newlines")
+  # locks in that behavior.
   repo=$(_new_repo)
-  for filename in $'quote".py' $'back\\slash.py' $'new\nline.py' $'ctrl\x01char.py'; do
+  for filename in $'quote".py' $'back\\slash.py' $'ctrl\x01char.py'; do
     printf 'x = 1\n' >"$repo/$filename"
     (cd "$repo" && git add -- "$filename") 2>/dev/null
   done
   _run_sley "$repo" changes --json --commit
   if _validate_json "$__SLEY_OUT"; then
-    _pass "changes --json: quotes/backslash/newline/control-byte emit valid JSON"
+    _pass "changes --json: quotes/backslash/control-byte emit valid JSON"
   else
-    _fail "changes --json: quotes/backslash/newline/control-byte emit valid JSON"
+    _fail "changes --json: quotes/backslash/control-byte emit valid JSON"
   fi
 fi
 
@@ -3157,5 +3163,44 @@ if command -v python3 >/dev/null 2>&1; then
     _fail "json escape: python3 fallback added trailing characters (got: $(printf '%q' "$out"))"
   fi
 fi
+
+echo "=== sley: changed-file enumeration drops filenames with embedded newlines ==="
+
+# Regression test for the silent fail-open where line-delimited
+# `git diff --name-only` either C-quoted filenames containing `\n` (when
+# `core.quotePath=true`, the git default) or let them split into bogus
+# multi-line entries downstream (when quoting was disabled). Either outcome
+# made the affected file invisible to format/lint/secret scans while the gate
+# reported success. The fix routes changed-name enumeration through a `-z`
+# (NUL-delimited) pipeline and warns-and-drops any name with an embedded
+# newline, converting the silent fail-open into a loud fail-closed.
+#
+# This test fails (and the bug returns) if any one of these regresses:
+#   - `_repo_git_changed_names staged` stops using `-z`
+#   - `_repo_emit_safe_paths` stops checking for embedded newlines
+#   - the stderr warning is removed or its wording changes meaningfully
+
+repo=$(_new_repo)
+echo "ok" >"$repo/normal.txt"
+nl_name=$'evil\nfake-second.txt'
+printf 'secret\n' >"$repo/$nl_name"
+(cd "$repo" && git add -- 'normal.txt' "$nl_name")
+
+nl_stderr_file=$(_tmpdir)/repo_changed_names_stderr.txt
+nl_stdout=$(
+  cd "$repo" &&
+    bash -c '
+      source "$SLEY_REPO_ROOT/lib/sley/repo.sh"
+      _REPO_TYPE=git
+      _REPO_ROOT=$(pwd)
+      _repo_git_changed_names staged 0
+    ' 2>"$nl_stderr_file"
+)
+nl_stderr=$(cat "$nl_stderr_file")
+
+_assert_contains "changed-names: normal sibling still emitted" "normal.txt" "$nl_stdout"
+_assert_not_contains "changed-names: newline-bearing name not emitted as a path entry" "evil" "$nl_stdout"
+_assert_not_contains "changed-names: split fake-second fragment not emitted as a path entry" "fake-second.txt" "$nl_stdout"
+_assert_contains "changed-names: warns on dropped newline-bearing filename" "embedded newline" "$nl_stderr"
 
 _test_summary

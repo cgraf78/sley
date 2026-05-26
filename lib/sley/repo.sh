@@ -215,6 +215,31 @@ _repo_relpath_for_existing_dir() {
   esac
 }
 
+# Read NUL-delimited paths from stdin and emit them newline-delimited on
+# stdout, dropping (with a stderr warning) any name that contains a literal
+# newline. Sley's changed-file pipeline is newline-delimited end-to-end; a
+# filename with `\n` would otherwise survive the VCS query and then split
+# into multiple entries downstream, silently bypassing format/lint/secret
+# scans. Convert the silent fail-open into a loud drop so reviewers see the
+# issue immediately.
+_repo_emit_safe_paths() {
+  local name dropped=0
+  while IFS= read -r -d '' name; do
+    [[ -n "$name" ]] || continue
+    case "$name" in
+      *$'\n'*)
+        dropped=$((dropped + 1))
+        printf 'sley: warning: skipping file with embedded newline in name (would bypass changed-file scans): %q\n' "$name" >&2
+        continue
+        ;;
+    esac
+    printf '%s\n' "$name"
+  done
+  if ((dropped > 0)); then
+    printf 'sley: warning: %d file(s) skipped due to embedded newlines in their names; rename or omit them before re-running for full coverage.\n' "$dropped" >&2
+  fi
+}
+
 _repo_git_changed_names() {
   local scope="$1" include_untracked="$2" rc=0
   # Staged callers operate on existing-file content. The secrets scanner in
@@ -224,7 +249,15 @@ _repo_git_changed_names() {
 
   case "$scope" in
     staged)
-      git diff --cached --name-only --diff-filter="$staged_filter" 2>/dev/null || return 2
+      # `git diff -z` emits NUL-delimited path records; route through
+      # `_repo_emit_safe_paths` so filenames with control characters
+      # (newline in particular) cannot evade downstream changed-file checks.
+      # `set -o pipefail` in the subshell so a failing git invocation is
+      # not masked by the safe-paths filter.
+      (
+        set -o pipefail
+        git diff -z --cached --name-only --diff-filter="$staged_filter" 2>/dev/null | _repo_emit_safe_paths
+      ) || return 2
       ;;
     changed)
       # `set -o pipefail` inside the subshell so a failing `git diff` propagates
@@ -235,8 +268,8 @@ _repo_git_changed_names() {
         set -o pipefail
         {
           _repo_git_unpushed_names ACMDR
-          git diff --cached --name-only --diff-filter=ACMDR 2>/dev/null
-          git diff --name-only --diff-filter=ACMDR 2>/dev/null
+          git diff -z --cached --name-only --diff-filter=ACMDR 2>/dev/null | _repo_emit_safe_paths
+          git diff -z --name-only --diff-filter=ACMDR 2>/dev/null | _repo_emit_safe_paths
         } | awk 'NF && !seen[$0]++'
       ) || return 2
       ;;
@@ -246,7 +279,10 @@ _repo_git_changed_names() {
   esac
 
   if [[ "$include_untracked" == "1" ]]; then
-    git ls-files --others --exclude-standard 2>/dev/null || rc=2
+    (
+      set -o pipefail
+      git ls-files -z --others --exclude-standard 2>/dev/null | _repo_emit_safe_paths
+    ) || rc=2
   fi
   return "$rc"
 }
@@ -263,7 +299,12 @@ _repo_git_upstream_base() {
 _repo_git_unpushed_names() {
   local diff_filter="$1" base
   base=$(_repo_git_upstream_base) || return 0
-  git diff --name-only --diff-filter="$diff_filter" "$base"...HEAD 2>/dev/null || return 2
+  # See `_repo_emit_safe_paths` and the `staged` branch above for why we route
+  # every changed-name source through the NUL-safe pipeline.
+  (
+    set -o pipefail
+    git diff -z --name-only --diff-filter="$diff_filter" "$base"...HEAD 2>/dev/null | _repo_emit_safe_paths
+  ) || return 2
 }
 
 _repo_sl_current_phase() {
