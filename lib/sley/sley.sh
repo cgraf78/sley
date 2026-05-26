@@ -645,7 +645,15 @@ _sley_secrets_scan_batch() {
     fi
     _sley_secrets_print_failed_scan_output "$scan_rc" "$stdout_file" "$stderr_file"
     rm -f "$stdout_file" "$stderr_file"
-    [[ "$scan_rc" -ne 0 ]] && rc=$scan_rc
+    # Preserve the MAX exit code across batch members. gitleaks's exit-code
+    # protocol overloads severity onto the numeric value (1 = leaks found,
+    # ≥2 = scanner / IO error). Last-non-zero-wins would let a later
+    # "leaks found" (rc=1) silently downgrade an earlier "scanner failed"
+    # (rc≥2) and ship a green secrets verdict on a half-broken scan. The
+    # same max-preserve discipline is applied in
+    # `_sley_secrets_scan_worktree_files` and matches `_sley_ready`'s
+    # global-severity aggregation.
+    [[ "$scan_rc" -gt "$rc" ]] && rc=$scan_rc
   done
 
   return "$rc"
@@ -677,7 +685,10 @@ _sley_secrets_scan_worktree_files() {
       fi
       if [[ "$scan_rc" -ne 0 ]]; then
         [[ -n "$out" ]] && printf '%s\n' "$out" >&2
-        rc=$scan_rc
+        # Preserve MAX rc across files: gitleaks rc=1 (leaks found) must not
+        # downgrade an earlier rc≥2 (scanner error). See the matching note in
+        # `_sley_secrets_scan_batch`.
+        [[ "$scan_rc" -gt "$rc" ]] && rc=$scan_rc
       fi
     done
   else
@@ -685,7 +696,13 @@ _sley_secrets_scan_worktree_files() {
     # with the bytes scanned. Overlap independent worktree scans, but collect
     # output in file order so the human `ready` report stays deterministic.
     for ((start = 0; start < ${#files[@]}; start += jobs)); do
-      _sley_secrets_scan_batch "${files[@]:start:jobs}" || rc=$?
+      # Reset per-batch rc so the previous iteration's value cannot leak in
+      # when the current batch passes cleanly. Then promote to `rc` only if
+      # the batch was worse than what we've seen so far — same severity
+      # protocol as the single-job path above.
+      scan_rc=0
+      _sley_secrets_scan_batch "${files[@]:start:jobs}" || scan_rc=$?
+      [[ "$scan_rc" -gt "$rc" ]] && rc=$scan_rc
     done
   fi
 
