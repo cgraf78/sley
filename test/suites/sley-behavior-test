@@ -3416,4 +3416,61 @@ parallel_rc=$(
 )
 _assert_eq "secrets worktree (parallel batch): final rc preserves max across batch members" "2" "$parallel_rc"
 
+echo "=== sley: secrets outer aggregator preserves max-severity rc across staged-blob and worktree passes ==="
+
+# Regression test for the OUTER `_sley_secrets` aggregator's MAX-rc fix.
+# The earlier commit (e1ab7ca) only fixed the inner functions
+# (`_sley_secrets_scan_batch`, `_sley_secrets_scan_worktree_files`). The
+# outer aggregator at sley.sh:~764 / ~801 still did `rc=$scan_rc` and
+# `|| rc=$?` — last-non-zero-wins — so a higher-severity staged-blob
+# scanner error (rc=2) was silently downgraded by a later "leaks found"
+# (rc=1) from the worktree scan, exactly the bug class the inner fix
+# was meant to eliminate.
+#
+# Cross-model adversarial review (Codex) caught this gap during the
+# re-review pass. The fix MAX-preserves at both aggregator sites.
+
+outer_repo=$(_new_repo)
+outer_mockbin=$(_mock_bin)
+export OUTER_MOCK_LOG="$outer_repo/gitleaks-outer.log"
+: >"$OUTER_MOCK_LOG"
+# Mock gitleaks: rc=2 when called as `gitleaks stdin ...` (the staged-blob
+# scan path uses `git diff --cached | gitleaks stdin`), rc=1 when called
+# as `gitleaks dir -- <file>` (the worktree scan path). The outer
+# aggregator should preserve the MAX (2), not the last (1).
+cat >"$outer_mockbin/gitleaks" <<'MOCK'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"$OUTER_MOCK_LOG"
+case "$1" in
+  stdin) exit 2 ;;
+  dir) exit 1 ;;
+  *) exit 0 ;;
+esac
+MOCK
+chmod +x "$outer_mockbin/gitleaks"
+
+# Set up a file that is BOTH staged AND modified in the worktree, so
+# `_sley_secrets` runs both the staged-blob pass (via `git diff --cached
+# | gitleaks stdin`) and the worktree pass (via
+# `_sley_secrets_scan_worktree_files`). The worktree-path branch at
+# sley.sh:~770-783 skips files where the worktree matches staged, so we
+# must make them differ.
+echo "x = 1" >"$outer_repo/dual.py"
+(cd "$outer_repo" && git add dual.py && git commit -q -m "seed")
+echo "x = 2" >"$outer_repo/dual.py"
+(cd "$outer_repo" && git add dual.py)
+echo "x = 3" >"$outer_repo/dual.py"
+
+PATH="$outer_mockbin:$PATH" _run_sley "$outer_repo" secrets
+outer_rc=$__SLEY_RC
+
+# Confirm both passes ran (so we know the test actually exercises both
+# code paths, not just one).
+_assert_contains "secrets outer: staged-blob pass ran (stdin)" "stdin --redact --no-banner" "$(cat "$OUTER_MOCK_LOG")"
+_assert_contains "secrets outer: worktree pass ran (dir)" "dir --redact --no-banner" "$(cat "$OUTER_MOCK_LOG")"
+# THE assertion: rc=2 (staged scanner error) must dominate rc=1 (worktree leaks).
+_assert_eq "secrets outer: final rc preserves max (staged=2, worktree=1 → rc=2)" "2" "$outer_rc"
+
+unset OUTER_MOCK_LOG
+
 _test_summary
