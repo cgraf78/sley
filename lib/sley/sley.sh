@@ -763,7 +763,13 @@ _sley_secrets() {
     fi
     if [[ "$scan_rc" -ne 0 ]]; then
       [[ -n "$out" ]] && printf '%s\n' "$out" >&2
-      rc=$scan_rc
+      # MAX-preserve at the outer aggregator too. The inner functions
+      # (`_sley_secrets_scan_batch`, `_sley_secrets_scan_worktree_files`)
+      # already preserve max severity inside their own loops, but a higher
+      # severity from this staged-blob scan must not be downgraded by a
+      # later "leaks found" (rc=1) from the worktree scan below — the very
+      # severity-downgrade bug the inner fixes claimed to eliminate.
+      [[ "$scan_rc" -gt "$rc" ]] && rc=$scan_rc
     fi
   fi
   if [[ "$_SLEY_SCOPE_CHANGE" != "staged" ]]; then
@@ -796,7 +802,14 @@ _sley_secrets() {
       _scanned_set["$file"]=1
     done <<<"$runnable"
   fi
-  _sley_secrets_scan_worktree_files "${worktree_files[@]}" || rc=$?
+  # MAX-preserve across the staged-blob scan above and the worktree scan
+  # here. Reset `scan_rc` first so a successful worktree scan can't inherit
+  # a stale value from the staged path; then promote to `rc` only when the
+  # worktree result is strictly worse. Mirrors the per-batch discipline
+  # inside `_sley_secrets_scan_worktree_files` itself.
+  scan_rc=0
+  _sley_secrets_scan_worktree_files "${worktree_files[@]}" || scan_rc=$?
+  [[ "$scan_rc" -gt "$rc" ]] && rc=$scan_rc
   if [[ "$rc" -eq 0 ]]; then
     _sley_print_file_summary "sley secrets: scanned" "${#_scanned_set[@]}"
   fi
