@@ -586,12 +586,24 @@ _sley_verify_cache_lock_acquire() {
     # and reclaim it. Without this every future run for the same cache key
     # paid the full 5-second mkdir-polling penalty before falling through
     # unlocked AND a duplicate same-key execution could occur.
+    #
+    # CRITICAL: reclaim uses an atomic `mv`-to-tombstone, NOT `rm -rf` + retry.
+    # Two waiters can both pass `_sley_verify_cache_lock_is_stale` (the meta
+    # is unchanged until someone removes the dir), so a naive
+    # `is_stale ? rm -rf` lets the second waiter's `rm` destroy the FIRST
+    # waiter's freshly-acquired lock — exactly the duplicate-execution bug
+    # this whole fix is meant to eliminate. `mv` is atomic on the same
+    # filesystem: only one waiter's rename wins; the loser's `mv` fails
+    # cleanly (source already gone) and falls through to retry mkdir.
+    # The winner deletes a private tombstone path that can never collide
+    # with a subsequent fresh acquire on the original `$lock_dir`.
     if _sley_verify_cache_lock_is_stale "$lock_dir"; then
-      printf 'sley verify: reclaiming stale cache lock (owner PID gone): %s\n' "$lock_dir" >&2
-      rm -rf "$lock_dir" 2>/dev/null || true
-      # Fall through to the next iteration's mkdir attempt rather than
-      # racing the mkdir here; another waiter may also be reclaiming, and
-      # the next `mkdir` call resolves the race deterministically.
+      local tombstone="$lock_dir.stale.$$.$RANDOM"
+      if mv "$lock_dir" "$tombstone" 2>/dev/null; then
+        printf 'sley verify: reclaiming stale cache lock (owner PID gone): %s\n' "$lock_dir" >&2
+        rm -rf "$tombstone" 2>/dev/null || true
+      fi
+      # Fall through to the next iteration's mkdir attempt.
     fi
     attempts=$((attempts + 1))
     sleep 0.1
@@ -651,24 +663,67 @@ _sley_verify_explain_cache_lookup() {
 }
 
 _sley_verify_run_required() {
+  # Thin trap-discipline wrapper around the real implementation.
+  #
+  # Two problems would exist if the signal traps were installed directly in
+  # the impl function:
+  #   1. The trap is set on the caller's shell (the function is not a
+  #      subshell), so it persists after the function returns. Callers /
+  #      tests that rely on default INT/TERM/HUP behavior would be quietly
+  #      mutated for the rest of the session.
+  #   2. A handler without `exit` swallows Ctrl-C and lets the loop march on
+  #      to the next required command — user-hostile and gives the appearance
+  #      that Ctrl-C is broken.
+  #
+  # The wrapper captures the caller's prior trap state for each signal,
+  # delegates to the impl (which installs its own traps with `exit` codes
+  # matching the standard 128+signum convention), and restores the prior
+  # traps on every normal return path. The signal path bypasses the
+  # restore (we `exit` directly), which is the right thing for an
+  # interactive CLI but means signal-during-test cases will terminate the
+  # test shell — documented tradeoff.
+  local _saved_int _saved_term _saved_hup _rc
+  _saved_int=$(trap -p INT)
+  _saved_term=$(trap -p TERM)
+  _saved_hup=$(trap -p HUP)
+  _sley_verify_run_required_impl "$@"
+  _rc=$?
+  # `trap -p SIG` prints the literal command to reinstate the trap (e.g.
+  # `trap -- 'cmd' SIG`); when no prior trap was set it prints nothing, so
+  # we fall back to `trap - SIG` (reset to default).
+  eval "${_saved_int:-trap - INT}"
+  eval "${_saved_term:-trap - TERM}"
+  eval "${_saved_hup:-trap - HUP}"
+  return "$_rc"
+}
+
+_sley_verify_run_required_impl() {
   local commands="$1" files="$2" full="$3" json="$4" force="$5" explain_cache="$6"
   local required command_item command tier exit_code failed=0 status result_status
   local results_json="" first=1 cache_enabled payload lookup cache_status receipt pre_key post_lookup post_key write_result lock_dir
   local passed_count=0 cached_count=0 failed_count=0 skipped_slow_count=0
   local shell_mode shell_flag
 
-  # Cleanup-on-signal trap. Normal control flow releases `lock_dir` at every
+  # Cleanup-on-signal traps. Normal control flow releases `lock_dir` at every
   # branch below, but a SIGINT (Ctrl-C), SIGTERM, or SIGHUP between the
   # `mkdir` in `_sley_verify_cache_lock_acquire` and the matching release
   # would otherwise leak the lock dir. Every future run for the same cache
   # key then paid the full 5-second mkdir-polling penalty before falling
   # through unlocked AND a duplicate same-key execution could occur. The
   # PID-based stale reclaim in `_sley_verify_cache_lock_acquire` is the
-  # defensive backstop for the SIGKILL / power-loss case where this trap
-  # cannot fire. We deliberately do not save/restore the caller's prior
-  # trap state: the trap body is idempotent (a no-op when `lock_dir` is
-  # empty), so leaving it installed after return is harmless.
-  trap '_sley_verify_cache_lock_release "$lock_dir"' INT TERM HUP
+  # defensive backstop for the SIGKILL / power-loss case where the trap
+  # cannot fire.
+  #
+  # Each handler clears the trap first (so a signal during cleanup doesn't
+  # recurse), releases the current `$lock_dir` (idempotent — empty value is
+  # a no-op), then exits with the conventional `128 + signum` code so the
+  # caller sees a real signal-style exit rather than a swallowed Ctrl-C.
+  # The wrapper above restores the caller's prior trap state on normal
+  # return; signal exits bypass that restore, which is correct for an
+  # interactive sley CLI (the shell is terminating anyway).
+  trap 'trap - INT TERM HUP; _sley_verify_cache_lock_release "$lock_dir"; exit 130' INT
+  trap 'trap - INT TERM HUP; _sley_verify_cache_lock_release "$lock_dir"; exit 143' TERM
+  trap 'trap - INT TERM HUP; _sley_verify_cache_lock_release "$lock_dir"; exit 129' HUP
 
   command -v jq >/dev/null 2>&1 || {
     echo "sley verify: jq is required to run required verification commands" >&2

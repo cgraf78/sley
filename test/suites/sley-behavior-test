@@ -3254,8 +3254,13 @@ lock_stdout=$(
     _sley_verify_cache_lock_acquire "'"$verify_receipt"'"
   ' 2>"$lock_stderr_file"
 )
-lock_stderr=$(cat "$lock_stderr_file")
+# Capture the bash -c subprocess's rc IMMEDIATELY after the command
+# substitution. The earlier version of this test deferred to `cat`'s rc
+# via `lock_stderr=$(cat ...); lock_rc=$?`, which is always 0 — the
+# success-rc assertion below would pass vacuously even if reclaim
+# silently broke. Read the stderr file AFTER capturing rc.
 lock_rc=$?
+lock_stderr=$(cat "$lock_stderr_file")
 
 _assert_eq "verify lock: acquire reclaims stale lock and returns the lock dir path" "$verify_expected_lock_dir" "$lock_stdout"
 _assert_eq "verify lock: acquire returns success rc after reclaim" "0" "$lock_rc"
