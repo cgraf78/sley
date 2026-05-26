@@ -3322,4 +3322,93 @@ fi
 
 rm -rf "$verify_expected_lock_dir" 2>/dev/null || true
 
+echo "=== sley: secrets worktree scan preserves max-severity rc across files/batches ==="
+
+# Regression test for the silent-downgrade bug in
+# `_sley_secrets_scan_worktree_files` (and the per-batch loop in
+# `_sley_secrets_scan_batch`). gitleaks's exit-code protocol overloads
+# severity onto the numeric value: rc=0 clean, rc=1 leaks found, rc≥2
+# scanner/IO error. The pre-fix code did `rc=$scan_rc` unconditionally on
+# every non-zero, so a later "leaks found" (rc=1) silently downgraded an
+# earlier "scanner failed" (rc≥2) and shipped a "leaks reported, treated as
+# scanner-clean" verdict that hid the broken scan. The fix preserves the
+# MAX rc across files and batches.
+#
+# Both the single-job code path and the parallel batched path are
+# exercised so a regression in either branch fails this test.
+
+secrets_rc_repo=$(_tmpdir)
+echo "alpha" >"$secrets_rc_repo/alpha.txt"
+echo "beta" >"$secrets_rc_repo/beta.txt"
+
+secrets_rc_mockbin=$(_mock_bin)
+# Mock gitleaks: rc=2 for paths containing 'alpha' (scanner error), rc=1
+# for paths containing 'beta' (leaks-found). Both files are non-zero so
+# every call returns a failure; only the MAX-preserve discipline produces
+# the right final rc.
+cat >"$secrets_rc_mockbin/gitleaks" <<'MOCK'
+#!/usr/bin/env bash
+last="${!#}"
+case "$last" in
+  *alpha*) exit 2 ;;
+  *beta*) exit 1 ;;
+  *) exit 0 ;;
+esac
+MOCK
+chmod +x "$secrets_rc_mockbin/gitleaks"
+
+# Single-job path: SLEY_SECRETS_JOBS=1 forces the for-each-file branch.
+single_rc=$(
+  PATH="$secrets_rc_mockbin:$PATH" SLEY_SECRETS_JOBS=1 \
+    bash -c '
+      source "$SLEY_REPO_ROOT/lib/sley/repo.sh"
+      source "$SLEY_REPO_ROOT/lib/sley/scope.sh"
+      source "$SLEY_REPO_ROOT/lib/sley/hooks.sh"
+      source "$SLEY_REPO_ROOT/lib/sley/verify.sh"
+      source "$SLEY_REPO_ROOT/lib/sley/sley.sh"
+      _REPO_TYPE=git
+      _REPO_ROOT='"$secrets_rc_repo"'
+      _sley_secrets_scan_worktree_files '"$secrets_rc_repo/alpha.txt $secrets_rc_repo/beta.txt"' >/dev/null 2>&1
+      printf "%s\n" "$?"
+    '
+)
+_assert_eq "secrets worktree (1 job): final rc preserves max (alpha=2, beta=1 → rc=2)" "2" "$single_rc"
+
+# Reverse the file order to confirm the result is order-independent. Without
+# the fix, this case returned 2 because beta(1) ran first then alpha(2)
+# overwrote — the bug only manifested when the higher-rc file came first.
+single_rc_reverse=$(
+  PATH="$secrets_rc_mockbin:$PATH" SLEY_SECRETS_JOBS=1 \
+    bash -c '
+      source "$SLEY_REPO_ROOT/lib/sley/repo.sh"
+      source "$SLEY_REPO_ROOT/lib/sley/scope.sh"
+      source "$SLEY_REPO_ROOT/lib/sley/hooks.sh"
+      source "$SLEY_REPO_ROOT/lib/sley/verify.sh"
+      source "$SLEY_REPO_ROOT/lib/sley/sley.sh"
+      _REPO_TYPE=git
+      _REPO_ROOT='"$secrets_rc_repo"'
+      _sley_secrets_scan_worktree_files '"$secrets_rc_repo/beta.txt $secrets_rc_repo/alpha.txt"' >/dev/null 2>&1
+      printf "%s\n" "$?"
+    '
+)
+_assert_eq "secrets worktree (1 job, reversed order): final rc still preserves max" "2" "$single_rc_reverse"
+
+# Parallel batched path: SLEY_SECRETS_JOBS=4 routes through
+# `_sley_secrets_scan_batch`, which has its own max-preserve fix.
+parallel_rc=$(
+  PATH="$secrets_rc_mockbin:$PATH" SLEY_SECRETS_JOBS=4 \
+    bash -c '
+      source "$SLEY_REPO_ROOT/lib/sley/repo.sh"
+      source "$SLEY_REPO_ROOT/lib/sley/scope.sh"
+      source "$SLEY_REPO_ROOT/lib/sley/hooks.sh"
+      source "$SLEY_REPO_ROOT/lib/sley/verify.sh"
+      source "$SLEY_REPO_ROOT/lib/sley/sley.sh"
+      _REPO_TYPE=git
+      _REPO_ROOT='"$secrets_rc_repo"'
+      _sley_secrets_scan_worktree_files '"$secrets_rc_repo/beta.txt $secrets_rc_repo/alpha.txt"' >/dev/null 2>&1
+      printf "%s\n" "$?"
+    '
+)
+_assert_eq "secrets worktree (parallel batch): final rc preserves max across batch members" "2" "$parallel_rc"
+
 _test_summary
