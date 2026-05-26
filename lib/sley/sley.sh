@@ -407,8 +407,18 @@ _sley_status() {
 
 _sley_git_staged_partial_files() {
   local files_text="$1" staged unstaged f
-  staged=$(git diff --cached --name-only --diff-filter=ACM 2>/dev/null)
-  unstaged=$(git diff --name-only --diff-filter=ACM 2>/dev/null)
+  # Route both git invocations through the NUL-safe filter (`-z` +
+  # `_repo_emit_safe_paths`) so a filename with an embedded newline can't
+  # phantom-split into multiple bogus entries and silently misattribute
+  # partial-staging state. See `_repo_emit_safe_paths` in repo.sh.
+  staged=$(
+    set -o pipefail
+    git diff -z --cached --name-only --diff-filter=ACM 2>/dev/null | _repo_emit_safe_paths
+  ) || staged=""
+  unstaged=$(
+    set -o pipefail
+    git diff -z --name-only --diff-filter=ACM 2>/dev/null | _repo_emit_safe_paths
+  ) || unstaged=""
   # Build O(1) membership sets so the loop is O(N) instead of O(N) `grep -Fxq`
   # invocations per row. A 100-file partial-staging audit drops from thousands
   # of grep spawns to one pass over each list.
@@ -429,7 +439,14 @@ _sley_git_staged_partial_files() {
 
 _sley_git_staged_selected_files() {
   local files_text="$1" staged f
-  staged=$(git diff --cached --name-only --diff-filter=ACM 2>/dev/null)
+  # NUL-safe staged-name enumeration (see `_repo_emit_safe_paths` in repo.sh).
+  # Without `-z`, a staged secret in a file with a `\n` in its name would
+  # split into bogus entries that the downstream `_in_files` membership test
+  # silently skips, letting the secret slip past `sley secrets --commit`.
+  staged=$(
+    set -o pipefail
+    git diff -z --cached --name-only --diff-filter=ACM 2>/dev/null | _repo_emit_safe_paths
+  ) || staged=""
   declare -A _in_files
   while IFS= read -r f; do
     [[ -n "$f" ]] && _in_files["$f"]=1
