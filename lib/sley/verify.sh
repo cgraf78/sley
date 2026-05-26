@@ -563,8 +563,35 @@ _sley_verify_cache_lock_acquire() {
   # duplicate same-key executions without making cache unavailability fatal.
   while [[ "$attempts" -lt 50 ]]; do
     if mkdir "$lock_dir" 2>/dev/null; then
+      # Stamp owner metadata so a future invocation can reclaim a stale lock
+      # whose holder was SIGKILLed (or died to OOM / power loss) before
+      # reaching the release path. Hostname is recorded alongside the PID
+      # because lock files live under `XDG_CACHE_HOME` — per-user and
+      # per-machine in practice, but a network-mounted cache (rare) would
+      # otherwise let one host reclaim a still-alive PID on another. Failure
+      # to write metadata is non-fatal: the lock still works, it just falls
+      # back to the pre-fix behavior (no stale reclaim) for this acquisition.
+      {
+        printf 'pid=%s\n' "$$"
+        printf 'host=%s\n' "${HOSTNAME:-$(uname -n 2>/dev/null)}"
+        printf 'started=%s\n' "$(date +%s 2>/dev/null)"
+      } >"$lock_dir/owner.meta" 2>/dev/null || true
       printf '%s\n' "$lock_dir"
       return 0
+    fi
+    # An existing lock dir may be stale (holder SIGKILLed, OOM, power loss
+    # between acquire and release, or the SIGINT/SIGTERM trap in
+    # `_sley_verify_run_required` did not get to run). If `owner.meta` names a
+    # PID that is no longer alive on this host, treat the lock as abandoned
+    # and reclaim it. Without this every future run for the same cache key
+    # paid the full 5-second mkdir-polling penalty before falling through
+    # unlocked AND a duplicate same-key execution could occur.
+    if _sley_verify_cache_lock_is_stale "$lock_dir"; then
+      printf 'sley verify: reclaiming stale cache lock (owner PID gone): %s\n' "$lock_dir" >&2
+      rm -rf "$lock_dir" 2>/dev/null || true
+      # Fall through to the next iteration's mkdir attempt rather than
+      # racing the mkdir here; another waiter may also be reclaiming, and
+      # the next `mkdir` call resolves the race deterministically.
     fi
     attempts=$((attempts + 1))
     sleep 0.1
@@ -575,7 +602,37 @@ _sley_verify_cache_lock_acquire() {
 _sley_verify_cache_lock_release() {
   local lock_dir="$1"
   [[ -n "$lock_dir" ]] || return 0
-  rmdir "$lock_dir" 2>/dev/null || true
+  # `rm -rf` (not `rmdir`) because the lock dir now contains the owner.meta
+  # stamp; rmdir would fail on non-empty dirs and silently leak the lock.
+  rm -rf "$lock_dir" 2>/dev/null || true
+}
+
+# Return success (rc=0) iff `lock_dir` looks abandoned by a dead PID on this
+# host. The caller is expected to remove the directory and retry mkdir.
+# Conservative: locks without metadata, locks owned by another host, and
+# locks whose recorded PID is still alive all return rc=1 (NOT stale).
+_sley_verify_cache_lock_is_stale() {
+  # Split the locals so `meta_file` actually sees `$lock_dir` — same-statement
+  # `local a="$1" b="$a/..."` does not take effect for `b` (shellcheck SC2318).
+  local lock_dir="$1"
+  local meta_file="$lock_dir/owner.meta"
+  local pid host current_host
+  [[ -f "$meta_file" ]] || return 1
+  pid=$(awk -F= '$1=="pid" {print $2; exit}' "$meta_file" 2>/dev/null)
+  host=$(awk -F= '$1=="host" {print $2; exit}' "$meta_file" 2>/dev/null)
+  [[ -n "$pid" && "$pid" =~ ^[0-9]+$ ]] || return 1
+  current_host="${HOSTNAME:-$(uname -n 2>/dev/null)}"
+  # Cross-host lock — may still be held by a live process elsewhere. Don't
+  # reclaim. The shared-cache scenario is rare but worth the conservatism.
+  [[ -n "$host" && -n "$current_host" && "$host" != "$current_host" ]] && return 1
+  # `kill -0 PID` is the POSIX way to test "is this process still alive and
+  # signalable from here". Success means alive (not stale); failure means
+  # ESRCH (no such PID, i.e. stale) or EPERM (alive but unsignalable, treated
+  # as not-stale to stay conservative — `kill -0` returns rc=1 for EPERM but
+  # the only way to distinguish that from ESRCH is `errno`, which bash can't
+  # see, so we accept the false-negative).
+  kill -0 "$pid" 2>/dev/null && return 1
+  return 0
 }
 
 _sley_verify_explain_cache_lookup() {
@@ -599,6 +656,19 @@ _sley_verify_run_required() {
   local results_json="" first=1 cache_enabled payload lookup cache_status receipt pre_key post_lookup post_key write_result lock_dir
   local passed_count=0 cached_count=0 failed_count=0 skipped_slow_count=0
   local shell_mode shell_flag
+
+  # Cleanup-on-signal trap. Normal control flow releases `lock_dir` at every
+  # branch below, but a SIGINT (Ctrl-C), SIGTERM, or SIGHUP between the
+  # `mkdir` in `_sley_verify_cache_lock_acquire` and the matching release
+  # would otherwise leak the lock dir. Every future run for the same cache
+  # key then paid the full 5-second mkdir-polling penalty before falling
+  # through unlocked AND a duplicate same-key execution could occur. The
+  # PID-based stale reclaim in `_sley_verify_cache_lock_acquire` is the
+  # defensive backstop for the SIGKILL / power-loss case where this trap
+  # cannot fire. We deliberately do not save/restore the caller's prior
+  # trap state: the trap body is idempotent (a no-op when `lock_dir` is
+  # empty), so leaving it installed after return is harmless.
+  trap '_sley_verify_cache_lock_release "$lock_dir"' INT TERM HUP
 
   command -v jq >/dev/null 2>&1 || {
     echo "sley verify: jq is required to run required verification commands" >&2
