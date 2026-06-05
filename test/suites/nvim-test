@@ -1,0 +1,94 @@
+#!/usr/bin/env bash
+# nvim-test — verify Sley's optional Neovim protocol adapters.
+
+set -euo pipefail
+
+SLEY_TEST_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
+SLEY_REPO_ROOT="$(cd -- "$SLEY_TEST_DIR/.." && pwd -P)"
+
+# shellcheck source=../helpers.sh
+. "$SLEY_TEST_DIR/helpers.sh"
+
+echo "=== sley: optional Neovim adapters ==="
+
+if ! command -v nvim >/dev/null 2>&1; then
+  echo "  SKIP: nvim adapter tests require Neovim"
+  _test_summary
+fi
+
+lua_test=$(_tmpdir)/sley-nvim-test.lua
+cat >"$lua_test" <<'LUA'
+local root = assert(os.getenv("SLEY_REPO_ROOT"), "SLEY_REPO_ROOT missing")
+local sley_nvim = dofile(root .. "/lib/sley/nvim.lua")
+
+local function assert_eq(desc, expected, actual)
+  if expected ~= actual then
+    error(desc .. ": expected " .. vim.inspect(expected) .. ", got " .. vim.inspect(actual), 0)
+  end
+end
+
+local formatter = sley_nvim.conform_formatter({
+  command = "/tmp/mock-sley",
+  cwd = "/tmp/project",
+})
+assert_eq("formatter command", "/tmp/mock-sley", formatter.command)
+assert_eq("formatter first arg", "hook", formatter.args[1])
+assert_eq("formatter filename placeholder", "$FILENAME", formatter.args[3])
+assert_eq("formatter keeps caller policy fields", "/tmp/project", formatter.cwd)
+assert_eq("formatter does not use stdin", false, formatter.stdin)
+
+local condition_called = false
+local linter = sley_nvim.nvim_lint_linter({
+  command = "/tmp/mock-sley",
+  condition = function()
+    condition_called = true
+    return true
+  end,
+})
+assert_eq("linter command", "/tmp/mock-sley", linter.cmd)
+assert_eq("linter json arg", "--json", linter.args[3])
+assert_eq("linter appends filename", true, linter.append_fname)
+assert_eq("linter ignores lint exit code", true, linter.ignore_exitcode)
+assert_eq("linter condition result", true, linter.condition())
+assert_eq("linter condition called", true, condition_called)
+
+local output = table.concat({
+  vim.json.encode({
+    line = 2,
+    col = 3,
+    end_line = 2,
+    end_col = 8,
+    severity = "error",
+    code = "E1",
+    message = "bad value",
+    source = "mocklint",
+  }),
+  "not json",
+  vim.json.encode({
+    line = 1,
+    severity = "unknown",
+    message = "default severity",
+  }),
+}, "\n")
+
+local diags = linter.parser(output, 17)
+assert_eq("diagnostic count", 2, #diags)
+assert_eq("diagnostic lnum is zero based", 1, diags[1].lnum)
+assert_eq("diagnostic col is zero based", 2, diags[1].col)
+assert_eq("diagnostic end_lnum is zero based", 1, diags[1].end_lnum)
+assert_eq("diagnostic source preserved", "mocklint", diags[1].source)
+assert_eq("diagnostic severity mapped", vim.diagnostic.severity.ERROR, diags[1].severity)
+assert_eq("diagnostic default source", "sley", diags[2].source)
+assert_eq("diagnostic default severity", vim.diagnostic.severity.WARN, diags[2].severity)
+
+print("sley nvim adapter lua checks passed")
+LUA
+
+set +e
+output=$(SLEY_REPO_ROOT="$SLEY_REPO_ROOT" nvim --headless --clean -n -u NONE -i NONE -l "$lua_test" 2>&1)
+rc=$?
+set -e
+_assert_exit "nvim adapter: lua checks pass" 0 "$rc"
+_assert_contains "nvim adapter: reports success" "sley nvim adapter lua checks passed" "$output"
+
+_test_summary

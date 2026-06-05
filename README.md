@@ -96,6 +96,9 @@ New integrations should source `sley.sh` through shdeps and call public
 
 - `bin/sley` is the PATH-visible CLI.
 - `lib/sley/sley.sh` is the sourceable Bash API.
+- `lib/sley/nvim.lua` is the optional Neovim adapter API. It does not depend on
+  shdeps or local editor policy; callers pass command paths and policy callbacks
+  explicitly when they do not want the default PATH-visible `sley`.
 - `share/sley/shell.sh` is the sourceable interactive shell loader.
 - `share/sley/schemas/verify.schema.json` is the JSON Schema for
   `sley verify` registry files.
@@ -123,6 +126,45 @@ New integrations should source `sley.sh` through shdeps and call public
 
 Hook integrations should call `sley_hook_*` functions and use `SLEY_CALLER` and
 `SLEY_SCOPED` for extension context.
+
+### Neovim Adapter API
+
+The Neovim module is a protocol adapter, not a complete plugin. It translates
+Sley's public hook commands and JSON diagnostic contract into common Neovim
+plugin shapes while leaving policy in the consuming config.
+
+```lua
+local sley_nvim = dofile("lib/sley/nvim.lua")
+
+formatters = {
+  sley = sley_nvim.conform_formatter({
+    command = "sley",
+  }),
+}
+
+linters = {
+  sley = sley_nvim.nvim_lint_linter({
+    command = "sley",
+    condition = function()
+      return true
+    end,
+  }),
+}
+```
+
+Public functions:
+
+- `conform_formatter(opts)` returns a Conform formatter spec for
+  `sley hook format-file "$FILENAME"`.
+- `nvim_lint_linter(opts)` returns an nvim-lint linter spec for
+  `sley hook lint-file --json`.
+- `parse_diagnostics(output, opts)` converts Sley's JSON-lines diagnostics into
+  `vim.diagnostic` records.
+
+Supported options are intentionally small: `command`, `args`, `condition`,
+`source`, `default_severity`, and pass-through plugin fields. The module does
+not choose filetypes, configure keymaps, resolve shdeps dependencies, inspect
+workspace roots, or decide local disable flags.
 
 ## Extension Policy
 

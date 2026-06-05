@@ -1,0 +1,8 @@
+# The optional Neovim adapter is tested and linted in this repo, so Selene needs
+# the Neovim standard library globals even though Sley's runtime is mostly Bash.
+std = "vim+lua51"
+
+[rules]
+bad_string_escape = "allow"
+global_usage = "allow"
+mixed_table = "allow"
