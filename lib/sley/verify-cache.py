@@ -88,10 +88,10 @@ def machine_id(root: Path) -> str:
     return sha_bytes(ident_path.read_bytes().strip())
 
 
-def git_output(args: list[str], cwd: Path) -> str | None:
+def _vcs_output(binary: str, args: list[str], cwd: Path) -> str | None:
     try:
         result = subprocess.run(
-            ["git", *args],
+            [binary, *args],
             cwd=str(cwd),
             check=True,
             stdout=subprocess.PIPE,
@@ -101,21 +101,14 @@ def git_output(args: list[str], cwd: Path) -> str | None:
     except (OSError, subprocess.CalledProcessError):
         return None
     return result.stdout.strip()
+
+
+def git_output(args: list[str], cwd: Path) -> str | None:
+    return _vcs_output("git", args, cwd)
 
 
 def sl_output(args: list[str], cwd: Path) -> str | None:
-    try:
-        result = subprocess.run(
-            ["sl", *args],
-            cwd=str(cwd),
-            check=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            text=True,
-        )
-    except (OSError, subprocess.CalledProcessError):
-        return None
-    return result.stdout.strip()
+    return _vcs_output("sl", args, cwd)
 
 
 def repo_identity(payload: dict[str, Any], root: Path) -> dict[str, Any]:
