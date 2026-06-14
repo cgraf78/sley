@@ -6,6 +6,14 @@
 # discovery and required-check execution; `sley ready` delegates to it instead
 # of carrying a separate verification registry.
 
+# Project manifest filenames that map to suggested verify commands. The case in
+# _sley_project_manifest_commands owns the per-manifest command vocabulary; this
+# is the single list the ancestor-walk and repo-root scans iterate.
+_SLEY_MANIFEST_NAMES=(
+  package.json pyproject.toml Cargo.toml go.mod
+  Makefile makefile justfile Justfile BUCK TARGETS
+)
+
 _sley_package_json_commands() {
   local pkg="$1" context="${2:-manifest}" kind cmd
   for kind in test lint build; do
@@ -697,6 +705,25 @@ _sley_verify_run_required() {
   return "$_rc"
 }
 
+# Emit a cached-pass result for the current command: log it, bump the cached
+# counter, and (in JSON mode) append the structured result. Runs the same
+# pre-lock and post-lock cache-hit paths through one implementation. Mutates the
+# caller's cached_count / results_json / first / json via dynamic scope, matching
+# the inline blocks it replaces.
+_sley_verify_emit_cache_hit() {
+  local tier="$1" command="$2" receipt="$3"
+  echo "sley verify: cached pass $tier: $command" >&2
+  [[ -z "$receipt" ]] || echo "sley verify: receipt: $receipt" >&2
+  cached_count=$((cached_count + 1))
+  if [[ "$json" == "1" ]]; then
+    [[ "$first" == "1" ]] || results_json+=","
+    first=0
+    results_json+=$(printf '{"command":"%s","tier":"%s","status":"cached-pass","exit_code":0,"receipt":"%s"}' \
+      "$(_repo_json_escape "$command")" "$(_repo_json_escape "$tier")" \
+      "$(_repo_json_escape "$receipt")")
+  fi
+}
+
 _sley_verify_run_required_impl() {
   local commands="$1" files="$2" full="$3" json="$4" force="$5" explain_cache="$6"
   local required command_item command tier exit_code failed=0 status result_status
@@ -795,16 +822,7 @@ _sley_verify_run_required_impl() {
         cache_enabled=0
       fi
       if [[ "$force" != "1" && "$cache_status" == "hit" ]]; then
-        echo "sley verify: cached pass $tier: $command" >&2
-        [[ -z "$receipt" ]] || echo "sley verify: receipt: $receipt" >&2
-        cached_count=$((cached_count + 1))
-        if [[ "$json" == "1" ]]; then
-          [[ "$first" == "1" ]] || results_json+=","
-          first=0
-          results_json+=$(printf '{"command":"%s","tier":"%s","status":"cached-pass","exit_code":0,"receipt":"%s"}' \
-            "$(_repo_json_escape "$command")" "$(_repo_json_escape "$tier")" \
-            "$(_repo_json_escape "$receipt")")
-        fi
+        _sley_verify_emit_cache_hit "$tier" "$command" "$receipt"
         continue
       fi
       if [[ "$cache_enabled" != "1" ]]; then
@@ -833,16 +851,7 @@ _sley_verify_run_required_impl() {
         if [[ "$cache_status" == "hit" ]]; then
           _sley_verify_cache_lock_release "$lock_dir"
           lock_dir=""
-          echo "sley verify: cached pass $tier: $command" >&2
-          [[ -z "$receipt" ]] || echo "sley verify: receipt: $receipt" >&2
-          cached_count=$((cached_count + 1))
-          if [[ "$json" == "1" ]]; then
-            [[ "$first" == "1" ]] || results_json+=","
-            first=0
-            results_json+=$(printf '{"command":"%s","tier":"%s","status":"cached-pass","exit_code":0,"receipt":"%s"}' \
-              "$(_repo_json_escape "$command")" "$(_repo_json_escape "$tier")" \
-              "$(_repo_json_escape "$receipt")")
-          fi
+          _sley_verify_emit_cache_hit "$tier" "$command" "$receipt"
           continue
         fi
       fi
@@ -1038,9 +1047,7 @@ _sley_verify() {
       # the project root 100 times.
       [[ -n "${_seen_dirs[$dir]:-}" ]] && break
       _seen_dirs[$dir]=1
-      for source in "$dir/package.json" "$dir/pyproject.toml" "$dir/Cargo.toml" \
-        "$dir/go.mod" "$dir/Makefile" "$dir/makefile" "$dir/justfile" \
-        "$dir/Justfile" "$dir/BUCK" "$dir/TARGETS"; do
+      for source in "${_SLEY_MANIFEST_NAMES[@]/#/$dir/}"; do
         [[ -f "$source" ]] && commands+=$(_sley_project_manifest_commands "$source" ancestor)$'\n'
       done
       case "$dir" in
@@ -1053,8 +1060,7 @@ _sley_verify() {
   # Repo-root manifests are independent of which files changed; scan them once
   # outside the per-file loop so a large change set does not re-stat every
   # top-level manifest for every touched file.
-  for source in package.json pyproject.toml Cargo.toml go.mod Makefile makefile \
-    justfile Justfile BUCK TARGETS; do
+  for source in "${_SLEY_MANIFEST_NAMES[@]}"; do
     [[ -f "$source" ]] && commands+=$(_sley_project_manifest_commands "$source" repo-root)$'\n'
   done
   commands+=$(_sley_verify_extension_commands "$files")$'\n' || return 1

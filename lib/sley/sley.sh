@@ -347,9 +347,9 @@ _sley_dirty_counts_json() {
       # the active draft commit's files would conflate "is the worktree dirty?"
       # with "is there unsubmitted work?". Keep the `untracked` count separate
       # because Sapling supports it directly via `sl status -u`.
-      pending=$(_repo_sl_changed_names pending 0 2>/dev/null | sed '/^$/d' | wc -l | tr -d ' ')
+      pending=$(_sley_count_file_list "$(_repo_sl_changed_names pending 0 2>/dev/null)")
       if [[ "$skip_untracked" != "1" ]]; then
-        untracked=$(_repo_sl_machine status --no-status -u 2>/dev/null | sed '/^$/d' | wc -l | tr -d ' ')
+        untracked=$(_sley_count_file_list "$(_repo_sl_machine status --no-status -u 2>/dev/null)")
       fi
       ;;
   esac

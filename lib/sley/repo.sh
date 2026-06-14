@@ -142,7 +142,8 @@ _repo_json_escape() {
       python3 -c 'import json, sys; sys.stdout.write(json.dumps(sys.stdin.read())[1:-1])'
     return
   fi
-  echo "sley: jq or python3 is required for JSON output" >&2
+  # No encoder: emit the shared requirement message from its single owner.
+  _repo_require_json_encoder
   return 2
 }
 
