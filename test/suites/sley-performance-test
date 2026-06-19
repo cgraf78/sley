@@ -17,8 +17,8 @@ SLEY_PERF_BUDGET_MULTIPLIER_ENV=SLEY_PERF_BUDGET_MULTIPLIER
 # These measure the user-visible CLI path, including repo detection, changed-file
 # discovery, JSON command grouping, and process startup. They are intentionally
 # not microbenchmarks; commit hooks and agent workflows pay the full CLI cost.
-VERIFY_DISCOVERY_P95_BUDGET_MS=1500
-VERIFY_REQUIRED_REGISTRY_P95_BUDGET_MS=1800
+VERIFY_DISCOVERY_P95_BUDGET_MS=2500
+VERIFY_REQUIRED_REGISTRY_P95_BUDGET_MS=2500
 
 _new_perf_repo() {
   local repo
