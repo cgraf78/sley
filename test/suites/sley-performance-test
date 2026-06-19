@@ -1,0 +1,214 @@
+#!/usr/bin/env bash
+# sley-performance-test - guard the shape of latency-sensitive verify paths.
+
+set -euo pipefail
+
+SLEY_TEST_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
+SLEY_REPO_ROOT="$(cd -- "$SLEY_TEST_DIR/.." && pwd -P)"
+SLEY="$SLEY_REPO_ROOT/bin/sley"
+
+# shellcheck source=../helpers.sh
+. "$SLEY_TEST_DIR/helpers.sh"
+
+SLEY_PERF_RUNS=${SLEY_PERF_RUNS:-7}
+SLEY_PERF_CHANGED_FILES=${SLEY_PERF_CHANGED_FILES:-300}
+SLEY_PERF_BUDGET_MULTIPLIER_ENV=SLEY_PERF_BUDGET_MULTIPLIER
+
+# These measure the user-visible CLI path, including repo detection, changed-file
+# discovery, JSON command grouping, and process startup. They are intentionally
+# not microbenchmarks; commit hooks and agent workflows pay the full CLI cost.
+VERIFY_DISCOVERY_P95_BUDGET_MS=2500
+VERIFY_REQUIRED_REGISTRY_P95_BUDGET_MS=2500
+
+_new_perf_repo() {
+  local repo
+  repo=$(_tmpdir)
+  (
+    cd "$repo" || exit 1
+    export GIT_CONFIG_GLOBAL="$repo/.gitconfig-test"
+    : >"$GIT_CONFIG_GLOBAL"
+    git init -q
+    git config user.email test@test.local
+    git config user.name "Test User"
+    mkdir -p "$repo/.hooks"
+    git config core.hooksPath "$repo/.hooks"
+    git config commit.gpgsign false
+  )
+  (cd "$repo" && pwd -P)
+}
+
+_perf_budget_ms() {
+  local base_ms="$1" multiplier
+  multiplier="${!SLEY_PERF_BUDGET_MULTIPLIER_ENV:-1}"
+  if ! [[ "$multiplier" =~ ^[1-9][0-9]*$ ]]; then
+    multiplier=1
+  fi
+  printf '%s\n' "$((base_ms * multiplier))"
+}
+
+_assert_ms_le() {
+  local desc="$1" actual_ms="$2" budget_ms="$3"
+  if [[ "$actual_ms" -le "$budget_ms" ]]; then
+    _pass "$desc (${actual_ms}ms <= ${budget_ms}ms)"
+  else
+    _fail "$desc (${actual_ms}ms > ${budget_ms}ms)"
+  fi
+}
+
+_p95_ms() {
+  local runs="$1" index
+  index=$(((runs * 95 + 99) / 100))
+  LC_ALL=C sort -n | sed -n "${index}p"
+}
+
+_run_perf_sley_timed() {
+  local timeout_secs="$1" repo="$2"
+  shift 2
+  local xdg_config_home xdg_cache_home output_file rc_file
+  xdg_config_home="$repo/.xdg-config"
+  xdg_cache_home="$repo/.xdg-cache"
+  output_file="$repo/.sley-perf-output"
+  rc_file="$repo/.sley-perf-rc"
+  mkdir -p "$xdg_config_home" "$xdg_cache_home"
+  __SLEY_MS=$(
+    cd "$repo" &&
+      XDG_CONFIG_HOME="$xdg_config_home" \
+        XDG_CACHE_HOME="$xdg_cache_home" \
+        GIT_CONFIG_GLOBAL="$repo/.gitconfig-test" \
+        python3 - "$timeout_secs" "$output_file" "$rc_file" "$SLEY" "$@" <<'PY'
+import os
+import subprocess
+import sys
+import time
+
+timeout = float(sys.argv[1])
+output_file = sys.argv[2]
+rc_file = sys.argv[3]
+cmd = sys.argv[4:]
+
+started = time.perf_counter_ns()
+try:
+    completed = subprocess.run(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        timeout=timeout,
+        env=os.environ.copy(),
+    )
+    rc = completed.returncode
+    output = completed.stdout
+except subprocess.TimeoutExpired as exc:
+    rc = 124
+    output = exc.stdout or ""
+    if isinstance(output, bytes):
+        output = output.decode(errors="replace")
+
+elapsed_ms = max(1, (time.perf_counter_ns() - started) // 1_000_000)
+with open(output_file, "w", encoding="utf-8") as handle:
+    handle.write(output)
+with open(rc_file, "w", encoding="utf-8") as handle:
+    handle.write(str(rc))
+print(elapsed_ms)
+PY
+  )
+  __SLEY_OUT=$(cat "$output_file")
+  __SLEY_RC=$(cat "$rc_file")
+}
+
+_measure_perf_p95() {
+  local desc="$1" timeout_secs="$2" repo="$3"
+  shift 3
+  local durations_file run
+  durations_file="$repo/.sley-perf-durations"
+  : >"$durations_file"
+  for run in $(seq 1 "$SLEY_PERF_RUNS"); do
+    _run_perf_sley_timed "$timeout_secs" "$repo" "$@"
+    if [[ "$__SLEY_RC" -ne 0 ]]; then
+      _fail "$desc sample $run exits 0 (got $__SLEY_RC; output: $__SLEY_OUT)"
+      return 1
+    fi
+    printf '%s\n' "$__SLEY_MS" >>"$durations_file"
+  done
+  __PERF_P95=$(_p95_ms "$SLEY_PERF_RUNS" <"$durations_file")
+}
+
+_write_changed_tree() {
+  local repo="$1" count="$2" i dir file
+  dir="$repo/packages/app/src/generated/deep/nested"
+  mkdir -p "$dir"
+  for i in $(seq 1 "$count"); do
+    file="$dir/file-$i.js"
+    printf 'export const value%s = %s;\n' "$i" "$i" >"$file"
+  done
+  (
+    cd "$repo" || exit 1
+    git add .
+    git commit -q -m "seed large verify fixture"
+  )
+  for i in $(seq 1 "$count"); do
+    file="$dir/file-$i.js"
+    printf 'export const changed%s = %s;\n' "$i" "$i" >>"$file"
+  done
+}
+
+echo "=== sley: verify performance ==="
+
+repo=$(_new_perf_repo)
+mkdir -p "$repo/packages/app"
+cat >"$repo/package.json" <<'EOF'
+{"scripts":{"test":"node root-test.js","lint":"node root-lint.js"}}
+EOF
+cat >"$repo/packages/app/package.json" <<'EOF'
+{"scripts":{"test":"node app-test.js","lint":"node app-lint.js","build":"node app-build.js"}}
+EOF
+_write_changed_tree "$repo" "$SLEY_PERF_CHANGED_FILES"
+
+_run_perf_sley_timed 15 "$repo" verify --json
+_assert_exit "verify perf: large shared subtree discovery exits 0" 0 "$__SLEY_RC"
+_assert_contains "verify perf: discovers ancestor manifest command" "node app-test.js" "$__SLEY_OUT"
+_assert_contains "verify perf: discovers repo-root manifest command" "node root-test.js" "$__SLEY_OUT"
+_measure_perf_p95 "verify perf: large shared subtree discovery" 15 "$repo" verify --json
+discovery_p95="$__PERF_P95"
+discovery_budget=$(_perf_budget_ms "$VERIFY_DISCOVERY_P95_BUDGET_MS")
+echo "  PERF: verify discovery p95 ${discovery_p95}ms (budget ${discovery_budget}ms, files ${SLEY_PERF_CHANGED_FILES}, runs ${SLEY_PERF_RUNS})"
+_assert_ms_le "verify perf: large shared subtree discovery p95" "$discovery_p95" "$discovery_budget"
+
+repo=$(_new_perf_repo)
+mkdir -p "$repo/.sley" "$repo/tests"
+cat >"$repo/.sley/verify.json" <<'EOF'
+{
+  "rules": [
+    {
+      "paths": ["packages/app/src/**"],
+      "commands": [
+        {
+          "cmd": "./tests/run-once.sh",
+          "required": true
+        }
+      ]
+    }
+  ]
+}
+EOF
+cat >"$repo/tests/run-once.sh" <<'EOF'
+#!/usr/bin/env bash
+count=0
+[[ -f tests/count ]] && count=$(cat tests/count)
+count=$((count + 1))
+printf '%s\n' "$count" > tests/count
+EOF
+chmod +x "$repo/tests/run-once.sh"
+_write_changed_tree "$repo" "$SLEY_PERF_CHANGED_FILES"
+
+_run_perf_sley_timed 15 "$repo" verify --run-required --json
+_assert_exit "verify perf: large registry run exits 0" 0 "$__SLEY_RC"
+_assert_contains "verify perf: reports required command pass" '"status":"passed"' "$__SLEY_OUT"
+_assert_file_content "verify perf: grouped required command runs once" "1" "$repo/tests/count"
+_measure_perf_p95 "verify perf: large registry" 15 "$repo" verify --run-required --json
+registry_p95="$__PERF_P95"
+registry_budget=$(_perf_budget_ms "$VERIFY_REQUIRED_REGISTRY_P95_BUDGET_MS")
+echo "  PERF: verify required registry p95 ${registry_p95}ms (budget ${registry_budget}ms, files ${SLEY_PERF_CHANGED_FILES}, runs ${SLEY_PERF_RUNS})"
+_assert_ms_le "verify perf: large registry p95" "$registry_p95" "$registry_budget"
+
+_test_summary
