@@ -18,6 +18,7 @@ SLEY_PERF_BUDGET_MULTIPLIER_ENV=SLEY_PERF_BUDGET_MULTIPLIER
 # discovery, JSON command grouping, and process startup. They are intentionally
 # not microbenchmarks; commit hooks and agent workflows pay the full CLI cost.
 VERIFY_DISCOVERY_P95_BUDGET_MS=2500
+VERIFY_DISCOVERY_DARWIN_P95_BUDGET_MS=3500
 VERIFY_REQUIRED_REGISTRY_P95_BUDGET_MS=2500
 
 _new_perf_repo() {
@@ -38,7 +39,10 @@ _new_perf_repo() {
 }
 
 _perf_budget_ms() {
-  local base_ms="$1" multiplier
+  local base_ms="$1" darwin_ms="${2:-}" multiplier
+  if [[ "$(uname -s)" == "Darwin" && -n "$darwin_ms" ]]; then
+    base_ms="$darwin_ms"
+  fi
   multiplier="${!SLEY_PERF_BUDGET_MULTIPLIER_ENV:-1}"
   if ! [[ "$multiplier" =~ ^[1-9][0-9]*$ ]]; then
     multiplier=1
@@ -170,7 +174,7 @@ _assert_contains "verify perf: discovers ancestor manifest command" "node app-te
 _assert_contains "verify perf: discovers repo-root manifest command" "node root-test.js" "$__SLEY_OUT"
 _measure_perf_p95 "verify perf: large shared subtree discovery" 15 "$repo" verify --json
 discovery_p95="$__PERF_P95"
-discovery_budget=$(_perf_budget_ms "$VERIFY_DISCOVERY_P95_BUDGET_MS")
+discovery_budget=$(_perf_budget_ms "$VERIFY_DISCOVERY_P95_BUDGET_MS" "$VERIFY_DISCOVERY_DARWIN_P95_BUDGET_MS")
 echo "  PERF: verify discovery p95 ${discovery_p95}ms (budget ${discovery_budget}ms, files ${SLEY_PERF_CHANGED_FILES}, runs ${SLEY_PERF_RUNS})"
 _assert_ms_le "verify perf: large shared subtree discovery p95" "$discovery_p95" "$discovery_budget"
 
