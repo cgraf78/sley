@@ -54,6 +54,7 @@ assert_eq("linter condition called", true, condition_called)
 
 local output = table.concat({
   vim.json.encode({
+    path = "/tmp/project/test.lua",
     line = 2,
     col = 3,
     end_line = 2,
@@ -65,9 +66,12 @@ local output = table.concat({
   }),
   "not json",
   vim.json.encode({
+    path = "/tmp/project/test.lua",
     line = 1,
+    col = 1,
     severity = "unknown",
     message = "default severity",
+    source = "mocklint",
   }),
 }, "\n")
 
@@ -76,9 +80,11 @@ assert_eq("diagnostic count", 2, #diags)
 assert_eq("diagnostic lnum is zero based", 1, diags[1].lnum)
 assert_eq("diagnostic col is zero based", 2, diags[1].col)
 assert_eq("diagnostic end_lnum is zero based", 1, diags[1].end_lnum)
+assert_eq("diagnostic end_col is zero based", 7, diags[1].end_col)
+assert_eq("diagnostic code preserved", "E1", diags[1].code)
 assert_eq("diagnostic source preserved", "mocklint", diags[1].source)
 assert_eq("diagnostic severity mapped", vim.diagnostic.severity.ERROR, diags[1].severity)
-assert_eq("diagnostic default source", "sley", diags[2].source)
+assert_eq("diagnostic source preserved on fallback severity", "mocklint", diags[2].source)
 assert_eq("diagnostic default severity", vim.diagnostic.severity.WARN, diags[2].severity)
 
 print("sley nvim adapter lua checks passed")

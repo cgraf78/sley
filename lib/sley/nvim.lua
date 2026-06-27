@@ -3,9 +3,10 @@
 -- This module intentionally does not resolve shdeps paths, choose filetypes,
 -- create keymaps, or decide when linting should be disabled. Those choices are
 -- editor policy owned by the caller. Sley owns only the public hook command
--- contracts and the JSON diagnostic shape emitted by `sley hook lint-file
--- --json`, so the helpers below translate those contracts into common Neovim
--- plugin shapes.
+-- contracts. The JSON diagnostic object shape itself is produced by Checkrun's
+-- `autolint --json` path and documented in Checkrun's diagnostics schema; this
+-- module only translates that producer-owned contract into common Neovim plugin
+-- shapes.
 
 local M = {}
 
