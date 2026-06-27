@@ -30,9 +30,17 @@ _sley_shell_dir() {
 
 _sley_verify_schema_default() {
   local dir schema
-  # Integration harnesses may cache this loader by copying its contents.
-  # Prefer the dependency manager's public asset resolver so copied shell-init
-  # files still point back at the versioned schema in the sley repo.
+  dir=$(_sley_shell_dir) || dir=""
+  schema="$dir/schemas/verify.schema.json"
+  if [ -n "$dir" ] && [ -f "$schema" ]; then
+    printf '%s\n' "$schema"
+    return 0
+  fi
+
+  # Integration harnesses may cache this loader by copying its contents. When
+  # the adjacent repo asset is absent, fall back to the dependency manager's
+  # public resolver so copied shell-init files still point at the versioned
+  # schema in the sley repo.
   if command -v shdeps >/dev/null 2>&1; then
     schema=$(shdeps dep-file cgraf78/sley share/sley/schemas/verify.schema.json 2>/dev/null) &&
       [ -n "$schema" ] &&
@@ -40,10 +48,7 @@ _sley_verify_schema_default() {
       return 0
   fi
 
-  dir=$(_sley_shell_dir) || return 1
-  schema="$dir/schemas/verify.schema.json"
-  [ -f "$schema" ] || return 1
-  printf '%s\n' "$schema"
+  return 1
 }
 
 if [ -z "${SLEY_VERIFY_SCHEMA:-}" ]; then

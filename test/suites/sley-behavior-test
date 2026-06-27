@@ -25,7 +25,8 @@ SLEY_TEST_XDG_CACHE_HOME=$(_tmpdir)/xdg-cache
 echo "=== sley: public shell API ==="
 
 shell_completion_output=$(
-  SLEY_REPO_ROOT="$SLEY_REPO_ROOT" bash --noprofile --norc -c '
+  # shellcheck disable=SC2016 # Inner bash expands the sourced shell API with SLEY_VERIFY_SCHEMA isolated.
+  env -u SLEY_VERIFY_SCHEMA SLEY_REPO_ROOT="$SLEY_REPO_ROOT" bash --noprofile --norc -c '
     source "$SLEY_REPO_ROOT/share/sley/shell.sh"
     COMP_WORDS=(sley "")
     COMP_CWORD=1
@@ -75,7 +76,8 @@ exit 1
 EOF
 chmod +x "$cached_bin/shdeps"
 cached_schema_output=$(
-  PATH="$cached_bin:$PATH" bash --noprofile --norc -c '
+  # shellcheck disable=SC2016 # Inner bash must see the copied loader path and mock shdeps environment.
+  env -u SLEY_VERIFY_SCHEMA PATH="$cached_bin:$PATH" bash --noprofile --norc -c '
     source "$1"
     printf "%s\n" "${SLEY_VERIFY_SCHEMA:-}"
   ' bash "$cached_loader"

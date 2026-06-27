@@ -99,6 +99,9 @@ New integrations should source `sley.sh` through shdeps and call public
 - `lib/sley/nvim.lua` is the optional Neovim adapter API. It does not depend on
   shdeps or local editor policy; callers pass command paths and policy callbacks
   explicitly when they do not want the default PATH-visible `sley`.
+  Its diagnostic parser consumes the JSON-lines contract emitted by
+  Checkrun-backed `sley hook lint-file --json`; Checkrun owns that diagnostic
+  schema so editor integrations share one producer contract.
 - `share/sley/shell.sh` is the sourceable interactive shell loader.
 - `share/sley/schemas/verify.schema.json` is the JSON Schema for
   `sley verify` registry files.
@@ -119,6 +122,12 @@ New integrations should source `sley.sh` through shdeps and call public
   startup files may source the loader before their zsh completion phase.
 - Native VCS hooks delegate mechanical checks to
   `sley ready --fix --exclude verify --commit`.
+
+`sley verify` discovers and runs local workflow commands from manifests,
+verify registries, and Sley extensions. It is intentionally separate from
+`checkrun verify`, which owns explicit project/security scans that should not
+run from save-time editor lint. Bridge those checks through Sley's verify
+extension API when a repo wants them in `sley ready`.
 
 `sley_select` sets `SLEY_REPO_TYPE`, `SLEY_REPO_ROOT`, `SLEY_CHANGE_SCOPE`,
 `SLEY_INCLUDE_UNTRACKED`, `SLEY_REPO_WIDE`, `SLEY_PATH_SCOPE`, and
