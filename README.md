@@ -60,10 +60,13 @@ changes, it refuses the whole operation to preserve partial-staging intent.
   policy.
 - `gitleaks` is required for `sley secrets`.
 
-Optional verification commands such as `pytest`, `cargo`, `go`, `make`, `just`,
-`buck2`, `actionlint`, and `zizmor` are discovered from project manifests or
-verify registries and are only required when a selected rule asks Sley to run
-them.
+Optional workflow commands such as `pytest`, `cargo test`, `go test`, `make`,
+`just`, `buck2`, `actionlint`, and `zizmor` are discovered from project
+manifests or verify registries and are only required when a selected rule asks
+Sley to run them. Low-level project/security analyzers such as `cargo-audit`
+and `govulncheck` belong behind `checkrun verify`; put
+`checkrun verify --tool ...` in a verify registry when a repo wants those checks
+to count toward `sley ready`.
 
 Consumers that want Sley to operate on a bare Git worktree can set the standard
 `GIT_DIR` and `GIT_WORK_TREE` environment variables before invoking it. Set
@@ -127,7 +130,8 @@ New integrations should source `sley.sh` through shdeps and call public
 verify registries, and Sley extensions. It is intentionally separate from
 `checkrun verify`, which owns explicit project/security scans that should not
 run from save-time editor lint. Bridge those checks through Sley's verify
-extension API when a repo wants them in `sley ready`.
+registry or extension API when a repo wants them in `sley ready`; Sley should
+run `checkrun verify --tool ...`, not the underlying scanner directly.
 
 `sley_select` sets `SLEY_REPO_TYPE`, `SLEY_REPO_ROOT`, `SLEY_CHANGE_SCOPE`,
 `SLEY_INCLUDE_UNTRACKED`, `SLEY_REPO_WIDE`, `SLEY_PATH_SCOPE`, and

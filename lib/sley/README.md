@@ -13,6 +13,7 @@ This directory owns reusable Sley behavior.
 - `hooks.sh` owns shell hook integration.
 - `nvim.lua` provides the optional Neovim adapter.
 
-Keep checkrun integration at the boundary where formatting and linting are
-requested. Sley should ask checkrun for plans or execution rather than
-duplicating formatter/linter registry knowledge.
+Keep checkrun integration at the boundary where formatting, linting, and
+project/security analysis are requested. Sley should ask checkrun for plans or
+execution rather than duplicating formatter, linter, or analyzer knowledge; Sley
+itself owns workflow command discovery, caching, and readiness aggregation.

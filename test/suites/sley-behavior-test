@@ -1404,7 +1404,13 @@ test:
 lint:
 	@true
 EOF
-git -C "$repo" add package.json pyproject.toml Makefile
+cat >"$repo/Cargo.toml" <<'EOF'
+[package]
+name = "demo"
+version = "0.1.0"
+edition = "2021"
+EOF
+git -C "$repo" add package.json pyproject.toml Makefile Cargo.toml
 
 _run_sley "$repo" verify --json
 _assert_exit "verify --json: succeeds" 0 "$__SLEY_RC"
@@ -1412,6 +1418,9 @@ _assert_contains "verify --json: emits commands" '"commands":[' "$__SLEY_OUT"
 _assert_contains "verify --json: emits kind" '"kind":"test"' "$__SLEY_OUT"
 _assert_contains "verify --json: emits sources" '"sources":[' "$__SLEY_OUT"
 _assert_contains "verify --json: detects pyproject pytest" '"command":"pytest"' "$__SLEY_OUT"
+_assert_contains "verify --json: keeps Cargo workflow test command" '"command":"cargo test"' "$__SLEY_OUT"
+_assert_contains "verify --json: keeps Cargo workflow build command" '"command":"cargo build"' "$__SLEY_OUT"
+_assert_not_contains "verify --json: does not invent Checkrun security scans" "cargo-audit" "$__SLEY_OUT"
 _assert_contains "verify --json: detects make target" '"command":"make test"' "$__SLEY_OUT"
 
 repo=$(_new_repo)
@@ -1500,6 +1509,49 @@ _assert_contains "verify registry: changed file listed" "src/app.txt" "$__SLEY_O
 _assert_contains "verify registry: running mapped command" "running required fast command: ./tests/run.sh" "$__SLEY_OUT"
 _assert_contains "verify registry: exit code recorded" "exit code: 0" "$__SLEY_OUT"
 _assert_file_exists "verify registry: mapped command ran" "$repo/tests/ran"
+
+repo=$(_new_repo)
+mkdir -p "$repo/src" "$repo/.sley" "$repo/mockbin"
+cat >"$repo/src/lib.rs" <<'EOF'
+pub fn demo() {}
+EOF
+cat >"$repo/.sley/verify.json" <<'EOF'
+{
+  "rules": [
+    {
+      "paths": ["src/**"],
+      "commands": [
+        {
+          "command": "checkrun verify --tool cargo-audit .",
+          "kind": "security",
+          "required": true,
+          "tier": "slow",
+          "cache": {
+            "enabled": true,
+            "base_policy": "selected-content",
+            "salt": "checkrun-cargo-audit-v1"
+          }
+        }
+      ]
+    }
+  ]
+}
+EOF
+cat >"$repo/mockbin/checkrun" <<'EOF'
+#!/usr/bin/env bash
+printf '%s|%s\n' "$PWD" "$*" > checkrun-verify.log
+exit 0
+EOF
+chmod +x "$repo/mockbin/checkrun"
+(cd "$repo" && git add . && git commit -q -m "seed checkrun verify bridge")
+echo "pub fn changed() {}" >>"$repo/src/lib.rs"
+
+PATH="$repo/mockbin:$PATH" _run_sley "$repo" verify --run-required --full --json
+_assert_exit "verify registry: Checkrun verify bridge exits 0" 0 "$__SLEY_RC"
+_assert_contains "verify registry: Checkrun verify bridge is required security command" \
+  '"command":"checkrun verify --tool cargo-audit .","tier":"slow","status":"passed","exit_code":0' "$__SLEY_OUT"
+_assert_file_content "verify registry: Sley delegates Checkrun security backend unchanged" \
+  "$repo|verify --tool cargo-audit ." "$repo/checkrun-verify.log"
 
 repo=$(_new_repo)
 home=$(_tmpdir)
