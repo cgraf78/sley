@@ -80,21 +80,19 @@ _sley_make_like_commands() {
 }
 
 _sley_project_manifest_commands() {
-  local source="$1" context="${2:-manifest}" base q dir_q
+  local source="$1" context="${2:-manifest}" base dir_q
   [[ -f "$source" ]] || return 0
   base=$(basename "$source")
-  q=$(_sley_shell_quote "$source")
   case "$base" in
     package.json)
       _sley_package_json_commands "$source" "$context"
       ;;
     pyproject.toml)
       # These are conservative hints, not an execution engine. `sley verify`
-      # should help humans/agents discover likely local checks without
-      # inventing repo-specific commands from thin air.
+      # should help humans/agents discover workflow entry points. Formatter,
+      # linter, type-checker, and security-analyzer semantics belong to
+      # Checkrun or explicit verify registries, not manifest guessing here.
       grep -Eq '\[tool\.pytest|pytest' -- "$source" && _sley_manifest_command "pytest" "$source" test "$context"
-      grep -Eq '\[tool\.ruff|ruff' -- "$source" && _sley_manifest_command "ruff check ." "$source" lint "$context"
-      grep -Eq '\[tool\.mypy|mypy' -- "$source" && _sley_manifest_command "mypy ." "$source" lint "$context"
       ;;
     Cargo.toml)
       _sley_manifest_command "cargo test" "$source" test "$context"
@@ -112,16 +110,6 @@ _sley_project_manifest_commands() {
     BUCK | TARGETS)
       dir_q=$(_sley_shell_quote "$(dirname "$source")")
       _sley_manifest_command "buck2 test ${dir_q}:..." "$source" test "$context"
-      ;;
-    *.yml | *.yaml)
-      case "$source" in
-        .github/workflows/*)
-          # Quote the path so workflow files with spaces produce
-          # copy-pasteable commands.
-          _sley_manifest_command "actionlint $q" "$source" lint "$context"
-          _sley_manifest_command "zizmor $q" "$source" lint "$context"
-          ;;
-      esac
       ;;
   esac
 }
@@ -1028,8 +1016,8 @@ _sley_verify() {
   declare -A _seen_dirs
   while IFS= read -r file; do
     [[ -n "$file" ]] || continue
-    # Workflow files are commands in their own right; nearby manifest discovery
-    # below handles the project-local test/build hints.
+    # A changed file may itself be a manifest with workflow commands; nearby
+    # manifest discovery below handles broader project-local test/build hints.
     commands+=$(_sley_project_manifest_commands "$file" changed-file)$'\n'
     # Parameter-expansion `dirname` — `${file%/*}` when there's a slash, else
     # ".". Saves a fork per file (a 100-file change set walking 5 levels deep

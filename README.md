@@ -61,12 +61,13 @@ changes, it refuses the whole operation to preserve partial-staging intent.
 - `gitleaks` is required for `sley secrets`.
 
 Optional workflow commands such as `pytest`, `cargo test`, `go test`, `make`,
-`just`, `buck2`, `actionlint`, and `zizmor` are discovered from project
-manifests or verify registries and are only required when a selected rule asks
-Sley to run them. Low-level project/security analyzers such as `cargo-audit`
-and `govulncheck` belong behind `checkrun verify`; put
-`checkrun verify --tool ...` in a verify registry when a repo wants those checks
-to count toward `sley ready`.
+`just`, and `buck2` are discovered from project manifests or verify registries
+and are only required when a selected rule asks Sley to run them. Low-level
+formatters, linters, type checkers, and project/security analyzers such as
+`ruff`, `mypy`, `actionlint`, `zizmor`, `cargo-audit`, and `govulncheck` belong
+behind Checkrun or an explicit verify registry command. Put
+`checkrun verify --tool ...` in a verify registry when a repo wants explicit
+project/security checks to count toward `sley ready`.
 
 Consumers that want Sley to operate on a bare Git worktree can set the standard
 `GIT_DIR` and `GIT_WORK_TREE` environment variables before invoking it. Set
@@ -128,10 +129,11 @@ New integrations should source `sley.sh` through shdeps and call public
 
 `sley verify` discovers and runs local workflow commands from manifests,
 verify registries, and Sley extensions. It is intentionally separate from
-`checkrun verify`, which owns explicit project/security scans that should not
-run from save-time editor lint. Bridge those checks through Sley's verify
-registry or extension API when a repo wants them in `sley ready`; Sley should
-run `checkrun verify --tool ...`, not the underlying scanner directly.
+Checkrun's formatter, linter, diagnostic, and project/security analyzer policy.
+Bridge those checks through Sley's verify registry or extension API when a repo
+wants them in `sley ready`; Sley should run `checkrun verify --tool ...` or a
+project-owned workflow command, not invent underlying analyzer invocations from
+manifest metadata.
 
 `sley_select` sets `SLEY_REPO_TYPE`, `SLEY_REPO_ROOT`, `SLEY_CHANGE_SCOPE`,
 `SLEY_INCLUDE_UNTRACKED`, `SLEY_REPO_WIDE`, `SLEY_PATH_SCOPE`, and
