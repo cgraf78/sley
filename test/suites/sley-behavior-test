@@ -1397,6 +1397,8 @@ cat >"$repo/pyproject.toml" <<'EOF'
 testpaths = ["tests"]
 [tool.ruff]
 line-length = 100
+[tool.mypy]
+python_version = "3.12"
 EOF
 cat >"$repo/Makefile" <<'EOF'
 test:
@@ -1410,7 +1412,17 @@ name = "demo"
 version = "0.1.0"
 edition = "2021"
 EOF
-git -C "$repo" add package.json pyproject.toml Makefile Cargo.toml
+mkdir -p "$repo/.github/workflows"
+cat >"$repo/.github/workflows/ci.yml" <<'EOF'
+name: CI
+on: [push]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - run: true
+EOF
+git -C "$repo" add package.json pyproject.toml Makefile Cargo.toml .github/workflows/ci.yml
 
 _run_sley "$repo" verify --json
 _assert_exit "verify --json: succeeds" 0 "$__SLEY_RC"
@@ -1418,6 +1430,10 @@ _assert_contains "verify --json: emits commands" '"commands":[' "$__SLEY_OUT"
 _assert_contains "verify --json: emits kind" '"kind":"test"' "$__SLEY_OUT"
 _assert_contains "verify --json: emits sources" '"sources":[' "$__SLEY_OUT"
 _assert_contains "verify --json: detects pyproject pytest" '"command":"pytest"' "$__SLEY_OUT"
+_assert_not_contains "verify --json: does not invent ruff analyzer commands" '"command":"ruff check ."' "$__SLEY_OUT"
+_assert_not_contains "verify --json: does not invent mypy analyzer commands" '"command":"mypy ."' "$__SLEY_OUT"
+_assert_not_contains "verify --json: does not invent workflow lint analyzers" "actionlint" "$__SLEY_OUT"
+_assert_not_contains "verify --json: does not invent workflow security analyzers" "zizmor" "$__SLEY_OUT"
 _assert_contains "verify --json: keeps Cargo workflow test command" '"command":"cargo test"' "$__SLEY_OUT"
 _assert_contains "verify --json: keeps Cargo workflow build command" '"command":"cargo build"' "$__SLEY_OUT"
 _assert_not_contains "verify --json: does not invent Checkrun security scans" "cargo-audit" "$__SLEY_OUT"
