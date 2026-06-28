@@ -9,6 +9,9 @@
 hooks, and Sapling hooks. The generic CLI entry point is `bin/sley`; the shared
 API is `sley.sh`.
 
+See [`docs/workflow-contract.md`](docs/workflow-contract.md) for the ownership
+contract between Sley, Checkrun, editor adapters, dotfiles, humans, and agents.
+
 `shdeps` installs `bin/sley` as the PATH-visible `~/.local/bin/sley` symlink.
 The entry point is self-contained and resolves its dependency libraries through
 that symlink.
@@ -134,6 +137,10 @@ Bridge those checks through Sley's verify registry or extension API when a repo
 wants them in `sley ready`; Sley should run `checkrun verify --tool ...` or a
 project-owned workflow command, not invent underlying analyzer invocations from
 manifest metadata.
+
+The same boundary applies to hooks and editor integrations: Sley should decide
+repo scope, caller timing, and readiness phase composition, while Checkrun
+decides filetype inference, low-level tool selection, and diagnostic shape.
 
 `sley_select` sets `SLEY_REPO_TYPE`, `SLEY_REPO_ROOT`, `SLEY_CHANGE_SCOPE`,
 `SLEY_INCLUDE_UNTRACKED`, `SLEY_REPO_WIDE`, `SLEY_PATH_SCOPE`, and
