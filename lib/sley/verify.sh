@@ -114,6 +114,26 @@ _sley_project_manifest_commands() {
   esac
 }
 
+_sley_checkrun_verify_command() {
+  local files="$1" args="" file checkrun_path cmd source
+  checkrun_path=$(command -v checkrun 2>/dev/null) || return 0
+
+  # Sley knows the changed-file scope, while Checkrun owns language analyzer
+  # policy. Keep the bridge generic so adding a Go/Rust/C++ analyzer in
+  # Checkrun does not require teaching Sley another low-level tool rule.
+  while IFS= read -r file; do
+    [[ -n "$file" ]] || continue
+    args+=" $(_sley_shell_quote "$file")"
+  done <<<"$files"
+  [[ -n "$args" ]] || return 0
+
+  cmd="$(_sley_shell_quote "$checkrun_path") verify --$args"
+  source="checkrun verify"
+  printf '{"command":"%s","sources":["%s"],"kind":"verify","required":true,"tier":"fast","source_contexts":[{"source":"%s","context":"builtin"}]}\n' \
+    "$(_repo_json_escape "$cmd")" "$(_repo_json_escape "$source")" \
+    "$(_repo_json_escape "$source")"
+}
+
 _sley_verify_match() {
   local file="$1" pattern="$2" base="${3:-.}"
   # shellcheck disable=SC2053 # RHS is intentionally a registry glob.
@@ -1051,6 +1071,7 @@ _sley_verify() {
   for source in "${_SLEY_MANIFEST_NAMES[@]}"; do
     [[ -f "$source" ]] && commands+=$(_sley_project_manifest_commands "$source" repo-root)$'\n'
   done
+  commands+=$(_sley_checkrun_verify_command "$files")$'\n'
   commands+=$(_sley_verify_extension_commands "$files")$'\n' || return 1
   commands+=$(_sley_verify_registry_commands "$files")$'\n' || return 1
 

@@ -29,8 +29,9 @@ sley ready        # aggregate pre-submit readiness report
 ```
 
 `sley verify` reports where each suggested command came from. Human output labels
-sources such as `ancestor: sub/package.json` and `repo-root: package.json`;
-`sley verify --json` includes the same data in `source_contexts`.
+sources such as `ancestor: sub/package.json`, `repo-root: package.json`, and
+`builtin: checkrun verify`; `sley verify --json` includes the same data in
+`source_contexts`.
 
 Registry rules and individual command objects may set `"enabled": false` to
 temporarily suppress entries without deleting their configuration.
@@ -68,9 +69,11 @@ Optional workflow commands such as `pytest`, `cargo test`, `go test`, `make`,
 and are only required when a selected rule asks Sley to run them. Low-level
 formatters, linters, type checkers, and project/security analyzers such as
 `ruff`, `mypy`, `actionlint`, `zizmor`, `cargo-audit`, and `govulncheck` belong
-behind Checkrun or an explicit verify registry command. Put
-`checkrun verify --tool ...` in a verify registry when a repo wants explicit
-project/security checks to count toward `sley ready`.
+behind Checkrun or an explicit verify registry command. Base Sley adds a
+required `checkrun verify -- <changed-files>` command when `checkrun` is
+available, so generic Checkrun-owned analyzers are selected automatically from
+the same changed-file scope as the rest of readiness. Keep repo-specific
+workflow commands in verify registries.
 
 Consumers that want Sley to operate on a bare Git worktree can set the standard
 `GIT_DIR` and `GIT_WORK_TREE` environment variables before invoking it. Set
@@ -127,16 +130,15 @@ New integrations should source `sley.sh` through shdeps and call public
   PATH-visible CLI integrations.
 - zsh completion registration defers until `compinit` is available, so shell
   startup files may source the loader before their zsh completion phase.
-- Native VCS hooks delegate mechanical checks to
-  `sley ready --fix --exclude verify --commit`.
+- Native VCS hooks delegate mechanical checks to `sley ready --fix --commit`.
 
 `sley verify` discovers and runs local workflow commands from manifests,
-verify registries, and Sley extensions. It is intentionally separate from
-Checkrun's formatter, linter, diagnostic, and project/security analyzer policy.
-Bridge those checks through Sley's verify registry or extension API when a repo
-wants them in `sley ready`; Sley should run `checkrun verify --tool ...` or a
-project-owned workflow command, not invent underlying analyzer invocations from
-manifest metadata.
+verify registries, the built-in Checkrun verify bridge, and Sley extensions. It
+is intentionally separate from Checkrun's formatter, linter, diagnostic, and
+project analyzer policy. Sley passes selected changed files to
+`checkrun verify`; Checkrun decides which generic analyzer tools apply.
+Repo-specific workflow commands still belong in Sley's verify registry or
+extension API rather than manifest guessing.
 
 The same boundary applies to hooks and editor integrations: Sley should decide
 repo scope, caller timing, and readiness phase composition, while Checkrun
