@@ -225,7 +225,11 @@ MOCK
 #!/usr/bin/env bash
 exit 0
 MOCK
-  chmod +x "$bin/autolint" "$bin/gitleaks"
+  cat >"$bin/checkrun" <<'MOCK'
+#!/usr/bin/env bash
+exit 0
+MOCK
+  chmod +x "$bin/autolint" "$bin/gitleaks" "$bin/checkrun"
 }
 
 echo "=== sley: shdeps-installed symlink entry point ==="
@@ -1329,7 +1333,7 @@ _assert_eq "ready: cacheable verify first run executes command" "x" "$(cat "$cou
 
 READY_COUNTER="$counter" HOME="$home" PATH="$mockbin:$PATH" _run_sley "$repo" ready
 _assert_exit "ready: cached verify exits 0" 0 "$__SLEY_RC"
-_assert_contains "ready: cached verify annotates phase line" "verify: 0 (pass, cached 1/1)" "$__SLEY_OUT"
+_assert_contains "ready: cached verify annotates phase line" "verify: 0 (pass, cached 1/2)" "$__SLEY_OUT"
 _assert_eq "ready: cached verify does not rerun command" "x" "$(cat "$counter")"
 
 READY_COUNTER="$counter" HOME="$home" PATH="$mockbin:$PATH" _run_sley "$repo" ready --json
@@ -1424,11 +1428,22 @@ jobs:
 EOF
 git -C "$repo" add package.json pyproject.toml Makefile Cargo.toml .github/workflows/ci.yml
 
-_run_sley "$repo" verify --json
+checkrun_mock=$(_mock_bin)
+cat >"$checkrun_mock/checkrun" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+chmod +x "$checkrun_mock/checkrun"
+
+PATH="$checkrun_mock:$PATH" _run_sley "$repo" verify --json
 _assert_exit "verify --json: succeeds" 0 "$__SLEY_RC"
 _assert_contains "verify --json: emits commands" '"commands":[' "$__SLEY_OUT"
 _assert_contains "verify --json: emits kind" '"kind":"test"' "$__SLEY_OUT"
 _assert_contains "verify --json: emits sources" '"sources":[' "$__SLEY_OUT"
+_assert_contains "verify --json: adds generic Checkrun verify bridge" \
+  ' verify -- ' "$__SLEY_OUT"
+_assert_contains "verify --json: labels Checkrun bridge as built-in" \
+  '"source":"checkrun verify","context":"builtin"' "$__SLEY_OUT"
 _assert_contains "verify --json: detects pyproject pytest" '"command":"pytest"' "$__SLEY_OUT"
 _assert_not_contains "verify --json: does not invent ruff analyzer commands" '"command":"ruff check ."' "$__SLEY_OUT"
 _assert_not_contains "verify --json: does not invent mypy analyzer commands" '"command":"mypy ."' "$__SLEY_OUT"
@@ -1438,6 +1453,36 @@ _assert_contains "verify --json: keeps Cargo workflow test command" '"command":"
 _assert_contains "verify --json: keeps Cargo workflow build command" '"command":"cargo build"' "$__SLEY_OUT"
 _assert_not_contains "verify --json: does not invent Checkrun security scans" "cargo-audit" "$__SLEY_OUT"
 _assert_contains "verify --json: detects make target" '"command":"make test"' "$__SLEY_OUT"
+
+repo=$(_new_repo)
+mkdir -p "$repo/src" "$repo/space dir"
+echo "print('one')" >"$repo/src/app.py"
+echo "print('two')" >"$repo/space dir/app.py"
+git -C "$repo" add src/app.py "space dir/app.py"
+
+checkrun_mock=$(_mock_bin)
+cat >"$checkrun_mock/checkrun" <<'EOF'
+#!/usr/bin/env bash
+{
+  printf 'pwd=%s\n' "$PWD"
+  for arg in "$@"; do
+    printf '<%s>\n' "$arg"
+  done
+} > checkrun-verify.log
+exit 0
+EOF
+chmod +x "$checkrun_mock/checkrun"
+
+PATH="$checkrun_mock:$PATH" _run_sley "$repo" verify --run-required --json
+_assert_exit "verify Checkrun bridge: run-required exits 0" 0 "$__SLEY_RC"
+_assert_contains "verify Checkrun bridge: reports passed result" \
+  ' verify -- ' "$__SLEY_OUT"
+_assert_contains "verify Checkrun bridge: passes separator to Checkrun" \
+  '<-->' "$(cat "$repo/checkrun-verify.log")"
+_assert_contains "verify Checkrun bridge: passes regular changed file" \
+  '<src/app.py>' "$(cat "$repo/checkrun-verify.log")"
+_assert_contains "verify Checkrun bridge: preserves spaces through shell quoting" \
+  '<space dir/app.py>' "$(cat "$repo/checkrun-verify.log")"
 
 repo=$(_new_repo)
 mkdir -p "$repo/sub"
@@ -1631,7 +1676,10 @@ echo "changed" >>"$repo/src/app.txt"
 
 _run_sley "$repo" verify --run-required
 _assert_exit "verify registry: disabled rule exits 0" 0 "$__SLEY_RC"
-_assert_contains "verify registry: disabled rule maps no commands" "no required verification commands mapped" "$__SLEY_OUT"
+_assert_contains "verify registry: disabled rule still runs built-in Checkrun bridge" \
+  "running required fast command:" "$__SLEY_OUT"
+_assert_contains "verify registry: disabled rule bridge receives changed file" \
+  "verify -- 'src/app.txt'" "$__SLEY_OUT"
 _assert_not_contains "verify registry: disabled rule command omitted" "disabled-rule" "$__SLEY_OUT"
 
 repo=$(_new_repo)
@@ -2283,7 +2331,8 @@ echo "changed" >"$repo/docs/readme.md"
 
 _run_sley "$repo" verify --run-required
 _assert_exit "verify registry: unmatched change exits 0" 0 "$__SLEY_RC"
-_assert_contains "verify registry: unmatched reports no mapped commands" "no required verification commands mapped" "$__SLEY_OUT"
+_assert_contains "verify registry: unmatched still runs built-in Checkrun bridge" \
+  "running required fast command:" "$__SLEY_OUT"
 _assert_file_missing "verify registry: unmatched command not run" "$repo/tests/ran"
 
 repo=$(_new_repo)
@@ -2315,7 +2364,8 @@ echo "changed" >>"$repo/file.txt"
 
 _run_sley "$repo" verify --run-required
 _assert_exit "verify registry: missing registry exits 0" 0 "$__SLEY_RC"
-_assert_contains "verify registry: missing registry reports no required commands" "no required verification commands mapped" "$__SLEY_OUT"
+_assert_contains "verify registry: missing registry still runs built-in Checkrun bridge" \
+  "running required fast command:" "$__SLEY_OUT"
 
 repo=$(_new_repo)
 mkdir -p "$repo/service/.sley" "$repo/service/src"
@@ -2480,8 +2530,8 @@ export "$_old_config_env=$config_dir/old.json"
 _run_sley "$repo" verify --run-required
 unset "$_old_config_env"
 _assert_exit "verify registry: old env config is ignored" 0 "$__SLEY_RC"
-_assert_contains "verify registry: old env config maps no commands" \
-  "no required verification commands mapped" "$__SLEY_OUT"
+_assert_contains "verify registry: old env config still runs built-in Checkrun bridge" \
+  "running required fast command:" "$__SLEY_OUT"
 _assert_not_contains "verify registry: old env command is not listed" "old-env-test" "$__SLEY_OUT"
 
 repo=$(_new_repo)
