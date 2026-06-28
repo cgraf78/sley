@@ -232,6 +232,16 @@ MOCK
   chmod +x "$bin/autolint" "$bin/gitleaks" "$bin/checkrun"
 }
 
+_mock_checkrun_verify() {
+  local bin="$1"
+  mkdir -p "$bin"
+  cat >"$bin/checkrun" <<'MOCK'
+#!/usr/bin/env bash
+exit 0
+MOCK
+  chmod +x "$bin/checkrun"
+}
+
 echo "=== sley: shdeps-installed symlink entry point ==="
 
 symlink_bin=$(_tmpdir)/bin
@@ -1674,7 +1684,8 @@ EOF
 (cd "$repo" && git add . && git commit -q -m "seed disabled verify rule")
 echo "changed" >>"$repo/src/app.txt"
 
-_run_sley "$repo" verify --run-required
+_mock_checkrun_verify "$repo/mockbin"
+PATH="$repo/mockbin:$PATH" _run_sley "$repo" verify --run-required
 _assert_exit "verify registry: disabled rule exits 0" 0 "$__SLEY_RC"
 _assert_contains "verify registry: disabled rule still runs built-in Checkrun bridge" \
   "running required fast command:" "$__SLEY_OUT"
@@ -2329,7 +2340,8 @@ EOF
 (cd "$repo" && git add . && git commit -q -m "seed unmatched verify registry")
 echo "changed" >"$repo/docs/readme.md"
 
-_run_sley "$repo" verify --run-required
+_mock_checkrun_verify "$repo/mockbin"
+PATH="$repo/mockbin:$PATH" _run_sley "$repo" verify --run-required
 _assert_exit "verify registry: unmatched change exits 0" 0 "$__SLEY_RC"
 _assert_contains "verify registry: unmatched still runs built-in Checkrun bridge" \
   "running required fast command:" "$__SLEY_OUT"
@@ -2362,7 +2374,8 @@ EOF
 (cd "$repo" && git add file.txt && git commit -q -m "seed no registry")
 echo "changed" >>"$repo/file.txt"
 
-_run_sley "$repo" verify --run-required
+_mock_checkrun_verify "$repo/mockbin"
+PATH="$repo/mockbin:$PATH" _run_sley "$repo" verify --run-required
 _assert_exit "verify registry: missing registry exits 0" 0 "$__SLEY_RC"
 _assert_contains "verify registry: missing registry still runs built-in Checkrun bridge" \
   "running required fast command:" "$__SLEY_OUT"
@@ -2527,7 +2540,8 @@ _assert_contains "verify registry: env dir command is listed" "echo env-dir-test
 
 _old_config_env="SLEY_C""I_CONFIG"
 export "$_old_config_env=$config_dir/old.json"
-_run_sley "$repo" verify --run-required
+_mock_checkrun_verify "$repo/mockbin"
+PATH="$repo/mockbin:$PATH" _run_sley "$repo" verify --run-required
 unset "$_old_config_env"
 _assert_exit "verify registry: old env config is ignored" 0 "$__SLEY_RC"
 _assert_contains "verify registry: old env config still runs built-in Checkrun bridge" \
