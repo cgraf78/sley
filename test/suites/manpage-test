@@ -12,11 +12,18 @@ SLEY_REPO_ROOT="$(cd -- "$SLEY_TEST_DIR/.." && pwd -P)"
 
 echo "=== sley: manpages ==="
 
-page="$SLEY_REPO_ROOT/man/man1/sley.1"
-_assert_file_exists "manpage exists: sley" "$page"
-content=$(cat "$page")
-_assert_contains "manpage NAME section: sley" ".SH NAME" "$content"
-_assert_contains "manpage names command: sley" "sley \\" "$content"
+while IFS= read -r command; do
+  page="$SLEY_REPO_ROOT/man/man1/$command.1"
+  _assert_file_exists "manpage exists: $command" "$page"
+  content=$(cat "$page")
+  _assert_contains "manpage NAME section: $command" ".SH NAME" "$content"
+  _assert_contains "manpage names command: $command" "$command \\" "$content"
+done < <(
+  git -C "$SLEY_REPO_ROOT" ls-files -- 'bin/*' |
+    xargs -n 1 basename |
+    sort
+)
+
 _assert_contains "manpage documents verify bridge" "Checkrun verify bridge" "$content"
 
 _test_summary
