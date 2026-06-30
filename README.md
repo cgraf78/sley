@@ -12,9 +12,10 @@ API is `sley.sh`.
 See [`docs/workflow-contract.md`](docs/workflow-contract.md) for the ownership
 contract between Sley, Checkrun, editor adapters, dotfiles, humans, and agents.
 
-`shdeps` installs `bin/sley` as the PATH-visible `~/.local/bin/sley` symlink.
-The entry point is self-contained and resolves its dependency libraries through
-that symlink.
+`shdeps` installs `bin/sley` as the PATH-visible `~/.local/bin/sley` symlink
+and links the bundled `man/man1/` page into the user-local manpath. The entry
+point is self-contained and resolves its dependency libraries through that
+symlink.
 
 ## Commands
 
