@@ -1,0 +1,98 @@
+.TH SLEY 1 "2026-06-30" "sley" "User Commands"
+.SH NAME
+sley \- repository workflow checks for humans, editors, hooks, and agents
+.SH SYNOPSIS
+.B sley
+.I command
+.RI [ options ]
+.RI [ args ...]
+.SH DESCRIPTION
+.B sley
+owns repository workflow orchestration: selecting the active changed-file
+scope, formatting through hook APIs, running fast checks, scanning secrets, and
+aggregating readiness before submit. It delegates low-level formatter, linter,
+diagnostic, and generic analyzer policy to Checkrun when Checkrun is available.
+.PP
+The default scope follows the active VCS change context rather than the current
+working directory. Use
+.BR --path ,
+.BR --repo-wide ,
+and
+.B --include-untracked
+on commands that accept scope options when a different scope is needed.
+.SH COMMANDS
+.TP
+.B status
+Print repository type, root, ref, and dirty-file counts.
+.TP
+.B changes
+List selected changed files.
+.TP
+.B fix
+Run the mutating format phase for selected files.
+.TP
+.B check
+Run the read-only fast lint and validation phase for selected files.
+.TP
+.B secrets
+Run the configured redacted secret scan.
+.TP
+.B verify
+Discover and run broader local verification commands from manifests, verify
+registries, Sley extensions, and the built-in Checkrun verify bridge.
+.TP
+.B ready
+Run the aggregate pre-submit readiness report. With
+.B --fix
+and
+.BR --commit ,
+this is the commit-gate path used by native hooks.
+.TP
+.B hook
+Run narrow editor and agent hook entry points such as formatting or linting one
+file.
+.SH ENVIRONMENT
+.TP
+.B SLEY_SKIP_UNTRACKED
+Set to
+.B 1
+to skip untracked-file discovery in large repositories.
+.TP
+.B SLEY_BARE_REPO_GIT_DIR
+Optional bare Git repository fallback for PATH-visible integrations.
+.TP
+.B SLEY_BARE_REPO_WORK_TREE
+Work tree paired with
+.BR SLEY_BARE_REPO_GIT_DIR .
+Defaults to
+.BR $HOME .
+.TP
+.B SLEY_SKIP_BARE_REPO_FALLBACK
+Set to
+.B 1
+when a probe should ignore the optional bare-repo fallback.
+.TP
+.B SLEY_EXTENSION_DIR
+Directory containing environment-specific extension files. Defaults to the
+user's XDG config location.
+.SH FILES
+.TP
+.I share/sley/schemas/verify.schema.json
+JSON Schema for Sley verify registry files.
+.TP
+.I ${XDG_CONFIG_HOME:-~/.config}/sley/extensions.d/*.sh
+Ordered extension files for local hook and verify policy.
+.SH EXIT STATUS
+.TP
+.B 0
+The requested workflow phase succeeded.
+.TP
+.B 1
+A selected check, secret scan, or verification command failed.
+.TP
+.B 2
+Usage error or invalid local configuration.
+.SH SEE ALSO
+.BR checkrun (1),
+.BR autoformat (1),
+.BR autolint (1)

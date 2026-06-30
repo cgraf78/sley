@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# Verify that the PATH-visible workflow command has a manual page.
+
+set -o pipefail
+export NO_COLOR=1
+
+SLEY_TEST_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
+SLEY_REPO_ROOT="$(cd -- "$SLEY_TEST_DIR/.." && pwd -P)"
+
+# shellcheck source=../helpers.sh
+. "$SLEY_TEST_DIR/helpers.sh"
+
+echo "=== sley: manpages ==="
+
+page="$SLEY_REPO_ROOT/man/man1/sley.1"
+_assert_file_exists "manpage exists: sley" "$page"
+content=$(cat "$page")
+_assert_contains "manpage NAME section: sley" ".SH NAME" "$content"
+_assert_contains "manpage names command: sley" "sley \\" "$content"
+_assert_contains "manpage documents verify bridge" "Checkrun verify bridge" "$content"
+
+_test_summary
