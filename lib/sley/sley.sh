@@ -319,7 +319,7 @@ _sley_changes() {
   fi
 }
 
-_sley_dirty_counts_json() {
+_sley_dirty_counts() {
   local staged=0 unstaged=0 untracked=0 pending=0 line
   # `SLEY_SKIP_UNTRACKED=1` disables the untracked-file walk in both repo
   # types. This is mainly for bare Git worktrees rooted at large directories:
@@ -353,8 +353,36 @@ _sley_dirty_counts_json() {
       fi
       ;;
   esac
+
+  _SLEY_DIRTY_STAGED=$staged
+  _SLEY_DIRTY_PENDING=$pending
+  _SLEY_DIRTY_UNSTAGED=$unstaged
+  _SLEY_DIRTY_UNTRACKED=$untracked
+}
+
+_sley_dirty_counts_json_from_values() {
+  local staged="$1" pending="$2" unstaged="$3" untracked="$4"
   printf '{"staged":%s,"pending":%s,"unstaged":%s,"untracked":%s}' \
     "$staged" "$pending" "$unstaged" "$untracked"
+}
+
+_sley_dirty_from_counts() {
+  local staged="$1" pending="$2" unstaged="$3" untracked="$4"
+
+  if ((staged == 0 && pending == 0 && unstaged == 0 && untracked == 0)); then
+    printf 'false\n'
+  else
+    printf 'true\n'
+  fi
+}
+
+_sley_dirty_counts_json() {
+  _sley_dirty_counts || return $?
+  _sley_dirty_counts_json_from_values \
+    "$_SLEY_DIRTY_STAGED" \
+    "$_SLEY_DIRTY_PENDING" \
+    "$_SLEY_DIRTY_UNSTAGED" \
+    "$_SLEY_DIRTY_UNTRACKED"
 }
 
 _sley_status() {
@@ -390,9 +418,19 @@ _sley_status() {
       fi
       ;;
   esac
-  counts=$(_sley_dirty_counts_json)
-  [[ "$counts" == '{"staged":0,"pending":0,"unstaged":0,"untracked":0}' ]] &&
-    dirty=false || dirty=true
+  _sley_dirty_counts || return $?
+  # Dirty state is derived from the numeric counts before display JSON is
+  # rendered, so changing the JSON field order cannot change control flow.
+  dirty=$(_sley_dirty_from_counts \
+    "$_SLEY_DIRTY_STAGED" \
+    "$_SLEY_DIRTY_PENDING" \
+    "$_SLEY_DIRTY_UNSTAGED" \
+    "$_SLEY_DIRTY_UNTRACKED")
+  counts=$(_sley_dirty_counts_json_from_values \
+    "$_SLEY_DIRTY_STAGED" \
+    "$_SLEY_DIRTY_PENDING" \
+    "$_SLEY_DIRTY_UNSTAGED" \
+    "$_SLEY_DIRTY_UNTRACKED")
 
   if [[ "$_SLEY_SCOPE_JSON" == "1" ]]; then
     _repo_require_json_encoder || return 2
