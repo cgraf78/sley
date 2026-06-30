@@ -318,6 +318,22 @@ _assert_contains "bare repo fallback: skip reports unsupported repo" "unsupporte
 
 echo "=== sley: git status and changes ==="
 
+dirty_decisions=$(
+  SLEY_REPO_ROOT="$SLEY_REPO_ROOT" bash --noprofile --norc -c '
+    source "$SLEY_REPO_ROOT/lib/sley/sley.sh"
+    printf "clean=%s\n" "$(_sley_dirty_from_counts 0 0 0 0)"
+    printf "staged=%s\n" "$(_sley_dirty_from_counts 1 0 0 0)"
+    printf "pending=%s\n" "$(_sley_dirty_from_counts 0 1 0 0)"
+    printf "unstaged=%s\n" "$(_sley_dirty_from_counts 0 0 1 0)"
+    printf "untracked=%s\n" "$(_sley_dirty_from_counts 0 0 0 1)"
+  '
+)
+_assert_contains "status dirty helper: clean counts are clean" "clean=false" "$dirty_decisions"
+_assert_contains "status dirty helper: staged count is dirty" "staged=true" "$dirty_decisions"
+_assert_contains "status dirty helper: pending count is dirty" "pending=true" "$dirty_decisions"
+_assert_contains "status dirty helper: unstaged count is dirty" "unstaged=true" "$dirty_decisions"
+_assert_contains "status dirty helper: untracked count is dirty" "untracked=true" "$dirty_decisions"
+
 repo=$(_new_repo)
 cat >"$repo/tracked.py" <<'EOF'
 x = 1
