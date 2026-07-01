@@ -962,6 +962,117 @@ _assert_contains "fix --commit: partial staging explains refusal" "staged and un
 _assert_eq "fix --commit: partial staging formats no files" "" "$(cat "$MOCK_LOG")"
 _assert_file_content "fix --commit: partial staging leaves worktree unchanged" "x = 3" "$repo/partial.py"
 
+echo "=== sley: ready --fix --commit partial staging safety ==="
+
+# `sley ready --fix --commit` is the real commit gate; it must share `sley
+# fix`'s refusal so it can't fold formatter output into an unstaged hunk.
+repo=$(_new_repo)
+mockbin=$(_mock_bin)
+export MOCK_LOG="$repo/autoformat.log"
+: >"$MOCK_LOG"
+cat >"$mockbin/autoformat" <<'MOCK'
+#!/usr/bin/env bash
+printf 'autoformat:%s\n' "$*" >>"$MOCK_LOG"
+for file in "$@"; do
+  printf '\n# formatted\n' >>"$file"
+done
+MOCK
+chmod +x "$mockbin/autoformat"
+
+cat >"$repo/partial.py" <<'EOF'
+x = 1
+EOF
+(cd "$repo" && git add partial.py && git commit -q -m "seed")
+cat >"$repo/partial.py" <<'EOF'
+x = 2
+EOF
+(cd "$repo" && git add partial.py)
+cat >"$repo/partial.py" <<'EOF'
+x = 3
+EOF
+
+PATH="$mockbin:$PATH" _run_sley "$repo" ready --fix --commit
+_assert_exit "ready --fix: partial staging exits 2" 2 "$__SLEY_RC"
+_assert_contains "ready --fix: partial staging explains refusal" "staged and unstaged changes" "$__SLEY_OUT"
+_assert_eq "ready --fix: partial staging formats no files" "" "$(cat "$MOCK_LOG")"
+_assert_file_content "ready --fix: partial staging leaves worktree unchanged" "x = 3" "$repo/partial.py"
+
+echo "=== sley: ready --fix --commit refuses all when any file is partial ==="
+
+# One partially staged file alongside a fully-staged clean file must refuse the
+# whole run (refuse-all parity with `sley fix`), formatting neither — a partial
+# file anywhere poisons the batch.
+repo=$(_new_repo)
+mockbin=$(_mock_bin)
+export MOCK_LOG="$repo/autoformat.log"
+: >"$MOCK_LOG"
+cat >"$mockbin/autoformat" <<'MOCK'
+#!/usr/bin/env bash
+printf 'autoformat:%s\n' "$*" >>"$MOCK_LOG"
+for file in "$@"; do
+  printf '\n# formatted\n' >>"$file"
+done
+MOCK
+chmod +x "$mockbin/autoformat"
+
+cat >"$repo/partial.py" <<'EOF'
+x = 1
+EOF
+cat >"$repo/clean.py" <<'EOF'
+y = 1
+EOF
+(cd "$repo" && git add partial.py clean.py && git commit -q -m "seed")
+# partial.py: staged x=2, worktree x=3 (partial). clean.py: fully staged y=2.
+cat >"$repo/partial.py" <<'EOF'
+x = 2
+EOF
+cat >"$repo/clean.py" <<'EOF'
+y = 2
+EOF
+(cd "$repo" && git add partial.py clean.py)
+cat >"$repo/partial.py" <<'EOF'
+x = 3
+EOF
+
+PATH="$mockbin:$PATH" _run_sley "$repo" ready --fix --commit
+_assert_exit "ready --fix: mixed batch exits 2" 2 "$__SLEY_RC"
+_assert_contains "ready --fix: mixed batch names the partial file" "partial.py" "$__SLEY_OUT"
+_assert_eq "ready --fix: mixed batch formats no files" "" "$(cat "$MOCK_LOG")"
+_assert_file_content "ready --fix: mixed batch leaves clean file unformatted" "y = 2" "$repo/clean.py"
+
+echo "=== sley: ready --fix --commit formats a fully-staged clean file ==="
+
+# A fully-staged file (worktree == index, no unstaged hunk) must NOT be refused
+# — the guard only fires on partial files. It formats and, if changed, reports
+# the re-stage requirement (exit 1).
+repo=$(_new_repo)
+mockbin=$(_mock_bin)
+export MOCK_LOG="$repo/autoformat.log"
+: >"$MOCK_LOG"
+cat >"$mockbin/autoformat" <<'MOCK'
+#!/usr/bin/env bash
+printf 'autoformat:%s\n' "$*" >>"$MOCK_LOG"
+for file in "$@"; do
+  printf '\n# formatted\n' >>"$file"
+done
+MOCK
+chmod +x "$mockbin/autoformat"
+
+cat >"$repo/clean.py" <<'EOF'
+y = 1
+EOF
+(cd "$repo" && git add clean.py && git commit -q -m "seed")
+cat >"$repo/clean.py" <<'EOF'
+y = 2
+EOF
+(cd "$repo" && git add clean.py)
+
+PATH="$mockbin:$PATH" _run_sley "$repo" ready --fix --commit
+_assert_exit "ready --fix: fully-staged clean file exits 1 (re-stage)" 1 "$__SLEY_RC"
+_assert_contains "ready --fix: fully-staged clean file is formatted" "autoformat:" "$(cat "$MOCK_LOG")"
+_assert_contains "ready --fix: fully-staged clean file reports re-stage" "formatter modified staged files" "$__SLEY_OUT"
+_assert_file_content "ready --fix: fully-staged clean file gets formatter output" "$(printf 'y = 2\n\n# formatted')" "$repo/clean.py"
+
 echo "=== sley: fix --commit does not update git index ==="
 
 repo=$(_new_repo)
