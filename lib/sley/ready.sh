@@ -189,6 +189,27 @@ _sley_ready() {
     _fix_files=$(_sley_selected_files) || true
     if [[ -n "$_fix_files" ]]; then
       if [[ "$_REPO_TYPE" == "git" ]]; then
+        # Formatting rewrites the whole worktree file, so a partially staged
+        # file (both staged AND unstaged hunks) would fold the formatter's
+        # output into the unstaged hunk. Refuse before touching anything —
+        # the same guard `sley fix` enforces — so the commit gate
+        # (`sley ready --fix --commit`) and the standalone command share one
+        # policy. Only the staged/commit scope has an index to corrupt.
+        if [[ "$_SLEY_SCOPE_CHANGE" == "staged" ]]; then
+          # Match `sley fix`: only existing regular files get formatted, so
+          # only they can be corrupted. Filter symlinks/non-regular files out
+          # before the partial check so the two paths share one policy (e.g. a
+          # partially staged symlink must not refuse the run).
+          local _fix_partial _fix_runnable
+          _fix_runnable=$(printf '%s\n' "$_fix_files" | _repo_existing_regular_files)
+          _fix_partial=$(_sley_git_staged_partial_files "$_fix_runnable")
+          if [[ -n "$_fix_partial" ]]; then
+            echo "sley fix: refusing files with staged and unstaged changes:" >&2
+            printf '%s\n' "$_fix_partial" | sed 's/^/  /' >&2
+            rm -f "$selected_cache_file"
+            return 2
+          fi
+        fi
         while IFS= read -r _fix_f; do
           [[ -n "$_fix_f" ]] || continue
           [[ -f "$_fix_f" ]] || continue
