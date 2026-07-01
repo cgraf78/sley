@@ -247,7 +247,7 @@ Commands:
   changes     list changed files
   fix         format changed files
   check       lint and validate changed files
-  secrets     scan changed files for secrets
+  secrets     scan changed files (or --message-file <path>) for secrets
   verify      list and run local verification commands
   ready       run the pre-submit readiness report
   hook        run low-level hook plumbing
@@ -645,6 +645,127 @@ _sley_gitleaks_args() {
   fi
 }
 
+# Existing, validated extra gitleaks config paths (one per line) from the
+# secrets extension hook. Extensions are sourced here so a standalone
+# `sley secrets` sees an overlay override even without a `sley ready` parent
+# (re-sourcing under `sley ready` is idempotent). Missing files are dropped so a
+# stale override can never abort the scan.
+_sley_secrets_extra_config_list() {
+  _sley_source_extensions_from "$(_sley_extension_dir)" 2>/dev/null || true
+  local cfg
+  while IFS= read -r cfg; do
+    [[ -n "$cfg" && -f "$cfg" ]] && printf '%s\n' "$cfg"
+  done < <(_sley_hook_secrets_extra_configs 2>/dev/null || true)
+}
+
+# One independent gitleaks pass over an extra config, applied to the same inputs
+# as the base scan: the staged diff (git) plus each worktree file. `--verbose`
+# keeps failures actionable — with `--redact` the value stays hidden but the
+# RuleID is shown, which matters for rules whose whole point is naming what was
+# found. MAX-preserves rc so a later leak (rc=1) cannot mask a scanner error.
+_sley_secrets_scan_extra_config() {
+  local cfg="$1" staged_files="$2"
+  shift 2
+  local -a wfiles=("$@")
+  local -a args=(--redact --no-banner --verbose --config "$cfg")
+  # Declare _SLEY_ARRAY locally per the _sley_to_array contract so the staged
+  # file list does not leak into or clobber the caller's scope.
+  local -a _SLEY_ARRAY=()
+  local rc=0 scan_rc out file
+  if [[ -n "$staged_files" ]]; then
+    _sley_to_array "$staged_files"
+    if out=$(
+      (
+        set -o pipefail
+        git diff --cached -- "${_SLEY_ARRAY[@]}" | gitleaks stdin "${args[@]}"
+      ) 2>&1
+    ); then
+      scan_rc=0
+    else
+      scan_rc=$?
+      [[ -n "$out" ]] && printf '%s\n' "$out" >&2
+    fi
+    [[ "$scan_rc" -gt "$rc" ]] && rc=$scan_rc
+  fi
+  if [[ "${#wfiles[@]}" -gt 0 ]]; then
+    for file in "${wfiles[@]}"; do
+      [[ -n "$file" ]] || continue
+      if out=$(gitleaks dir "${args[@]}" -- "$file" </dev/null 2>&1); then
+        scan_rc=0
+      else
+        scan_rc=$?
+        [[ -n "$out" ]] && printf '%s\n' "$out" >&2
+      fi
+      [[ "$scan_rc" -gt "$rc" ]] && rc=$scan_rc
+    done
+  fi
+  return "$rc"
+}
+
+# Scan a blob of text (via stdin) through one gitleaks invocation. Used by the
+# commit-message path. Surfaces gitleaks output on failure and returns its rc.
+_sley_gitleaks_scan_text() {
+  local text="$1"
+  shift
+  local out scan_rc=0
+  # gitleaks is last in the pipe, so the command-substitution rc is its rc.
+  # Capture via `|| scan_rc=$?` (not `if ...; then`, whose false-no-else branch
+  # resets $? to 0 and would swallow a "leaks found" exit).
+  out=$(printf '%s\n' "$text" | gitleaks stdin "$@" 2>&1) || scan_rc=$?
+  [[ "$scan_rc" -ne 0 && -n "$out" ]] && printf '%s\n' "$out" >&2
+  return "$scan_rc"
+}
+
+# Prepare a commit message for scanning. Only the `commit -v` scissors region
+# (`# ... >8 ...` and everything after) is removed — Git always strips that, and
+# its diff is already covered by the staged-content scan. Comment (`#`) lines are
+# deliberately KEPT: Git's non-interactive cleanup (`git commit -m`/`-F`, and the
+# message a `commit-msg` hook receives) is `whitespace`, which commits `#` lines
+# verbatim — so stripping them would let a secret on a committed `#` line slip
+# the scan (a fail-open). Scanning the retained comments of an editor commit
+# (where Git would `strip` them) is at worst a rare, safe false positive.
+_sley_clean_commit_message() {
+  local file="$1"
+  sed '/^#.*>8/,$d' "$file"
+}
+
+# `sley secrets --message-file <path>`: scan a (to-be-committed) commit message
+# for secrets and any extension-provided extra rules. Runs the base config pass
+# plus one pass per extra config over the git-cleaned message text.
+_sley_secrets_message_file() {
+  local msg_file="$1"
+  _sley_init_repo || return $?
+  command -v gitleaks >/dev/null 2>&1 || {
+    _sley_die "gitleaks not found"
+    return 2
+  }
+  [[ -r "$msg_file" ]] || {
+    _sley_die "message file not readable: $msg_file"
+    return 2
+  }
+  local cleaned
+  cleaned=$(_sley_clean_commit_message "$msg_file") || return 2
+  # An empty message (after cleanup) has nothing to scan; e.g. an aborted or
+  # comment-only buffer. Let the commit proceed — message emptiness is Git's
+  # concern, not the secrets gate's.
+  [[ -n "$cleaned" ]] || return 0
+
+  local rc=0 scan_rc cfg
+  local -a base_args
+  _sley_gitleaks_args
+  base_args=("${_SLEY_GITLEAKS_ARGS[@]}" --verbose)
+  _sley_gitleaks_scan_text "$cleaned" "${base_args[@]}" || scan_rc=$?
+  scan_rc=${scan_rc:-0}
+  [[ "$scan_rc" -gt "$rc" ]] && rc=$scan_rc
+  while IFS= read -r cfg; do
+    [[ -n "$cfg" ]] || continue
+    scan_rc=0
+    _sley_gitleaks_scan_text "$cleaned" --redact --no-banner --verbose --config "$cfg" || scan_rc=$?
+    [[ "$scan_rc" -gt "$rc" ]] && rc=$scan_rc
+  done < <(_sley_secrets_extra_config_list)
+  return "$rc"
+}
+
 _sley_secrets_print_failed_scan_output() {
   local scan_rc="$1" stdout_file="$2" stderr_file="$3"
   [[ "$scan_rc" -eq 0 ]] && return 0
@@ -748,6 +869,16 @@ _sley_secrets_scan_worktree_files() {
 }
 
 _sley_secrets() {
+  # Commit-message scan mode: `sley secrets --message-file <path>`. Handled
+  # before scope parsing since it takes a file, not a change/path scope.
+  if [[ "${1:-}" == "--message-file" ]]; then
+    if [[ $# -lt 2 || -z "${2:-}" ]]; then
+      _sley_die "--message-file requires an argument"
+      return 2
+    fi
+    _sley_secrets_message_file "$2"
+    return $?
+  fi
   _sley_init_repo || return $?
   _sley_parse_scope "$@" || return $?
   local files runnable staged_files file rc=0 out scan_rc
@@ -848,6 +979,16 @@ _sley_secrets() {
   scan_rc=0
   _sley_secrets_scan_worktree_files "${worktree_files[@]}" || scan_rc=$?
   [[ "$scan_rc" -gt "$rc" ]] && rc=$scan_rc
+  # Extra secrets configs: independent gitleaks passes (e.g. an overlay's
+  # forbidden-vocabulary rules) over the same staged + worktree inputs. Base
+  # sley returns none, so this is a no-op unless an extension opts in.
+  local _cfg
+  while IFS= read -r _cfg; do
+    [[ -n "$_cfg" ]] || continue
+    scan_rc=0
+    _sley_secrets_scan_extra_config "$_cfg" "$staged_files" "${worktree_files[@]}" || scan_rc=$?
+    [[ "$scan_rc" -gt "$rc" ]] && rc=$scan_rc
+  done < <(_sley_secrets_extra_config_list)
   if [[ "$rc" -eq 0 ]]; then
     _sley_print_file_summary "sley secrets: scanned" "${#_scanned_set[@]}"
   fi

@@ -3623,4 +3623,188 @@ _assert_eq "secrets outer: final rc preserves max (staged=2, worktree=1 → rc=2
 
 unset OUTER_MOCK_LOG
 
+echo "=== sley: secrets extra configs + commit-message scan ==="
+
+# Mock gitleaks that logs its args, captures stdin, and simulates a finding
+# (exit 1) whenever the extra meta config is passed via --config. Written into
+# $mockbin by each block below.
+_emc_write_mock() {
+  cat >"$1/gitleaks" <<'MOCK'
+#!/usr/bin/env bash
+printf 'gitleaks:%s\n' "$*" >>"$MOCK_LOG"
+if [ "${1:-}" = stdin ]; then cat >>"$MOCK_STDIN"; else cat >/dev/null 2>&1 || true; fi
+case " $* " in *" --config $MOCK_LEAK_CONFIG "*) exit 1 ;; esac
+exit 0
+MOCK
+  chmod +x "$1/gitleaks"
+}
+
+# Variant whose exit code depends on which --config it received, so a single
+# scan can exercise rc aggregation across passes: rc=2 for MOCK_RC2_CONFIG,
+# rc=1 for MOCK_RC1_CONFIG, else 0.
+_emc_write_mock2() {
+  cat >"$1/gitleaks" <<'MOCK'
+#!/usr/bin/env bash
+printf 'gitleaks:%s\n' "$*" >>"$MOCK_LOG"
+if [ "${1:-}" = stdin ]; then cat >>"$MOCK_STDIN"; else cat >/dev/null 2>&1 || true; fi
+case " $* " in
+  *" --config ${MOCK_RC2_CONFIG:-/none} "*) exit 2 ;;
+  *" --config ${MOCK_RC1_CONFIG:-/none} "*) exit 1 ;;
+esac
+exit 0
+MOCK
+  chmod +x "$1/gitleaks"
+}
+
+# --- extra config runs an independent pass and its rc is aggregated ---------
+repo=$(_new_repo)
+mockbin=$(_mock_bin)
+ext=$(_tmpdir)
+metacfg="$repo/meta-vocab.toml"
+: >"$metacfg"
+cat >"$ext/80-extra.sh" <<EOF
+_sley_hook_secrets_extra_configs() { printf '%s\n' '$metacfg'; }
+EOF
+export MOCK_LOG="$repo/gl.log" MOCK_STDIN="$repo/gl.stdin" MOCK_LEAK_CONFIG="$metacfg"
+: >"$MOCK_LOG"
+: >"$MOCK_STDIN"
+_emc_write_mock "$mockbin"
+printf 'token = "seed"\n' >"$repo/f.py"
+(cd "$repo" && git add f.py && git commit -q -m seed)
+printf 'token = "changed"\n' >"$repo/f.py"
+(cd "$repo" && git add f.py)
+__EMC_OUT=$(cd "$repo" && GIT_CONFIG_GLOBAL="$repo/.gitconfig-test" SLEY_EXTENSION_DIR="$ext" PATH="$mockbin:$PATH" "$SLEY" secrets --commit 2>&1)
+__EMC_RC=$?
+_assert_exit "secrets extra: extra-config finding blocks the commit" 1 "$__EMC_RC"
+_assert_contains "secrets extra: base staged pass ran without the extra config" \
+  "gitleaks:stdin --redact --no-banner" "$(cat "$MOCK_LOG")"
+_assert_contains "secrets extra: extra config pass ran with --verbose --config" \
+  "--verbose --config $metacfg" "$(cat "$MOCK_LOG")"
+
+# --- no extension: no extra pass, scan passes ------------------------------
+repo=$(_new_repo)
+mockbin=$(_mock_bin)
+ext=$(_tmpdir) # empty extension dir
+export MOCK_LOG="$repo/gl.log" MOCK_STDIN="$repo/gl.stdin" MOCK_LEAK_CONFIG="/nope"
+: >"$MOCK_LOG"
+: >"$MOCK_STDIN"
+_emc_write_mock "$mockbin"
+printf 'token = "seed"\n' >"$repo/f.py"
+(cd "$repo" && git add f.py && git commit -q -m seed)
+printf 'token = "changed"\n' >"$repo/f.py"
+(cd "$repo" && git add f.py)
+__EMC_OUT=$(cd "$repo" && GIT_CONFIG_GLOBAL="$repo/.gitconfig-test" SLEY_EXTENSION_DIR="$ext" PATH="$mockbin:$PATH" "$SLEY" secrets --commit 2>&1)
+__EMC_RC=$?
+_assert_exit "secrets extra: no extension -> scan passes" 0 "$__EMC_RC"
+_assert_not_contains "secrets extra: no extension -> no extra --config pass" \
+  "--config" "$(cat "$MOCK_LOG")"
+
+# --- --message-file scans the message; extra-config finding blocks ---------
+repo=$(_new_repo)
+mockbin=$(_mock_bin)
+ext=$(_tmpdir)
+metacfg="$repo/meta-vocab.toml"
+: >"$metacfg"
+cat >"$ext/80-extra.sh" <<EOF
+_sley_hook_secrets_extra_configs() { printf '%s\n' '$metacfg'; }
+EOF
+export MOCK_LOG="$repo/gl.log" MOCK_STDIN="$repo/gl.stdin" MOCK_LEAK_CONFIG="$metacfg"
+: >"$MOCK_LOG"
+: >"$MOCK_STDIN"
+_emc_write_mock "$mockbin"
+printf 'fix parser bug per policy\n' >"$repo/msg"
+__EMC_OUT=$(cd "$repo" && GIT_CONFIG_GLOBAL="$repo/.gitconfig-test" SLEY_EXTENSION_DIR="$ext" PATH="$mockbin:$PATH" "$SLEY" secrets --message-file "$repo/msg" 2>&1)
+__EMC_RC=$?
+_assert_exit "secrets message: extra-config finding blocks the message" 1 "$__EMC_RC"
+_assert_contains "secrets message: message text reached gitleaks stdin" \
+  "fix parser bug per policy" "$(cat "$MOCK_STDIN")"
+
+# --- message cleaning: cut the commit -v scissors region, KEEP # comments -----
+# Git's non-interactive cleanup (`-m`/`-F`, and the commit-msg hook input) is
+# `whitespace`, which commits `#` lines verbatim, so they MUST still be scanned
+# (no fail-open); only the always-stripped scissors region is removed.
+repo=$(_new_repo)
+mockbin=$(_mock_bin)
+ext=$(_tmpdir) # no extra config; assert cleaned stdin content
+export MOCK_LOG="$repo/gl.log" MOCK_STDIN="$repo/gl.stdin" MOCK_LEAK_CONFIG="/nope"
+: >"$MOCK_LOG"
+: >"$MOCK_STDIN"
+_emc_write_mock "$mockbin"
+printf 'realtitle body\n\n# commentkept line\n# ------------------------ >8 ------------------------\nscissorsdropped diff\n' >"$repo/msg"
+__EMC_OUT=$(cd "$repo" && GIT_CONFIG_GLOBAL="$repo/.gitconfig-test" SLEY_EXTENSION_DIR="$ext" PATH="$mockbin:$PATH" "$SLEY" secrets --message-file "$repo/msg" 2>&1)
+__EMC_RC=$?
+_assert_exit "secrets message: cleaned message scans clean" 0 "$__EMC_RC"
+_assert_contains "secrets message: keeps real message body" "realtitle body" "$(cat "$MOCK_STDIN")"
+_assert_contains "secrets message: scans kept # comment lines (no fail-open)" "commentkept" "$(cat "$MOCK_STDIN")"
+_assert_not_contains "secrets message: strips commit -v scissors region" "scissorsdropped" "$(cat "$MOCK_STDIN")"
+
+# --- base gitleaks config finding blocks the message ------------------------
+repo=$(_new_repo)
+mockbin=$(_mock_bin)
+: >"$repo/.gitleaks.toml" # presence makes the base pass use --config <repo>
+export MOCK_LOG="$repo/gl.log" MOCK_STDIN="$repo/gl.stdin" MOCK_RC1_CONFIG="$repo/.gitleaks.toml" MOCK_RC2_CONFIG="/none"
+: >"$MOCK_LOG"
+: >"$MOCK_STDIN"
+_emc_write_mock2 "$mockbin"
+printf 'a message with a secret\n' >"$repo/msg"
+__EMC_OUT=$(cd "$repo" && GIT_CONFIG_GLOBAL="$repo/.gitconfig-test" PATH="$mockbin:$PATH" "$SLEY" secrets --message-file "$repo/msg" 2>&1)
+__EMC_RC=$?
+_assert_exit "secrets message: base-config finding blocks the message" 1 "$__EMC_RC"
+
+# --- message path: scanner error (rc>=2) surfaces and dominates a leak ------
+# Base pass errors (rc=2); the extra pass finds a leak (rc=1). Final rc must be
+# 2 — a later leak must not downgrade an earlier scanner error.
+repo=$(_new_repo)
+mockbin=$(_mock_bin)
+ext=$(_tmpdir)
+metacfg="$repo/meta-vocab.toml"
+: >"$metacfg"
+: >"$repo/.gitleaks.toml"
+cat >"$ext/80-extra.sh" <<EOF
+_sley_hook_secrets_extra_configs() { printf '%s\n' '$metacfg'; }
+EOF
+export MOCK_LOG="$repo/gl.log" MOCK_STDIN="$repo/gl.stdin" MOCK_RC2_CONFIG="$repo/.gitleaks.toml" MOCK_RC1_CONFIG="$metacfg"
+: >"$MOCK_LOG"
+: >"$MOCK_STDIN"
+_emc_write_mock2 "$mockbin"
+printf 'msg body\n' >"$repo/msg"
+__EMC_OUT=$(cd "$repo" && GIT_CONFIG_GLOBAL="$repo/.gitconfig-test" SLEY_EXTENSION_DIR="$ext" PATH="$mockbin:$PATH" "$SLEY" secrets --message-file "$repo/msg" 2>&1)
+__EMC_RC=$?
+_assert_exit "secrets message: scanner error dominates a later leak (max rc)" 2 "$__EMC_RC"
+
+# --- extra-config also runs a worktree (gitleaks dir) pass ------------------
+repo=$(_new_repo)
+mockbin=$(_mock_bin)
+ext=$(_tmpdir)
+metacfg="$repo/meta-vocab.toml"
+: >"$metacfg"
+cat >"$ext/80-extra.sh" <<EOF
+_sley_hook_secrets_extra_configs() { printf '%s\n' '$metacfg'; }
+EOF
+export MOCK_LOG="$repo/gl.log" MOCK_STDIN="$repo/gl.stdin" MOCK_RC1_CONFIG="$metacfg" MOCK_RC2_CONFIG="/none"
+: >"$MOCK_LOG"
+: >"$MOCK_STDIN"
+_emc_write_mock2 "$mockbin"
+printf 'token = "seed"\n' >"$repo/w.py"
+(cd "$repo" && git add w.py && git commit -q -m seed)
+printf 'token = "changed"\n' >"$repo/w.py" # unstaged -> default (worktree) scope
+__EMC_OUT=$(cd "$repo" && GIT_CONFIG_GLOBAL="$repo/.gitconfig-test" SLEY_EXTENSION_DIR="$ext" PATH="$mockbin:$PATH" "$SLEY" secrets 2>&1)
+__EMC_RC=$?
+_assert_exit "secrets extra: worktree extra-config finding blocks" 1 "$__EMC_RC"
+_assert_contains "secrets extra: extra config runs a worktree (dir) pass" \
+  "dir --redact --no-banner --verbose --config $metacfg -- w.py" "$(cat "$MOCK_LOG")"
+
+# --- --message-file requires an argument -----------------------------------
+repo=$(_new_repo)
+mockbin=$(_mock_bin)
+export MOCK_LOG="$repo/gl.log" MOCK_STDIN="$repo/gl.stdin" MOCK_LEAK_CONFIG="/nope"
+: >"$MOCK_LOG"
+: >"$MOCK_STDIN"
+_emc_write_mock "$mockbin"
+__EMC_OUT=$(cd "$repo" && GIT_CONFIG_GLOBAL="$repo/.gitconfig-test" PATH="$mockbin:$PATH" "$SLEY" secrets --message-file 2>&1)
+__EMC_RC=$?
+_assert_exit "secrets message: missing path is a usage error" 2 "$__EMC_RC"
+
+unset MOCK_LOG MOCK_STDIN MOCK_LEAK_CONFIG MOCK_RC1_CONFIG MOCK_RC2_CONFIG
+
 _test_summary

@@ -71,6 +71,14 @@ _sley_hook_lint() {
 
 _sley_hook_validate() { :; }
 
+# Extra gitleaks config paths for the secrets phase, one per line. Default: none
+# (base sley ships no extra rules). An environment extension can override this to
+# add independent gitleaks passes — e.g. an overlay that scans for forbidden
+# work-specific vocabulary in repos where it must not appear. The override
+# decides its own applicability (repo type, remote, markers); base sley just
+# runs a pass per returned config and MAX-preserves the exit code.
+_sley_hook_secrets_extra_configs() { :; }
+
 _sley_ext_ready_phases() { :; }
 
 _sley_ext_ready_phase() { return 2; }
