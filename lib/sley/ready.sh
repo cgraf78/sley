@@ -227,9 +227,20 @@ _sley_ready() {
               continue
             fi
             _fix_pre=$(git hash-object -- "$_fix_f" 2>/dev/null || true)
-            sley_hook_format_file "$_fix_f" >/dev/null 2>&1 || true
+            # Redirect stdin from /dev/null so a formatter that reads stdin can't
+            # drain the herestring driving this loop (parity with `_sley_fix`).
+            sley_hook_format_file "$_fix_f" </dev/null >/dev/null 2>&1 || true
             _fix_post=$(git hash-object -- "$_fix_f" 2>/dev/null || true)
-            cp -p "$_fix_bak" "$_fix_f" # always restore: formatting here is only a probe
+            # Always restore: formatting a partial file is only a probe. If the
+            # restore itself fails after the formatter mutated the file, keep the
+            # backup and refuse loudly — deleting the only copy that can recover
+            # the unstaged hunk would be the exact clobber this guard prevents.
+            if ! cp -p "$_fix_bak" "$_fix_f"; then
+              printf 'sley fix: failed to restore %s from backup %s; the worktree may hold formatter output — recover it from the backup.\n' \
+                "$_fix_f" "$_fix_bak" >&2
+              rm -f "$selected_cache_file"
+              return 2
+            fi
             rm -f "$_fix_bak"
             if [[ -n "$_fix_pre" ]] && [[ "$_fix_pre" != "$_fix_post" ]]; then
               _fix_partial_modified+=("$_fix_f")
@@ -248,7 +259,7 @@ _sley_ready() {
               continue
             fi
             _fix_pre=$(git hash-object -- "$_fix_f" 2>/dev/null || true)
-            sley_hook_format_file "$_fix_f" >/dev/null 2>&1 || true
+            sley_hook_format_file "$_fix_f" </dev/null >/dev/null 2>&1 || true
             _fix_post=$(git hash-object -- "$_fix_f" 2>/dev/null || true)
             if [[ -n "$_fix_pre" ]] && [[ "$_fix_pre" != "$_fix_post" ]]; then
               _fix_modified+=("$_fix_f")
