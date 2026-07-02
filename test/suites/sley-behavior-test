@@ -964,8 +964,10 @@ _assert_file_content "fix --commit: partial staging leaves worktree unchanged" "
 
 echo "=== sley: ready --fix --commit partial staging safety ==="
 
-# `sley ready --fix --commit` is the real commit gate; it must share `sley
-# fix`'s refusal so it can't fold formatter output into an unstaged hunk.
+# `sley ready --fix --commit` is the real commit gate. A partial file whose
+# formatting WOULD change it must be refused (and the worktree left untouched)
+# so it can't fold formatter output into the unstaged hunk. The mock formatter
+# always rewrites, so this partial file is refused.
 repo=$(_new_repo)
 mockbin=$(_mock_bin)
 export MOCK_LOG="$repo/autoformat.log"
@@ -994,14 +996,14 @@ EOF
 PATH="$mockbin:$PATH" _run_sley "$repo" ready --fix --commit
 _assert_exit "ready --fix: partial staging exits 2" 2 "$__SLEY_RC"
 _assert_contains "ready --fix: partial staging explains refusal" "staged and unstaged changes" "$__SLEY_OUT"
-_assert_eq "ready --fix: partial staging formats no files" "" "$(cat "$MOCK_LOG")"
-_assert_file_content "ready --fix: partial staging leaves worktree unchanged" "x = 3" "$repo/partial.py"
+_assert_contains "ready --fix: partial staging probes the formatter" "autoformat:" "$(cat "$MOCK_LOG")"
+_assert_file_content "ready --fix: partial staging leaves worktree unchanged (probe reverted)" "x = 3" "$repo/partial.py"
 
 echo "=== sley: ready --fix --commit refuses all when any file is partial ==="
 
-# One partially staged file alongside a fully-staged clean file must refuse the
-# whole run (refuse-all parity with `sley fix`), formatting neither — a partial
-# file anywhere poisons the batch.
+# A partial file that would be reformatted refuses the whole run before the
+# fully-staged file is touched — the refusal must not leave the rest of the
+# batch reformatted in the worktree.
 repo=$(_new_repo)
 mockbin=$(_mock_bin)
 export MOCK_LOG="$repo/autoformat.log"
@@ -1037,7 +1039,7 @@ EOF
 PATH="$mockbin:$PATH" _run_sley "$repo" ready --fix --commit
 _assert_exit "ready --fix: mixed batch exits 2" 2 "$__SLEY_RC"
 _assert_contains "ready --fix: mixed batch names the partial file" "partial.py" "$__SLEY_OUT"
-_assert_eq "ready --fix: mixed batch formats no files" "" "$(cat "$MOCK_LOG")"
+_assert_not_contains "ready --fix: mixed batch never formats the fully-staged file" "clean.py" "$(cat "$MOCK_LOG")"
 _assert_file_content "ready --fix: mixed batch leaves clean file unformatted" "y = 2" "$repo/clean.py"
 
 echo "=== sley: ready --fix --commit formats a fully-staged clean file ==="
@@ -1072,6 +1074,51 @@ _assert_exit "ready --fix: fully-staged clean file exits 1 (re-stage)" 1 "$__SLE
 _assert_contains "ready --fix: fully-staged clean file is formatted" "autoformat:" "$(cat "$MOCK_LOG")"
 _assert_contains "ready --fix: fully-staged clean file reports re-stage" "formatter modified staged files" "$__SLEY_OUT"
 _assert_file_content "ready --fix: fully-staged clean file gets formatter output" "$(printf 'y = 2\n\n# formatted')" "$repo/clean.py"
+
+echo "=== sley: ready --fix --commit allows a clean partial-staged file ==="
+
+# The regression this fixes: a partially staged file whose staged content is
+# already formatter-clean must NOT be refused by the commit gate. With a no-op
+# formatter the probe finds no change, the worktree is left intact, and the run
+# proceeds through the phases to exit 0.
+repo=$(_new_repo)
+mockbin=$(_mock_bin)
+home=$(_tmpdir)
+_copy_sley_libs "$home"
+_mock_ready_pass_tools "$mockbin"
+# The secrets phase pipes file content to gitleaks' stdin; a bare `exit 0` mock
+# closes the pipe early and SIGPIPEs the writer, so drain stdin here.
+cat >"$mockbin/gitleaks" <<'MOCK'
+#!/usr/bin/env bash
+cat >/dev/null
+exit 0
+MOCK
+chmod +x "$mockbin/gitleaks"
+export MOCK_LOG="$repo/autoformat.log"
+: >"$MOCK_LOG"
+cat >"$mockbin/autoformat" <<'MOCK'
+#!/usr/bin/env bash
+printf 'autoformat:%s\n' "$*" >>"$MOCK_LOG"
+# no-op formatter: every file is already clean, so leave it byte-for-byte intact
+MOCK
+chmod +x "$mockbin/autoformat"
+
+cat >"$repo/partial.py" <<'EOF'
+x = 1
+EOF
+(cd "$repo" && git add partial.py && git commit -q -m "seed")
+cat >"$repo/partial.py" <<'EOF'
+x = 2
+EOF
+(cd "$repo" && git add partial.py)
+printf 'extra_unstaged = True\n' >>"$repo/partial.py" # partial: staged x=2, unstaged extra line
+
+HOME="$home" PATH="$mockbin:$PATH" _run_sley "$repo" ready --fix --commit
+_assert_exit "ready --fix: clean partial-staged file is not refused" 0 "$__SLEY_RC"
+_assert_not_contains "ready --fix: clean partial-staged file has no refusal" \
+  "staged and unstaged changes" "$__SLEY_OUT"
+_assert_file_content "ready --fix: clean partial-staged worktree left intact" \
+  "$(printf 'x = 2\nextra_unstaged = True')" "$repo/partial.py"
 
 echo "=== sley: fix --commit does not update git index ==="
 

@@ -189,38 +189,84 @@ _sley_ready() {
     _fix_files=$(_sley_selected_files) || true
     if [[ -n "$_fix_files" ]]; then
       if [[ "$_REPO_TYPE" == "git" ]]; then
-        # Formatting rewrites the whole worktree file, so a partially staged
-        # file (both staged AND unstaged hunks) would fold the formatter's
-        # output into the unstaged hunk. Refuse before touching anything —
-        # the same guard `sley fix` enforces — so the commit gate
-        # (`sley ready --fix --commit`) and the standalone command share one
-        # policy. Only the staged/commit scope has an index to corrupt.
+        # A partially staged file (both staged AND unstaged hunks) is the one
+        # hazard: formatting rewrites the whole worktree file, folding the
+        # formatter's output across the unstaged hunk. But refusing every
+        # partial file upfront would block the common "stage some hunks, keep
+        # editing, commit" flow even when the staged content is already clean.
+        # So decide per file by result: back the worktree copy up, format, and
+        # if formatting WOULD change it, restore the copy (no clobber) and
+        # refuse just those files. A clean partial file formats to a no-op and
+        # commits fine. (`sley fix`, the explicit command, still refuses partial
+        # files outright; the commit gate is deliberately more permissive.)
+        local _fix_partial=""
         if [[ "$_SLEY_SCOPE_CHANGE" == "staged" ]]; then
-          # Match `sley fix`: only existing regular files get formatted, so
-          # only they can be corrupted. Filter symlinks/non-regular files out
-          # before the partial check so the two paths share one policy (e.g. a
-          # partially staged symlink must not refuse the run).
-          local _fix_partial _fix_runnable
+          local _fix_runnable
           _fix_runnable=$(printf '%s\n' "$_fix_files" | _repo_existing_regular_files)
           _fix_partial=$(_sley_git_staged_partial_files "$_fix_runnable")
-          if [[ -n "$_fix_partial" ]]; then
-            echo "sley fix: refusing files with staged and unstaged changes:" >&2
-            printf '%s\n' "$_fix_partial" | sed 's/^/  /' >&2
-            rm -f "$selected_cache_file"
-            return 2
-          fi
         fi
-        while IFS= read -r _fix_f; do
-          [[ -n "$_fix_f" ]] || continue
-          [[ -f "$_fix_f" ]] || continue
-          [[ ! -L "$_fix_f" ]] || continue
-          _fix_pre=$(git hash-object -- "$_fix_f" 2>/dev/null || true)
-          sley_hook_format_file "$_fix_f" >/dev/null 2>&1 || true
-          _fix_post=$(git hash-object -- "$_fix_f" 2>/dev/null || true)
-          if [[ -n "$_fix_pre" ]] && [[ "$_fix_pre" != "$_fix_post" ]]; then
-            _fix_modified+=("$_fix_f")
-          fi
-        done <<<"$_fix_files"
+        # Pass 1: partially staged files are probed, never mutated. Format a
+        # backup-protected copy to learn whether formatting would change the
+        # file, then always restore the worktree — so a refusal leaves nothing
+        # touched, and a clean partial file is a pure no-op. If any partial file
+        # would be reformatted, refuse before touching the rest of the batch.
+        local -a _fix_partial_modified=()
+        local _fix_bak
+        if [[ -n "$_fix_partial" ]]; then
+          while IFS= read -r _fix_f; do
+            [[ -n "$_fix_f" ]] || continue
+            [[ -f "$_fix_f" ]] || continue
+            [[ ! -L "$_fix_f" ]] || continue
+            printf '%s\n' "$_fix_partial" | grep -qxF -- "$_fix_f" || continue
+            # Refuse without formatting if we cannot back up, rather than risk an
+            # unrecoverable clobber of the unstaged hunk.
+            if ! { _fix_bak=$(mktemp "${TMPDIR:-/tmp}/sley-fix-bak.XXXXXX") &&
+              cp -p "$_fix_f" "$_fix_bak"; }; then
+              [[ -n "${_fix_bak:-}" ]] && rm -f "$_fix_bak"
+              _fix_partial_modified+=("$_fix_f")
+              continue
+            fi
+            _fix_pre=$(git hash-object -- "$_fix_f" 2>/dev/null || true)
+            sley_hook_format_file "$_fix_f" >/dev/null 2>&1 || true
+            _fix_post=$(git hash-object -- "$_fix_f" 2>/dev/null || true)
+            cp -p "$_fix_bak" "$_fix_f" # always restore: formatting here is only a probe
+            rm -f "$_fix_bak"
+            if [[ -n "$_fix_pre" ]] && [[ "$_fix_pre" != "$_fix_post" ]]; then
+              _fix_partial_modified+=("$_fix_f")
+            fi
+          done <<<"$_fix_files"
+        fi
+        # Pass 2: everything else formats in place as usual (skip the partial
+        # files handled above). Reached only when no partial file was refused.
+        if [[ "${#_fix_partial_modified[@]}" -eq 0 ]]; then
+          while IFS= read -r _fix_f; do
+            [[ -n "$_fix_f" ]] || continue
+            [[ -f "$_fix_f" ]] || continue
+            [[ ! -L "$_fix_f" ]] || continue
+            if [[ -n "$_fix_partial" ]] &&
+              printf '%s\n' "$_fix_partial" | grep -qxF -- "$_fix_f"; then
+              continue
+            fi
+            _fix_pre=$(git hash-object -- "$_fix_f" 2>/dev/null || true)
+            sley_hook_format_file "$_fix_f" >/dev/null 2>&1 || true
+            _fix_post=$(git hash-object -- "$_fix_f" 2>/dev/null || true)
+            if [[ -n "$_fix_pre" ]] && [[ "$_fix_pre" != "$_fix_post" ]]; then
+              _fix_modified+=("$_fix_f")
+            fi
+          done <<<"$_fix_files"
+        fi
+        if [[ "${#_fix_partial_modified[@]}" -gt 0 ]]; then
+          _ready_report+="sley fix: refusing to format files with staged and unstaged changes"$'\n'
+          _ready_report+="(formatting would fold changes across the unstaged hunk):"$'\n'
+          local _fpm
+          for _fpm in "${_fix_partial_modified[@]}"; do
+            _ready_report+="  $_fpm"$'\n'
+          done
+          _ready_report+="stage or stash the rest of these files, then re-run the commit."$'\n'
+          printf '%s' "$_ready_report" >&2
+          rm -f "$selected_cache_file"
+          return 2
+        fi
         if [[ "${#_fix_modified[@]}" -gt 0 ]]; then
           _ready_report+="sley fix: formatter modified staged files:"$'\n'
           local _fm
