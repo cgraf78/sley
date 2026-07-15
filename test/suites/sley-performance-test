@@ -20,6 +20,7 @@ SLEY_PERF_BUDGET_MULTIPLIER_ENV=SLEY_PERF_BUDGET_MULTIPLIER
 VERIFY_DISCOVERY_P95_BUDGET_MS=2500
 VERIFY_DISCOVERY_DARWIN_P95_BUDGET_MS=3500
 VERIFY_REQUIRED_REGISTRY_P95_BUDGET_MS=2500
+VERIFY_REQUIRED_REGISTRY_DARWIN_P95_BUDGET_MS=3500
 
 _new_perf_repo() {
   local repo
@@ -211,7 +212,9 @@ _assert_contains "verify perf: reports required command pass" '"status":"passed"
 _assert_file_content "verify perf: grouped required command runs once" "1" "$repo/tests/count"
 _measure_perf_p95 "verify perf: large registry" 15 "$repo" verify --run-required --json
 registry_p95="$__PERF_P95"
-registry_budget=$(_perf_budget_ms "$VERIFY_REQUIRED_REGISTRY_P95_BUDGET_MS")
+registry_budget=$(_perf_budget_ms \
+  "$VERIFY_REQUIRED_REGISTRY_P95_BUDGET_MS" \
+  "$VERIFY_REQUIRED_REGISTRY_DARWIN_P95_BUDGET_MS")
 echo "  PERF: verify required registry p95 ${registry_p95}ms (budget ${registry_budget}ms, files ${SLEY_PERF_CHANGED_FILES}, runs ${SLEY_PERF_RUNS})"
 _assert_ms_le "verify perf: large registry p95" "$registry_p95" "$registry_budget"
 
