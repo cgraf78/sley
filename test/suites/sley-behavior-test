@@ -3133,6 +3133,39 @@ HOME="$home" SLEY_READY_SYNC="$sync_dir" _run_sley "$repo" ready
 _assert_exit "ready: extension phases run concurrently" 0 "$__SLEY_RC"
 _assert_contains "ready: concurrent phase output surfaces" "phase-a saw phase-b" "$__SLEY_OUT"
 
+repo=$(_new_repo)
+home=$(_tmpdir)
+mockbin=$(_mock_bin)
+_copy_sley_libs "$home"
+cat >"$mockbin/autolint" <<'MOCK'
+#!/usr/bin/env bash
+sleep 5
+exit 0
+MOCK
+cat >"$mockbin/gitleaks" <<'MOCK'
+#!/usr/bin/env bash
+exit 0
+MOCK
+cat >"$mockbin/checkrun" <<'MOCK'
+#!/usr/bin/env bash
+exit 0
+MOCK
+chmod +x "$mockbin/autolint" "$mockbin/gitleaks" "$mockbin/checkrun"
+echo "x = 1" >"$repo/slow-ready.py"
+(cd "$repo" && git add slow-ready.py && git commit -q -m "seed slow ready")
+echo "x = 2" >"$repo/slow-ready.py"
+
+__SLEY_OUT=$(
+  cd "$repo" &&
+    HOME="$home" PATH="$mockbin:$PATH" _with_timeout 1 "$SLEY" ready 2>&1
+)
+__SLEY_RC=$?
+_assert_exit "ready: slow human phase times out in test harness" 124 "$__SLEY_RC"
+_assert_contains "ready: slow human phase reports changed-file selection before blocking" \
+  "sley ready: selecting changed files" "$__SLEY_OUT"
+_assert_contains "ready: slow human phase reports running phases before blocking" \
+  "sley ready: running phases: status, check, secrets, verify" "$__SLEY_OUT"
+
 echo "=== sley: --path argument validation ==="
 
 repo=$(_new_repo)

@@ -111,6 +111,8 @@ _sley_ready() {
 
   _sley_parse_scope "${scope_args[@]}" || return $?
   [[ "$_SLEY_SCOPE_JSON" == "0" ]] || _repo_require_json_encoder || return 2
+  local progress=0
+  [[ "$quiet" != "1" && "$_SLEY_SCOPE_JSON" != "1" ]] && progress=1
 
   # Validate the path scope at the orchestrator level. Without this an invalid
   # `--path` would be hidden: each phase subshell would emit exit 2 which the
@@ -122,7 +124,13 @@ _sley_ready() {
   # re-run a VCS pass right after this block.
   local filters selected selected_cache_file
   filters=$(_sley_path_filters) || return $?
+  [[ "$progress" == "1" ]] && echo "sley ready: selecting changed files" >&2
   selected=$(_sley_selected_files_for_filters "$filters") || return 2
+  if [[ "$progress" == "1" ]]; then
+    local selected_count
+    selected_count=$(_sley_count_file_list "$selected")
+    echo "sley ready: selected $selected_count changed files" >&2
+  fi
   selected_cache_file=$(mktemp "${TMPDIR:-/tmp}/sley-ready-selected.XXXXXX") || return 2
   printf '%s\n' "$selected" >"$selected_cache_file"
   _SLEY_SELECTED_FILES_CACHE_FILE="$selected_cache_file"
@@ -176,6 +184,14 @@ _sley_ready() {
       [[ "$_skip" -eq 0 ]] && _filtered+=("$phase")
     done
     phases=("${_filtered[@]}")
+  fi
+  if [[ "$progress" == "1" ]]; then
+    local phases_text=""
+    for phase in "${phases[@]}"; do
+      [[ -z "$phases_text" ]] || phases_text+=", "
+      phases_text+="$phase"
+    done
+    echo "sley ready: running phases: $phases_text" >&2
   fi
   # --fix: format changed files before the concurrent phases so `check`
   # validates already-formatted content. For git (staging area), reject if
