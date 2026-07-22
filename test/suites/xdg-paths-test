@@ -1,0 +1,177 @@
+#!/usr/bin/env bash
+# xdg-paths-test - XDG and explicit path precedence across Sley consumers.
+
+# shellcheck disable=SC2030,SC2031 # Environment changes are intentionally isolated in probes.
+
+set -o pipefail
+export NO_COLOR=1
+
+SLEY_TEST_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
+SLEY_REPO_ROOT="$(cd -- "$SLEY_TEST_DIR/.." && pwd -P)"
+SLEY="$SLEY_REPO_ROOT/bin/sley"
+CACHE_HELPER="$SLEY_REPO_ROOT/lib/sley/verify-cache.py"
+
+# shellcheck source=../helpers.sh
+. "$SLEY_TEST_DIR/helpers.sh"
+# shellcheck source=../../lib/sley/sley.sh
+. "$SLEY_REPO_ROOT/lib/sley/sley.sh"
+
+echo "=== sley: XDG path resolution ==="
+
+home=$(_tmpdir)
+resolved=$(
+  result=""
+  export HOME="$home" XDG_CONFIG_HOME=relative/config
+  _sley_xdg_dir result XDG_CONFIG_HOME .config sley/extensions.d \
+    "Sley extension directory"
+  printf '%s' "$result"
+)
+_assert_eq "XDG config: relative root uses HOME fallback" \
+  "$home/.config/sley/extensions.d" "$resolved"
+
+resolved=$(
+  result=""
+  export HOME="$home" XDG_CONFIG_HOME=
+  _sley_xdg_dir result XDG_CONFIG_HOME .config sley/extensions.d \
+    "Sley extension directory"
+  printf '%s' "$result"
+)
+_assert_eq "XDG config: empty root uses HOME fallback" \
+  "$home/.config/sley/extensions.d" "$resolved"
+
+missing_home_out=$(
+  unset HOME
+  XDG_CONFIG_HOME=relative/config \
+    _sley_xdg_dir resolved XDG_CONFIG_HOME .config sley/extensions.d \
+    "Sley extension directory" 2>&1
+)
+missing_home_rc=$?
+_assert_exit "XDG config: missing HOME fails" 1 "$missing_home_rc"
+_assert_contains "XDG config: missing HOME explains the unavailable roots" \
+  "HOME is not set and XDG_CONFIG_HOME is not an absolute path" "$missing_home_out"
+
+xdg_config=$(_tmpdir)/config
+extension_dir="$xdg_config/sley/extensions.d"
+mkdir -p "$extension_dir"
+cat >"$extension_dir/80-xdg-test.sh" <<'EOF'
+SLEY_XDG_EXTENSION_LOADED=absolute
+EOF
+xdg_extension_result=$(
+  unset HOME SLEY_EXTENSION_DIR
+  export XDG_CONFIG_HOME="$xdg_config"
+  source "$SLEY_REPO_ROOT/lib/sley/sley.sh"
+  sley_hook_init
+  printf '%s' "${SLEY_XDG_EXTENSION_LOADED:-missing}"
+)
+_assert_eq "XDG config: absolute root works without HOME" \
+  "absolute" "$xdg_extension_result"
+
+newline_extension_dir="$(_tmpdir)/extensions"$'\n'
+mkdir -p "$newline_extension_dir"
+cat >"$newline_extension_dir/80-newline-test.sh" <<'EOF'
+SLEY_XDG_EXTENSION_LOADED=newline
+EOF
+newline_extension_result=$(
+  unset HOME
+  export XDG_CONFIG_HOME=relative/config
+  export SLEY_EXTENSION_DIR="$newline_extension_dir"
+  source "$SLEY_REPO_ROOT/lib/sley/sley.sh"
+  sley_hook_init
+  printf '%s' "${SLEY_XDG_EXTENSION_LOADED:-missing}"
+)
+_assert_eq "extension override: trailing newline path reaches the consumer unchanged" \
+  "newline" "$newline_extension_result"
+
+repo=$(_tmpdir)
+git -C "$repo" init -q
+git -C "$repo" config user.email test@test.local
+git -C "$repo" config user.name "Test User"
+git -C "$repo" config commit.gpgsign false
+mkdir -p "$repo/.hooks"
+git -C "$repo" config core.hooksPath "$repo/.hooks"
+printf 'initial\n' >"$repo/app.txt"
+git -C "$repo" add app.txt
+git -C "$repo" commit -q -m seed
+printf 'changed\n' >>"$repo/app.txt"
+
+xdg_config=$(_tmpdir)/config
+mkdir -p "$xdg_config/sley/verify.d"
+cat >"$xdg_config/sley/verify.d/xdg.json" <<EOF
+{"repos":[{"match":{"root":"$repo"},"rules":[{"paths":["app.txt"],"commands":["echo xdg-verify"]}]}]}
+EOF
+verify_out=$(
+  cd "$repo" || exit 1
+  env -u HOME -u SLEY_VERIFY_CONFIG \
+    XDG_CONFIG_HOME="$xdg_config" XDG_CACHE_HOME="$(_tmpdir)/cache" \
+    GIT_CONFIG_GLOBAL="$repo/.gitconfig-test" "$SLEY" verify 2>&1
+)
+verify_rc=$?
+_assert_exit "verify registry: absolute XDG config works without HOME" 0 "$verify_rc"
+_assert_contains "verify registry: XDG config reaches registry consumer" \
+  "echo xdg-verify" "$verify_out"
+
+newline_config="$(_tmpdir)/verify.json"$'\n'
+cat >"$newline_config" <<EOF
+{"repos":[{"match":{"root":"$repo"},"rules":[{"paths":["app.txt"],"commands":["echo newline-verify"]}]}]}
+EOF
+verify_out=$(
+  cd "$repo" || exit 1
+  env -u HOME SLEY_VERIFY_CONFIG="$newline_config" XDG_CONFIG_HOME=relative/config \
+    XDG_CACHE_HOME="$(_tmpdir)/cache" GIT_CONFIG_GLOBAL="$repo/.gitconfig-test" \
+    "$SLEY" verify 2>&1
+)
+verify_rc=$?
+_assert_exit "verify override: trailing newline path works without HOME" 0 "$verify_rc"
+_assert_contains "verify override: exact path reaches registry consumer" \
+  "echo newline-verify" "$verify_out"
+
+verify_out=$(
+  cd "$repo" || exit 1
+  env -u HOME -u SLEY_VERIFY_CONFIG XDG_CONFIG_HOME=relative/config \
+    XDG_CACHE_HOME="$(_tmpdir)/cache" GIT_CONFIG_GLOBAL="$repo/.gitconfig-test" \
+    "$SLEY" verify 2>&1
+)
+verify_rc=$?
+_assert_exit "verify registry: relative XDG without HOME fails" 1 "$verify_rc"
+_assert_contains "verify registry: missing fallback has actionable error" \
+  "cannot resolve Sley verify registry directory" "$verify_out"
+
+cache_root() {
+  python3 -c 'import json,sys; print(json.load(sys.stdin)["root"].encode().hex())'
+}
+
+absolute_cache=$(_tmpdir)/cache
+cache_out=$(env -u HOME -u SLEY_VERIFY_CACHE_DIR XDG_CACHE_HOME="$absolute_cache" \
+  python3 "$CACHE_HELPER" stats)
+_assert_eq "XDG cache: absolute root works without HOME" \
+  "$(printf '%s' "$absolute_cache/sley/verify" | od -An -tx1 | tr -d ' \n')" \
+  "$(printf '%s' "$cache_out" | cache_root)"
+
+home=$(_tmpdir)
+cache_out=$(env -u SLEY_VERIFY_CACHE_DIR HOME="$home" XDG_CACHE_HOME=relative/cache \
+  python3 "$CACHE_HELPER" stats)
+_assert_eq "XDG cache: relative root uses HOME fallback" \
+  "$(printf '%s' "$home/.cache/sley/verify" | od -An -tx1 | tr -d ' \n')" \
+  "$(printf '%s' "$cache_out" | cache_root)"
+
+cache_out=$(env -u SLEY_VERIFY_CACHE_DIR HOME="$home" XDG_CACHE_HOME= \
+  python3 "$CACHE_HELPER" stats)
+_assert_eq "XDG cache: empty root uses HOME fallback" \
+  "$(printf '%s' "$home/.cache/sley/verify" | od -An -tx1 | tr -d ' \n')" \
+  "$(printf '%s' "$cache_out" | cache_root)"
+
+newline_cache="$(_tmpdir)/cache"$'\n'
+cache_out=$(env -u HOME SLEY_VERIFY_CACHE_DIR="$newline_cache" \
+  XDG_CACHE_HOME=relative/cache python3 "$CACHE_HELPER" stats)
+_assert_eq "cache override: trailing newline path reaches the consumer unchanged" \
+  "$(printf '%s' "$newline_cache" | od -An -tx1 | tr -d ' \n')" \
+  "$(printf '%s' "$cache_out" | cache_root)"
+
+cache_out=$(env -u HOME -u SLEY_VERIFY_CACHE_DIR XDG_CACHE_HOME=relative/cache \
+  python3 "$CACHE_HELPER" stats 2>&1)
+cache_rc=$?
+_assert_exit "XDG cache: relative root without HOME fails" 1 "$cache_rc"
+_assert_contains "XDG cache: missing fallback has actionable error" \
+  "cannot resolve Sley verify cache directory" "$cache_out"
+
+_test_summary
