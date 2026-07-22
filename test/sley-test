@@ -4,6 +4,69 @@
 set -euo pipefail
 
 test_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+root="${test_dir%/test}"
+
+# Keep runtime entry points explicit so additions require a lint review.
+runtime_shell_files=(
+  "$root/bin/sley"
+  "$root/lib/sley/hooks.sh"
+  "$root/lib/sley/ready.sh"
+  "$root/lib/sley/repo.sh"
+  "$root/lib/sley/scope.sh"
+  "$root/lib/sley/sley.sh"
+  "$root/lib/sley/verify.sh"
+  "$root/share/sley/shell.sh"
+)
+
+check_runtime_shell_inventory() {
+  local file first_line listed discovered
+  listed=$(
+    for file in "${runtime_shell_files[@]}"; do
+      printf '%s\n' "${file#"$root"/}"
+    done | LC_ALL=C sort
+  )
+  discovered=$(
+    while IFS= read -r file; do
+      case "$file" in
+        *.sh | *.sh.template)
+          printf '%s\n' "$file"
+          continue
+          ;;
+      esac
+      first_line=""
+      IFS= read -r first_line <"$root/$file" || true
+      if [[ "$first_line" == '#!'*bash* ||
+        "$first_line" == '#!'*dash* ||
+        "$first_line" == '#!'*ksh* ||
+        "$first_line" == '#!'*/sh ||
+        "$first_line" == '#!'*'/sh '* ||
+        "$first_line" == '#!'*' sh' ||
+        "$first_line" == '#!'*' sh '* ||
+        "$first_line" == '# shellcheck shell=bash' ||
+        "$first_line" == '# shellcheck shell=dash' ||
+        "$first_line" == '# shellcheck shell=ksh' ||
+        "$first_line" == '# shellcheck shell=sh' ]]; then
+        printf '%s\n' "$file"
+      fi
+    done < <(git -C "$root" ls-files -- bin lib share)
+  )
+  discovered=$(printf '%s\n' "$discovered" | sed '/^$/d' | LC_ALL=C sort)
+
+  if [[ "$listed" != "$discovered" ]]; then
+    printf 'sley-test: runtime shell inventory is stale\n' >&2
+    diff -u \
+      <(printf '%s\n' "$listed") \
+      <(printf '%s\n' "$discovered") >&2 || true
+    return 1
+  fi
+}
+
+check_runtime_shell_inventory
+shellcheck -x -P SCRIPTDIR \
+  "${runtime_shell_files[@]}" \
+  "$test_dir/sley-test" \
+  "$test_dir/helpers.sh" \
+  "$test_dir"/suites/*-test
 
 for suite in "$test_dir"/suites/*-test; do
   "$suite"
