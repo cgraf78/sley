@@ -1,0 +1,353 @@
+#!/usr/bin/env bash
+# ready-cancellation-test - signal cleanup and sourced-shell discipline.
+
+set -o pipefail
+export NO_COLOR=1
+
+SLEY_TEST_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
+SLEY_REPO_ROOT="$(cd -- "$SLEY_TEST_DIR/.." && pwd -P)"
+export SLEY_REPO_ROOT
+
+# shellcheck disable=SC1091 # Resolved from the suite's runtime location.
+. "$SLEY_TEST_DIR/helpers.sh"
+
+_new_ready_repo() {
+  local repo
+  repo=$(_tmpdir)
+  (
+    cd "$repo" || exit 1
+    export GIT_CONFIG_GLOBAL="$repo/.gitconfig-test"
+    : >"$GIT_CONFIG_GLOBAL"
+    git init -q
+    git config user.email test@test.local
+    git config user.name "Test User"
+    git config commit.gpgsign false
+    printf 'ready\n' >tracked.txt
+    git add tracked.txt
+    git commit -q -m seed
+  )
+  printf '%s\n' "$repo"
+}
+
+_result_value() {
+  local key="$1" content="$2"
+  printf '%s\n' "$content" | awk -F= -v key="$key" '$1 == key {sub(/^[^=]*=/, ""); print; exit}'
+}
+
+repo=$(_new_ready_repo)
+home=$(_tmpdir)
+config=$(_tmpdir)
+sync_dir=$(_tmpdir)
+ready_tmp=$(_tmpdir)
+mkdir -p "$config/sley/extensions.d"
+
+cat >"$config/sley/extensions.d/80-ready-cancellation.sh" <<'EXTENSION'
+sley_ext_ready_phases() {
+  printf '%s\n' phase-a phase-b
+}
+
+sley_ext_ready_phase() {
+  local phase="$1"
+  case "${SLEY_READY_TEST_MODE:-normal}" in
+    normal)
+      printf '%s complete\n' "$phase"
+      ;;
+    failure)
+      if [[ "$phase" == "phase-a" ]]; then
+        printf '%s blocked\n' "$phase" >&2
+        return 1
+      fi
+      printf '%s complete\n' "$phase"
+      ;;
+    long)
+      printf '%s\n' "$BASHPID" >"$SLEY_READY_SYNC/$phase.pid"
+      : >"$SLEY_READY_SYNC/$phase.started"
+      while :; do
+        :
+      done
+      ;;
+  esac
+}
+EXTENSION
+
+harness=$(_tmpdir)/ready-source-harness
+cat >"$harness" <<'HARNESS'
+#!/usr/bin/env bash
+
+root="$1"
+output="$2"
+result="$3"
+
+# shellcheck disable=SC1090 # The test supplies the checkout under test.
+source "$root/lib/sley/sley.sh"
+
+trap 'printf "INT\n" >>"$SLEY_READY_TRAP_LOG"' INT
+trap 'printf "TERM\n" >>"$SLEY_READY_TRAP_LOG"' TERM
+trap 'printf "HUP\n" >>"$SLEY_READY_TRAP_LOG"' HUP
+before_int=$(trap -p INT)
+before_term=$(trap -p TERM)
+before_hup=$(trap -p HUP)
+before_options=$-
+
+sley_ready \
+  --exclude status \
+  --exclude check \
+  --exclude secrets \
+  --exclude verify >"$output" 2>&1
+ready_rc=$?
+
+after_int=$(trap -p INT)
+after_term=$(trap -p TERM)
+after_hup=$(trap -p HUP)
+after_options=$-
+traps_restored=no
+if [[ "$before_int" == "$after_int" &&
+  "$before_term" == "$after_term" &&
+  "$before_hup" == "$after_hup" ]]; then
+  traps_restored=yes
+fi
+
+options_restored=no
+[[ "$before_options" == "$after_options" ]] && options_restored=yes
+
+cleanup_globals_absent=yes
+for name in \
+  _sley_ready_cleanup_done \
+  _sley_ready_cleanup_active \
+  phase_pids \
+  phase_stdout_files \
+  phase_stderr_files \
+  SLEY_CALLER \
+  SLEY_SCOPED \
+  _SLEY_SELECTED_FILES_CACHE_FILE \
+  _SLEY_SELECTED_FILES_CACHE_KEY; do
+  if declare -p "$name" >/dev/null 2>&1; then
+    cleanup_globals_absent=no
+  fi
+done
+
+artifact_count=0
+for artifact in "${TMPDIR:-/tmp}"/sley-ready-*; do
+  [[ -e "$artifact" ]] || continue
+  artifact_count=$((artifact_count + 1))
+done
+
+{
+  printf 'ready_rc=%s\n' "$ready_rc"
+  printf 'traps_restored=%s\n' "$traps_restored"
+  printf 'options_restored=%s\n' "$options_restored"
+  printf 'cleanup_globals_absent=%s\n' "$cleanup_globals_absent"
+  printf 'artifact_count=%s\n' "$artifact_count"
+} >"$result"
+HARNESS
+chmod +x "$harness"
+
+_run_sourced_ready() {
+  local mode="$1" output="$2" result="$3" trap_log="$4"
+  (
+    cd "$repo" || exit 1
+    HOME="$home" \
+      XDG_CONFIG_HOME="$config" \
+      XDG_CACHE_HOME="$home/cache" \
+      GIT_CONFIG_GLOBAL="$repo/.gitconfig-test" \
+      SLEY_READY_TEST_MODE="$mode" \
+      SLEY_READY_SYNC="$sync_dir" \
+      SLEY_READY_TRAP_LOG="$trap_log" \
+      TMPDIR="$ready_tmp" \
+      bash --noprofile --norc "$harness" "$SLEY_REPO_ROOT" "$output" "$result"
+  )
+}
+
+echo "=== sley: ready normal and failure cleanup ==="
+
+normal_output=$(_tmpdir)/normal.out
+normal_result=$(_tmpdir)/normal.result
+normal_trap_log=$(_tmpdir)/normal.traps
+_run_sourced_ready normal "$normal_output" "$normal_result" "$normal_trap_log"
+normal_data=$(cat "$normal_result")
+_assert_eq "ready normal: exits successfully" "0" "$(_result_value ready_rc "$normal_data")"
+_assert_eq "ready normal: restores caller traps" "yes" "$(_result_value traps_restored "$normal_data")"
+_assert_eq "ready normal: preserves caller shell options" "yes" "$(_result_value options_restored "$normal_data")"
+_assert_eq "ready normal: leaks no cleanup globals" "yes" "$(_result_value cleanup_globals_absent "$normal_data")"
+_assert_eq "ready normal: leaves no temporary artifacts" "0" "$(_result_value artifact_count "$normal_data")"
+normal_phase_a_line=$(awk '/^phase-a:/ {print NR; exit}' "$normal_output")
+normal_phase_b_line=$(awk '/^phase-b:/ {print NR; exit}' "$normal_output")
+if [[ -n "$normal_phase_a_line" && -n "$normal_phase_b_line" &&
+  "$normal_phase_a_line" -lt "$normal_phase_b_line" ]]; then
+  _pass "ready normal: reports phases in declaration order"
+else
+  _fail "ready normal: phase report order changed"
+fi
+
+failure_output=$(_tmpdir)/failure.out
+failure_result=$(_tmpdir)/failure.result
+failure_trap_log=$(_tmpdir)/failure.traps
+_run_sourced_ready failure "$failure_output" "$failure_result" "$failure_trap_log"
+failure_data=$(cat "$failure_result")
+_assert_eq "ready failure: preserves blocking exit" "1" "$(_result_value ready_rc "$failure_data")"
+_assert_eq "ready failure: restores caller traps" "yes" "$(_result_value traps_restored "$failure_data")"
+_assert_eq "ready failure: preserves caller shell options" "yes" "$(_result_value options_restored "$failure_data")"
+_assert_eq "ready failure: leaks no cleanup globals" "yes" "$(_result_value cleanup_globals_absent "$failure_data")"
+_assert_eq "ready failure: leaves no temporary artifacts" "0" "$(_result_value artifact_count "$failure_data")"
+_assert_contains "ready failure: keeps actionable phase output" "phase-a blocked" "$(cat "$failure_output")"
+
+signal_driver=$(_tmpdir)/ready-signal-driver.py
+cat >"$signal_driver" <<'PYTHON'
+import glob
+import os
+import signal
+import subprocess
+import sys
+import time
+
+(
+    bash,
+    harness,
+    root,
+    repo,
+    home,
+    config,
+    cache,
+    tmpdir,
+    sync_dir,
+    signal_name,
+    output,
+    result,
+    trap_log,
+) = sys.argv[1:]
+
+env = os.environ.copy()
+env.update(
+    {
+        "HOME": home,
+        "XDG_CONFIG_HOME": config,
+        "XDG_CACHE_HOME": cache,
+        "GIT_CONFIG_GLOBAL": os.path.join(repo, ".gitconfig-test"),
+        "SLEY_READY_TEST_MODE": "long",
+        "SLEY_READY_SYNC": sync_dir,
+        "SLEY_READY_TRAP_LOG": trap_log,
+        "TMPDIR": tmpdir,
+    }
+)
+
+with open(output, "wb") as output_file:
+    process = subprocess.Popen(
+        [bash, "--noprofile", "--norc", harness, root, output, result],
+        cwd=repo,
+        env=env,
+        stdout=output_file,
+        stderr=subprocess.STDOUT,
+    )
+
+
+def wait_for(predicate, timeout):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.02)
+    return predicate()
+
+
+phase_names = ("phase-a", "phase-b")
+started = wait_for(
+    lambda: all(os.path.exists(os.path.join(sync_dir, f"{name}.started")) for name in phase_names),
+    5,
+)
+pids = []
+if started:
+    for name in phase_names:
+        with open(os.path.join(sync_dir, f"{name}.pid"), encoding="ascii") as pid_file:
+            pids.append(int(pid_file.read().strip()))
+    os.kill(process.pid, getattr(signal, f"SIG{signal_name}"))
+
+completed = True
+try:
+    process.wait(timeout=5)
+except subprocess.TimeoutExpired:
+    completed = False
+
+
+def pid_exists(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+children_gone = wait_for(lambda: all(not pid_exists(pid) for pid in pids), 2)
+artifacts = sorted(glob.glob(os.path.join(tmpdir, "sley-ready-*")))
+trap_fired = os.path.exists(trap_log) and os.path.getsize(trap_log) > 0
+result_text = ""
+if os.path.exists(result):
+    with open(result, encoding="utf-8") as result_file:
+        result_text = result_file.read().strip()
+
+# A failing implementation must not leave the test's synthetic workers alive.
+for pid in pids:
+    if pid_exists(pid):
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+if process.poll() is None:
+    process.kill()
+process.wait()
+
+print(f"started={'yes' if started else 'no'}")
+print(f"completed={'yes' if completed else 'no'}")
+print(f"children_gone={'yes' if children_gone else 'no'}")
+print(f"artifact_count={len(artifacts)}")
+print(f"caller_trap_fired={'yes' if trap_fired else 'no'}")
+print(result_text)
+PYTHON
+
+echo "=== sley: ready cancellation cleanup ==="
+
+for cancel_signal in INT TERM HUP; do
+  rm -f "$sync_dir"/* "$ready_tmp"/sley-ready-* 2>/dev/null || true
+  cancel_output=$(_tmpdir)/"$cancel_signal.out"
+  cancel_result=$(_tmpdir)/"$cancel_signal.result"
+  cancel_trap_log=$(_tmpdir)/"$cancel_signal.traps"
+  cancel_data=$(python3 "$signal_driver" \
+    "$(command -v bash)" \
+    "$harness" \
+    "$SLEY_REPO_ROOT" \
+    "$repo" \
+    "$home" \
+    "$config" \
+    "$home/cache" \
+    "$ready_tmp" \
+    "$sync_dir" \
+    "$cancel_signal" \
+    "$cancel_output" \
+    "$cancel_result" \
+    "$cancel_trap_log")
+
+  case "$cancel_signal" in
+    INT) expected_rc=130 ;;
+    TERM) expected_rc=143 ;;
+    HUP) expected_rc=129 ;;
+  esac
+  _assert_eq "ready $cancel_signal: both phases start" "yes" "$(_result_value started "$cancel_data")"
+  _assert_eq "ready $cancel_signal: sourced call returns" "yes" "$(_result_value completed "$cancel_data")"
+  _assert_eq "ready $cancel_signal: returns conventional signal status" \
+    "$expected_rc" "$(_result_value ready_rc "$cancel_data")"
+  _assert_eq "ready $cancel_signal: leaves no live or zombie phase children" \
+    "yes" "$(_result_value children_gone "$cancel_data")"
+  _assert_eq "ready $cancel_signal: leaves no temporary artifacts" \
+    "0" "$(_result_value artifact_count "$cancel_data")"
+  _assert_eq "ready $cancel_signal: does not invoke the caller trap during its call" \
+    "no" "$(_result_value caller_trap_fired "$cancel_data")"
+  _assert_eq "ready $cancel_signal: restores caller traps before returning" \
+    "yes" "$(_result_value traps_restored "$cancel_data")"
+  _assert_eq "ready $cancel_signal: preserves caller shell options" \
+    "yes" "$(_result_value options_restored "$cancel_data")"
+  _assert_eq "ready $cancel_signal: leaks no cleanup globals" \
+    "yes" "$(_result_value cleanup_globals_absent "$cancel_data")"
+done
+
+_test_summary
