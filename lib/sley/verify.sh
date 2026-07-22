@@ -68,6 +68,10 @@ Scope:
   --repo-wide          consider all changed files in the repo
   --path PATH          restrict selected changed files to PATH
   --json               emit machine-readable output
+
+Environment:
+  SLEY_VERIFY_CONFIG    use one verify registry file or directory
+  SLEY_VERIFY_CACHE_DIR store success receipts in this directory
 EOF
 }
 
@@ -154,10 +158,14 @@ _sley_verify_config_context() {
 }
 
 _sley_verify_config_source() {
-  case "$1" in
-    "$_REPO_ROOT"/*) printf '%s\n' "${1#"$_REPO_ROOT"/}" ;;
-    *) printf '%s\n' "$1" ;;
+  local output_name="$1" config="$2" source_value
+  case "$config" in
+    "$_REPO_ROOT"/*) source_value="${config#"$_REPO_ROOT"/}" ;;
+    *) source_value="$config" ;;
   esac
+  # The source path is structured command metadata. Assign it directly so
+  # command substitution cannot strip trailing newline bytes from the value.
+  printf -v "$output_name" '%s' "$source_value"
 }
 
 _sley_verify_config_base() {
@@ -177,25 +185,37 @@ _sley_verify_config_base() {
   esac
 }
 
+_sley_verify_config_dir_files() {
+  local dir="$1" config had_nullglob=0 LC_ALL=C
+  local configs=()
+
+  [[ -d "$dir" ]] || return 0
+  shopt -q nullglob && had_nullglob=1
+  shopt -s nullglob
+  configs=("$dir"/*.json)
+  [[ "$had_nullglob" -eq 1 ]] || shopt -u nullglob
+  for config in "${configs[@]+"${configs[@]}"}"; do
+    # Follow valid symlinks while ignoring dangling ones, matching the previous
+    # `find -L` discovery contract without newline-delimited path transport.
+    [[ -f "$config" ]] && printf 'user\0%s\0' "$config"
+  done
+}
+
 _sley_verify_user_config_files() {
-  local xdg="${XDG_CONFIG_HOME:-$HOME/.config}" config
+  local config_home="$1" config
 
   if [[ -n "${SLEY_VERIFY_CONFIG:-}" ]]; then
     if [[ -f "$SLEY_VERIFY_CONFIG" ]]; then
-      printf '%s\n' "$SLEY_VERIFY_CONFIG"
+      printf 'user\0%s\0' "$SLEY_VERIFY_CONFIG"
     elif [[ -d "$SLEY_VERIFY_CONFIG" ]]; then
-      # User configs are often symlinked from a private config repo. Follow
-      # symlinks here so materialized files are first-class registry entries,
-      # while dangling links stay ignored.
-      find -L "$SLEY_VERIFY_CONFIG" -maxdepth 1 -name '*.json' -type f -print 2>/dev/null | LC_ALL=C sort
+      _sley_verify_config_dir_files "$SLEY_VERIFY_CONFIG"
     fi
   fi
 
-  config="$xdg/sley/verify.json"
-  [[ -f "$config" ]] && printf '%s\n' "$config"
-  if [[ -d "$xdg/sley/verify.d" ]]; then
-    find -L "$xdg/sley/verify.d" -maxdepth 1 -name '*.json' -type f -print 2>/dev/null | LC_ALL=C sort
-  fi
+  [[ -n "$config_home" ]] || return 0
+  config="$config_home/sley/verify.json"
+  [[ -f "$config" ]] && printf 'user\0%s\0' "$config"
+  _sley_verify_config_dir_files "$config_home/sley/verify.d"
 }
 
 _sley_verify_repo_config_files() {
@@ -214,9 +234,9 @@ _sley_verify_repo_config_files() {
         [[ -n "${_seen_configs[$source]:-}" ]] && continue
         _seen_configs[$source]=1
         if [[ "$source" == ./* ]]; then
-          printf '%s/%s\n' "$_REPO_ROOT" "${source#./}"
+          printf 'repo\0%s/%s\0' "$_REPO_ROOT" "${source#./}"
         else
-          printf '%s/%s\n' "$_REPO_ROOT" "$source"
+          printf 'repo\0%s/%s\0' "$_REPO_ROOT" "$source"
         fi
       done
       [[ "$dir" == "." ]] && break
@@ -338,26 +358,45 @@ _sley_verify_validate_config() {
 }
 
 _sley_verify_registry_commands() {
-  local files="$1" configs origin config context source base rules rule matched file pattern
-  local -a patterns
+  local files="$1" origin config context source base rules rule matched file pattern key i
+  local user_config_home=""
+  local -a patterns config_origins=() config_paths=()
+  declare -A seen_configs=()
 
-  configs=$(
-    {
-      _sley_verify_repo_config_files "$files" | sed 's/^/repo	/'
-      _sley_verify_user_config_files | sed 's/^/user	/'
-    } | awk 'NF && !seen[$0]++'
+  if [[ -z "${SLEY_VERIFY_CONFIG:-}" ]]; then
+    _sley_xdg_dir user_config_home XDG_CONFIG_HOME .config '' \
+      "Sley verify registry directory" || return $?
+    user_config_home="${user_config_home%/}"
+  elif _sley_xdg_dir user_config_home XDG_CONFIG_HOME .config '' \
+    "Sley verify registry directory" 2>/dev/null; then
+    # Preserve the established additive override contract: an explicit registry
+    # is discovered first, followed by the default user registries when their
+    # base directory is independently resolvable.
+    user_config_home="${user_config_home%/}"
+  fi
+
+  while IFS= read -r -d '' origin && IFS= read -r -d '' config; do
+    key="$origin"$'\x1f'"$config"
+    [[ -n "${seen_configs[$key]:-}" ]] && continue
+    seen_configs[$key]=1
+    config_origins+=("$origin")
+    config_paths+=("$config")
+  done < <(
+    _sley_verify_repo_config_files "$files"
+    _sley_verify_user_config_files "$user_config_home"
   )
-  [[ -n "$configs" ]] || return 0
+  [[ "${#config_paths[@]}" -gt 0 ]] || return 0
 
   command -v jq >/dev/null 2>&1 || {
     echo "sley verify: jq is required for sley verify registry files" >&2
     return 1
   }
 
-  while IFS=$'\t' read -r origin config; do
-    [[ -n "$config" ]] || continue
+  for ((i = 0; i < ${#config_paths[@]}; i++)); do
+    origin="${config_origins[$i]}"
+    config="${config_paths[$i]}"
     context=$(_sley_verify_config_context "$origin")
-    source=$(_sley_verify_config_source "$config")
+    _sley_verify_config_source source "$config"
     base=$(_sley_verify_config_base "$config" "$context")
     if ! _sley_verify_validate_config "$config" 2>/dev/null; then
       echo "sley verify: invalid verify registry: $source" >&2
@@ -426,7 +465,7 @@ _sley_verify_registry_commands() {
         '
       )
     done <<<"$rules"
-  done <<<"$configs"
+  done
 }
 
 _sley_verify_extension_commands() {
@@ -1031,7 +1070,7 @@ _sley_verify() {
   SLEY_CALLER="${SLEY_CALLER:-human}"
   # shellcheck disable=SC2034 # consumed by sourced local extensions.
   SLEY_SCOPED=1
-  sley_hook_init
+  sley_hook_init || return $?
 
   declare -A _seen_dirs
   while IFS= read -r file; do

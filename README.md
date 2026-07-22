@@ -141,6 +141,23 @@ project analyzer policy. Sley passes selected changed files to
 Repo-specific workflow commands still belong in Sley's verify registry or
 extension API rather than manifest guessing.
 
+User verify registries live at `$XDG_CONFIG_HOME/sley/verify.json` and
+`$XDG_CONFIG_HOME/sley/verify.d/*.json`, falling back to the same paths under
+`~/.config`. Set `SLEY_VERIFY_CONFIG` to add one explicit registry file or
+directory before those defaults. Success receipts live under
+`$XDG_CACHE_HOME/sley/verify`, falling back to `~/.cache/sley/verify`; set
+`SLEY_VERIFY_CACHE_DIR` to choose an explicit cache directory.
+
+Sley uses an XDG root only when it is non-empty and absolute. A missing, empty,
+or relative root falls back to `HOME`, and resolution fails with an actionable
+error when that fallback is required but `HOME` is unavailable. Explicit
+`SLEY_*` paths retain their exact value, including relative paths.
+
+`sley verify` always initializes extension discovery before collecting command
+sources. An explicit `SLEY_VERIFY_CONFIG` does not disable extensions; when no
+absolute config root or `HOME` is available, set `SLEY_EXTENSION_DIR` explicitly
+as well.
+
 The same boundary applies to hooks and editor integrations: Sley should decide
 repo scope, caller timing, and readiness phase composition, while Checkrun
 decides filetype inference, low-level tool selection, and diagnostic shape.
@@ -194,10 +211,11 @@ workspace roots, or decide local disable flags.
 ## Extension Policy
 
 Environment-specific hook policy lives in ordered files under
-`${XDG_CONFIG_HOME:-~/.config}/sley/extensions.d/*.sh`. These files may
-override the documented `sley_hook_*` functions. Set `SLEY_EXTENSION_DIR` when
-an integration needs to source extensions from a test fixture or another
-managed config location.
+`$XDG_CONFIG_HOME/sley/extensions.d/*.sh` when `XDG_CONFIG_HOME` is absolute,
+or `~/.config/sley/extensions.d/*.sh` otherwise. These files may override the
+documented `sley_hook_*` functions. Set `SLEY_EXTENSION_DIR` when an integration
+needs to source extensions from a test fixture or another managed config
+location.
 
 Extensions may also provide `sley_ext_verify_commands <files>` to print additional
 `sley verify` command items as JSON lines. Those items use the same shape as

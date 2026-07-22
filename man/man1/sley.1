@@ -1,4 +1,4 @@
-.TH SLEY 1 "2026-06-30" "sley" "User Commands"
+.TH SLEY 1 "2026-07-21" "sley" "User Commands"
 .SH NAME
 sley \- repository workflow checks for humans, editors, hooks, and agents
 .SH SYNOPSIS
@@ -75,13 +75,48 @@ when a probe should ignore the optional bare-repo fallback.
 .B SLEY_EXTENSION_DIR
 Directory containing environment-specific extension files. Defaults to the
 user's XDG config location.
+.TP
+.B SLEY_VERIFY_CONFIG
+Explicit verify registry file or directory, discovered before user registries
+from the default config directory.
+.TP
+.B SLEY_VERIFY_CACHE_DIR
+Explicit directory for local verify success receipts.
+.TP
+.B XDG_CONFIG_HOME
+Absolute base directory for Sley extensions and user verify registries. An
+empty or relative value falls back to
+.BR $HOME/.config .
+.TP
+.B XDG_CACHE_HOME
+Absolute base directory for verify success receipts. An empty or relative
+value falls back to
+.BR $HOME/.cache .
+.PP
+If an XDG fallback is required and
+.B HOME
+is unavailable, Sley reports an error rather than resolving a relative path.
+An explicit
+.B SLEY_VERIFY_CONFIG
+does not disable extension discovery, so
+.B SLEY_EXTENSION_DIR
+must also be explicit when no default config root can be resolved.
 .SH FILES
 .TP
 .I share/sley/schemas/verify.schema.json
 JSON Schema for Sley verify registry files.
 .TP
-.I ${XDG_CONFIG_HOME:-~/.config}/sley/extensions.d/*.sh
+.I $XDG_CONFIG_HOME/sley/extensions.d/*.sh
 Ordered extension files for local hook and verify policy.
+.TP
+.I $XDG_CONFIG_HOME/sley/verify.json
+Primary user verify registry.
+.TP
+.I $XDG_CONFIG_HOME/sley/verify.d/*.json
+Additional user verify registries.
+.TP
+.I $XDG_CACHE_HOME/sley/verify/
+Local verify success receipts.
 .SH EXIT STATUS
 .TP
 .B 0

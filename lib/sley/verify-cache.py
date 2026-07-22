@@ -39,11 +39,32 @@ def canon(obj: Any) -> bytes:
     return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
 
 
+def resolve_dir(override: str, xdg: str, home_suffix: Path, app_suffix: Path) -> Path:
+    """Resolve an explicit directory or an XDG-aware built-in default."""
+    explicit = os.environ.get(override)
+    if explicit:
+        return Path(explicit)
+
+    root = os.environ.get(xdg)
+    if root and Path(root).is_absolute():
+        return Path(root) / app_suffix
+
+    home = os.environ.get("HOME")
+    if home:
+        return Path(home) / home_suffix / app_suffix
+    raise RuntimeError(
+        f"HOME is not set and {xdg} is not an absolute path; "
+        "cannot resolve Sley verify cache directory"
+    )
+
+
 def cache_root() -> Path:
-    root = os.environ.get("XDG_CACHE_HOME")
-    if root:
-        return Path(root) / "sley" / "verify"
-    return Path.home() / ".cache" / "sley" / "verify"
+    return resolve_dir(
+        "SLEY_VERIFY_CACHE_DIR",
+        "XDG_CACHE_HOME",
+        Path(".cache"),
+        Path("sley") / "verify",
+    )
 
 
 def ensure_private_dir(path: Path) -> None:

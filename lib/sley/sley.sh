@@ -521,7 +521,7 @@ _sley_fix() {
   # `sley fix` must use the same formatting policy as editor, agent, Git, and
   # Sapling hooks. Base installs route through autoformat; environment
   # extensions may override `sley_hook_format_file` for repo-native tools.
-  sley_hook_init
+  sley_hook_init || return $?
 
   if [[ "$_REPO_TYPE" == "git" && "$_SLEY_SCOPE_CHANGE" == "staged" ]]; then
     # Formatting a partially staged file rewrites the whole worktree file,
@@ -600,7 +600,7 @@ _sley_check() {
   # `sley check` owns the scoped file list. Extensions may swap in repo-local
   # lint/validate behavior, but must preserve this sley-selected scope when the
   # scoped flag is set; hooks can still use their faster hook defaults.
-  sley_hook_init
+  sley_hook_init || return $?
   sley_hook_lint "$runnable"
   case $? in
     0) ;;
@@ -651,8 +651,8 @@ _sley_gitleaks_args() {
 # (re-sourcing under `sley ready` is idempotent). Missing files are dropped so a
 # stale override can never abort the scan.
 _sley_secrets_extra_config_list() {
-  _sley_source_extensions_from "$(_sley_extension_dir)" 2>/dev/null || true
-  local cfg
+  local extension_dir="$1" cfg
+  _sley_source_extensions_from "$extension_dir"
   while IFS= read -r cfg; do
     [[ -n "$cfg" && -f "$cfg" ]] && printf '%s\n' "$cfg"
   done < <(_sley_hook_secrets_extra_configs 2>/dev/null || true)
@@ -733,7 +733,7 @@ _sley_clean_commit_message() {
 # for secrets and any extension-provided extra rules. Runs the base config pass
 # plus one pass per extra config over the git-cleaned message text.
 _sley_secrets_message_file() {
-  local msg_file="$1"
+  local msg_file="$1" extension_dir="$2"
   _sley_init_repo || return $?
   command -v gitleaks >/dev/null 2>&1 || {
     _sley_die "gitleaks not found"
@@ -762,7 +762,7 @@ _sley_secrets_message_file() {
     scan_rc=0
     _sley_gitleaks_scan_text "$cleaned" --redact --no-banner --verbose --config "$cfg" || scan_rc=$?
     [[ "$scan_rc" -gt "$rc" ]] && rc=$scan_rc
-  done < <(_sley_secrets_extra_config_list)
+  done < <(_sley_secrets_extra_config_list "$extension_dir")
   return "$rc"
 }
 
@@ -869,6 +869,9 @@ _sley_secrets_scan_worktree_files() {
 }
 
 _sley_secrets() {
+  local extension_dir
+  _sley_extension_dir extension_dir || return $?
+
   # Commit-message scan mode: `sley secrets --message-file <path>`. Handled
   # before scope parsing since it takes a file, not a change/path scope.
   if [[ "${1:-}" == "--message-file" ]]; then
@@ -876,7 +879,7 @@ _sley_secrets() {
       _sley_die "--message-file requires an argument"
       return 2
     fi
-    _sley_secrets_message_file "$2"
+    _sley_secrets_message_file "$2" "$extension_dir"
     return $?
   fi
   _sley_init_repo || return $?
@@ -988,7 +991,7 @@ _sley_secrets() {
     scan_rc=0
     _sley_secrets_scan_extra_config "$_cfg" "$staged_files" "${worktree_files[@]}" || scan_rc=$?
     [[ "$scan_rc" -gt "$rc" ]] && rc=$scan_rc
-  done < <(_sley_secrets_extra_config_list)
+  done < <(_sley_secrets_extra_config_list "$extension_dir")
   if [[ "$rc" -eq 0 ]]; then
     _sley_print_file_summary "sley secrets: scanned" "${#_scanned_set[@]}"
   fi
@@ -1038,7 +1041,7 @@ _sley_hook() {
 
   case "$cmd" in
     changed-files)
-      sley_hook_init
+      sley_hook_init || return $?
       sley_hook_changed_files
       ;;
     format-file)
@@ -1047,7 +1050,7 @@ _sley_hook() {
         return 2
       }
       _sley_hook_cd_for_absolute_file_arg "$@" || return $?
-      sley_hook_init
+      sley_hook_init || return $?
       sley_hook_format_file "$@"
       ;;
     lint-file)
@@ -1056,7 +1059,7 @@ _sley_hook() {
         return 2
       }
       _sley_hook_cd_for_absolute_file_arg "$@" || return $?
-      sley_hook_init
+      sley_hook_init || return $?
       sley_hook_lint_file "$@"
       ;;
     format)
@@ -1065,7 +1068,7 @@ _sley_hook() {
         return 2
       }
       files=$(cat)
-      sley_hook_init
+      sley_hook_init || return $?
       sley_hook_format "$files"
       ;;
     lint)
@@ -1074,11 +1077,11 @@ _sley_hook() {
         return 2
       }
       files=$(cat)
-      sley_hook_init
+      sley_hook_init || return $?
       sley_hook_lint "$files"
       ;;
     validate)
-      sley_hook_init
+      sley_hook_init || return $?
       sley_hook_validate
       ;;
     -h | --help | help)

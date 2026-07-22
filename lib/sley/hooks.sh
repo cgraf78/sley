@@ -104,28 +104,44 @@ _sley_source_extensions_from() {
   done
 }
 
+_sley_xdg_dir() {
+  local output_name="$1" xdg_name="$2" home_suffix="$3" app_suffix="$4" purpose="$5"
+  local root="${!xdg_name:-}" resolved
+
+  if [[ -n "$root" && "$root" == /* ]]; then
+    resolved="$root/$app_suffix"
+  elif [[ -n "${HOME:-}" ]]; then
+    resolved="$HOME/$home_suffix/$app_suffix"
+  else
+    printf 'sley: HOME is not set and %s is not an absolute path; cannot resolve %s\n' \
+      "$xdg_name" "$purpose" >&2
+    return 1
+  fi
+
+  # Assign into the caller rather than printing. Command substitution removes
+  # trailing newlines, which can silently retarget an explicit filesystem path.
+  printf -v "$output_name" '%s' "$resolved"
+}
+
 _sley_extension_dir() {
-  local config_home
+  local output_name="$1" path_value
 
   if [[ -n "${SLEY_EXTENSION_DIR:-}" ]]; then
-    printf '%s\n' "$SLEY_EXTENSION_DIR"
-    return 0
+    path_value="$SLEY_EXTENSION_DIR"
+  else
+    # Extension policy is user configuration, not an installed code asset.
+    # Standalone shdeps installs therefore use XDG config rather than a host
+    # repository's historical library layout.
+    _sley_xdg_dir path_value XDG_CONFIG_HOME .config sley/extensions.d \
+      "Sley extension directory" || return $?
   fi
 
-  # Extension policy is user configuration, not an installed code asset. Keep
-  # the default under XDG config so standalone shdeps installs do not depend on
-  # any host repository's historical library layout.
-  config_home="${XDG_CONFIG_HOME:-}"
-  if [[ -z "$config_home" ]]; then
-    [[ -n "${HOME:-}" ]] || return 1
-    config_home="$HOME/.config"
-  fi
-  printf '%s\n' "$config_home/sley/extensions.d"
+  printf -v "$output_name" '%s' "$path_value"
 }
 
 _sley_hook_init() {
   local extension_dir
-  extension_dir=$(_sley_extension_dir)
+  _sley_extension_dir extension_dir || return $?
 
   # Native hooks only speak the SLEY_* extension contract. Deprecated
   # compatibility names were intentionally removed so hook policy has a single
