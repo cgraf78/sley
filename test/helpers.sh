@@ -258,9 +258,9 @@ _with_timeout() {
   local secs="$1"
   shift
   if command -v timeout &>/dev/null; then
-    timeout "$secs" "$@"
+    timeout --kill-after=5 "$secs" "$@"
   elif command -v gtimeout &>/dev/null; then
-    gtimeout "$secs" "$@"
+    gtimeout --kill-after=5 "$secs" "$@"
   elif command -v python3 &>/dev/null; then
     python3 -c '
 import errno

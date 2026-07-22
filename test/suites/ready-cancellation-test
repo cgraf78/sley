@@ -41,9 +41,38 @@ sync_dir=$(_tmpdir)
 ready_tmp=$(_tmpdir)
 mkdir -p "$config/sley/extensions.d"
 
+system_ps=""
+if [[ ! -r /proc/self/stat ]]; then
+  for ps_candidate in /bin/ps /usr/bin/ps; do
+    if [[ -x "$ps_candidate" ]]; then
+      system_ps=$ps_candidate
+      break
+    fi
+  done
+  if [[ -z "$system_ps" ]]; then
+    system_ps=$(command -v ps 2>/dev/null || true)
+  fi
+  [[ -x "$system_ps" ]] || {
+    echo "ready-cancellation-test: ps is required on systems without procfs" >&2
+    exit 1
+  }
+  export SLEY_READY_SYSTEM_PS="$system_ps"
+fi
+
 cat >"$config/sley/extensions.d/80-ready-cancellation.sh" <<'EXTENSION'
 sley_ext_ready_phases() {
+  if [[ "${SLEY_READY_TEST_MODE:-}" == "interactive" ]]; then
+    : >"$SLEY_READY_SYNC/interactive.waiting"
+    IFS= read -r terminal_input
+    printf '%s\n' "$terminal_input" >"$SLEY_READY_SYNC/interactive.input"
+  fi
   printf '%s\n' phase-a phase-b
+}
+
+sley_hook_format_file() {
+  [[ "${SLEY_READY_TEST_MODE:-}" == "format-long" ]] || return 0
+  printf 'formatted by interrupted formatter\n' >"$1"
+  "$SLEY_READY_FORMATTER"
 }
 
 sley_ext_ready_phase() {
@@ -66,9 +95,39 @@ sley_ext_ready_phase() {
         :
       done
       ;;
+    descendant)
+      printf '%s\n' "$BASHPID" >"$SLEY_READY_SYNC/$phase.pid"
+      sleep 300 &
+      descendant_pid=$!
+      printf '%s\n' "$descendant_pid" >"$SLEY_READY_SYNC/$phase.descendant.pid"
+      : >"$SLEY_READY_SYNC/$phase.started"
+      wait "$descendant_pid"
+      ;;
+    term-cleanup)
+      printf '%s\n' "$BASHPID" >"$SLEY_READY_SYNC/$phase.pid"
+      trap 'sleep 0.1; : >"$SLEY_READY_SYNC/'"$phase"'.term-cleanup"; exit 0' TERM
+      : >"$SLEY_READY_SYNC/$phase.started"
+      while :; do
+        :
+      done
+      ;;
   esac
 }
 EXTENSION
+
+formatter=$(_tmpdir)/term-ignoring-formatter
+cat >"$formatter" <<'FORMATTER'
+#!/usr/bin/env bash
+
+trap '' INT TERM
+printf '%s\n' "$BASHPID" >"$SLEY_READY_SYNC/formatter.pid"
+: >"$SLEY_READY_SYNC/formatter.started"
+while :; do
+  :
+done
+FORMATTER
+chmod +x "$formatter"
+export SLEY_READY_FORMATTER="$formatter"
 
 harness=$(_tmpdir)/ready-source-harness
 cat >"$harness" <<'HARNESS'
@@ -81,6 +140,11 @@ result="$3"
 # shellcheck disable=SC1090 # The test supplies the checkout under test.
 source "$root/lib/sley/sley.sh"
 
+if [[ "${SLEY_READY_TEST_NO_IDENTITY:-0}" == "1" ]]; then
+  _sley_ready_process_identity() { return 1; }
+  _sley_ready_process_tree() { return 1; }
+fi
+
 trap 'printf "INT\n" >>"$SLEY_READY_TRAP_LOG"' INT
 trap 'printf "TERM\n" >>"$SLEY_READY_TRAP_LOG"' TERM
 trap 'printf "HUP\n" >>"$SLEY_READY_TRAP_LOG"' HUP
@@ -89,11 +153,16 @@ before_term=$(trap -p TERM)
 before_hup=$(trap -p HUP)
 before_options=$-
 
-sley_ready \
-  --exclude status \
-  --exclude check \
-  --exclude secrets \
-  --exclude verify >"$output" 2>&1
+ready_args=(
+  --exclude status
+  --exclude check
+  --exclude secrets
+  --exclude verify
+)
+if [[ "${SLEY_READY_TEST_MODE:-}" == "format-long" ]]; then
+  ready_args=(--fix --commit "${ready_args[@]}")
+fi
+sley_ready "${ready_args[@]}" >"$output" 2>&1
 ready_rc=$?
 
 after_int=$(trap -p INT)
@@ -114,6 +183,8 @@ cleanup_globals_absent=yes
 for name in \
   _sley_ready_cleanup_done \
   _sley_ready_cleanup_active \
+  _sley_ready_launching_child \
+  _sley_ready_pending_status \
   phase_pids \
   phase_stdout_files \
   phase_stderr_files \
@@ -131,6 +202,11 @@ for artifact in "${TMPDIR:-/tmp}"/sley-ready-*; do
   [[ -e "$artifact" ]] || continue
   artifact_count=$((artifact_count + 1))
 done
+fix_backup_count=0
+for artifact in "${TMPDIR:-/tmp}"/sley-fix-bak.*; do
+  [[ -e "$artifact" ]] || continue
+  fix_backup_count=$((fix_backup_count + 1))
+done
 
 {
   printf 'ready_rc=%s\n' "$ready_rc"
@@ -138,6 +214,7 @@ done
   printf 'options_restored=%s\n' "$options_restored"
   printf 'cleanup_globals_absent=%s\n' "$cleanup_globals_absent"
   printf 'artifact_count=%s\n' "$artifact_count"
+  printf 'fix_backup_count=%s\n' "$fix_backup_count"
 } >"$result"
 HARNESS
 chmod +x "$harness"
@@ -152,6 +229,7 @@ _run_sourced_ready() {
       GIT_CONFIG_GLOBAL="$repo/.gitconfig-test" \
       SLEY_READY_TEST_MODE="$mode" \
       SLEY_READY_SYNC="$sync_dir" \
+      SLEY_READY_FORMATTER="$formatter" \
       SLEY_READY_TRAP_LOG="$trap_log" \
       TMPDIR="$ready_tmp" \
       bash --noprofile --norc "$harness" "$SLEY_REPO_ROOT" "$output" "$result"
@@ -178,6 +256,434 @@ if [[ -n "$normal_phase_a_line" && -n "$normal_phase_b_line" &&
 else
   _fail "ready normal: phase report order changed"
 fi
+if grep -Eq '^\[[0-9]+\].*(Done|Terminated|Exit)' "$normal_output"; then
+  _fail "ready normal: isolated implementation leaked a job-status notification"
+else
+  _pass "ready normal: emits no job-status notification"
+fi
+
+interactive_driver=$(_tmpdir)/ready-interactive-driver.py
+interactive_cancel_harness=$(_tmpdir)/ready-interactive-cancel-harness
+cat >"$interactive_cancel_harness" <<'HARNESS'
+#!/usr/bin/env bash
+
+root="$1"
+result="$2"
+
+# shellcheck disable=SC1090 # The test supplies the checkout under test.
+source "$root/lib/sley/sley.sh"
+
+# Widen the interval in which a terminal-delivered INT and the wrapper's
+# forwarded INT can overlap cleanup. The renamed function is the real cleanup,
+# so the test still verifies worktree restoration and artifact ownership.
+eval "$(declare -f _sley_ready_cleanup | sed '1s/_sley_ready_cleanup/_sley_ready_cleanup_original/')"
+_sley_ready_cleanup() {
+  : >"$SLEY_READY_SYNC/interactive-cleanup.started"
+  sleep 1
+  _sley_ready_cleanup_original
+  : >"$SLEY_READY_SYNC/interactive-cleanup.done"
+}
+
+sley_ready \
+  --fix \
+  --commit \
+  --exclude status \
+  --exclude check \
+  --exclude secrets \
+  --exclude verify >/dev/null 2>&1
+ready_rc=$?
+
+artifact_count=0
+for artifact in "${TMPDIR:-/tmp}"/sley-ready-*; do
+  [[ -e "$artifact" ]] || continue
+  artifact_count=$((artifact_count + 1))
+done
+fix_backup_count=0
+for artifact in "${TMPDIR:-/tmp}"/sley-fix-bak.*; do
+  [[ -e "$artifact" ]] || continue
+  fix_backup_count=$((fix_backup_count + 1))
+done
+
+{
+  printf 'ready_rc=%s\n' "$ready_rc"
+  printf 'cleanup_done=%s\n' "$([[ -e "$SLEY_READY_SYNC/interactive-cleanup.done" ]] && printf yes || printf no)"
+  printf 'artifact_count=%s\n' "$artifact_count"
+  printf 'fix_backup_count=%s\n' "$fix_backup_count"
+} >"$result"
+HARNESS
+chmod +x "$interactive_cancel_harness"
+
+cat >"$interactive_driver" <<'PYTHON'
+import atexit
+import fcntl
+import os
+import pty
+import select
+import signal
+import subprocess
+import sys
+import termios
+import time
+
+(
+    bash_command,
+    root,
+    repo,
+    home,
+    config,
+    cache,
+    tmpdir,
+    sync_dir,
+    formatter,
+    scenario,
+    cancel_harness,
+    cancel_result,
+) = sys.argv[1:]
+
+
+process = None
+owned_pid = None
+owned_session = None
+owned_pids = set()
+owned_groups = set()
+driver_session = os.getsid(0)
+diagnostic_path = os.path.join(sync_dir, f"interactive-driver-{scenario}.diagnostics")
+
+
+def record_diagnostic(message):
+    with open(diagnostic_path, "a", encoding="utf-8") as diagnostic_file:
+        diagnostic_file.write(f"{message}\n")
+
+
+def remember_owned_pid(pid):
+    if owned_session is None:
+        return False
+    try:
+        if os.getsid(pid) != owned_session:
+            return False
+        owned_pids.add(pid)
+        owned_groups.add(os.getpgid(pid))
+        return True
+    except OSError:
+        return False
+
+
+def discover_owned_processes():
+    if os.path.isdir("/proc"):
+        try:
+            entries = os.scandir("/proc")
+        except OSError:
+            return
+        with entries:
+            for entry in entries:
+                if entry.name.isdigit():
+                    remember_owned_pid(int(entry.name))
+        return
+    ps_command = os.environ.get("SLEY_READY_SYSTEM_PS")
+    if not ps_command:
+        return
+    try:
+        output = subprocess.check_output(
+            [ps_command, "-A", "-o", "pid="],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return
+    for pid_text in output.split():
+        if pid_text.isdigit() and int(pid_text) != os.getpid():
+            remember_owned_pid(int(pid_text))
+
+
+def remember_foreground_group(terminal_fd):
+    try:
+        foreground_group = os.tcgetpgrp(terminal_fd)
+        if os.getsid(foreground_group) == owned_session:
+            owned_groups.add(foreground_group)
+            return True
+    except OSError:
+        pass
+    return False
+
+
+def kill_owned_processes():
+    if owned_session is None or owned_session == driver_session:
+        return
+    for _ in range(3):
+        discover_owned_processes()
+        for pid in tuple(owned_pids):
+            remember_owned_pid(pid)
+        for process_group in tuple(owned_groups):
+            try:
+                os.killpg(process_group, signal.SIGKILL)
+            except OSError:
+                pass
+        for pid in tuple(owned_pids):
+            try:
+                if os.getsid(pid) == owned_session:
+                    os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
+        time.sleep(0.02)
+
+
+def cleanup_owned_session():
+    if owned_session is not None:
+        kill_owned_processes()
+    elif owned_pid is not None:
+        try:
+            os.killpg(owned_pid, signal.SIGKILL)
+        except OSError:
+            pass
+
+
+def interrupted(_signal_number, _frame):
+    raise SystemExit(1)
+
+
+atexit.register(cleanup_owned_session)
+handled_signals = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
+for handled_signal in handled_signals:
+    signal.signal(handled_signal, interrupted)
+
+
+env = os.environ.copy()
+env.update(
+    {
+        "HOME": home,
+        "XDG_CONFIG_HOME": config,
+        "XDG_CACHE_HOME": cache,
+        "GIT_CONFIG_GLOBAL": os.path.join(repo, ".gitconfig-test"),
+        "SLEY_READY_TEST_MODE": "format-long" if scenario == "cancel" else "interactive",
+        "SLEY_READY_SYNC": sync_dir,
+        "SLEY_READY_FORMATTER": formatter,
+        "TMPDIR": tmpdir,
+        "PS1": "",
+        "PROMPT_COMMAND": "",
+    }
+)
+
+previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, handled_signals)
+terminal_fd, child_terminal_fd = pty.openpty()
+record_diagnostic(f"driver_session={driver_session}")
+record_diagnostic("pty_opened=yes")
+
+
+def prepare_child():
+    os.setsid()
+    fcntl.ioctl(child_terminal_fd, termios.TIOCSCTTY, 0)
+    os.tcsetpgrp(child_terminal_fd, os.getpgrp())
+    signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+
+
+process = subprocess.Popen(
+    [bash_command, "--noprofile", "--norc", "-i"],
+    cwd=repo,
+    env=env,
+    stdin=child_terminal_fd,
+    stdout=child_terminal_fd,
+    stderr=child_terminal_fd,
+    preexec_fn=prepare_child,
+)
+os.close(child_terminal_fd)
+pid = process.pid
+owned_pid = process.pid
+record_diagnostic(f"child_pid={owned_pid}")
+
+try:
+    owned_session = os.getsid(pid)
+    if owned_session != pid or owned_session == driver_session:
+        raise RuntimeError(
+            f"child session is not isolated: pid={pid} sid={owned_session} driver_sid={driver_session}"
+        )
+    remember_owned_pid(pid)
+    foreground_group_owned = remember_foreground_group(terminal_fd)
+    record_diagnostic(f"owned_session={owned_session}")
+    record_diagnostic(f"child_group={os.getpgid(pid)}")
+    record_diagnostic(f"foreground_group={os.tcgetpgrp(terminal_fd)}")
+except (OSError, RuntimeError):
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    process.wait()
+    os.close(terminal_fd)
+    raise
+finally:
+    signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+attributes = termios.tcgetattr(terminal_fd)
+attributes[3] &= ~termios.ECHO
+termios.tcsetattr(terminal_fd, termios.TCSANOW, attributes)
+if scenario == "cancel":
+    command = f"source {cancel_harness} {root} {cancel_result}; exit\n"
+else:
+    command = (
+        f"source {root}/lib/sley/sley.sh; "
+        "sley_ready --exclude status --exclude check --exclude secrets --exclude verify; "
+        "printf '__READY_RC__=%s\\n' \"$?\"; exit\n"
+    )
+os.write(terminal_fd, command.encode())
+
+waiting_name = "formatter.started" if scenario == "cancel" else "interactive.waiting"
+waiting_path = os.path.join(sync_dir, waiting_name)
+output = bytearray()
+deadline = time.monotonic() + 5
+while (
+    time.monotonic() < deadline
+    and not os.path.exists(waiting_path)
+    and process.poll() is None
+):
+    readable, _, _ = select.select([terminal_fd], [], [], 0.02)
+    if readable:
+        try:
+            chunk = os.read(terminal_fd, 4096)
+            if chunk:
+                output.extend(chunk)
+        except OSError:
+            pass
+started = os.path.exists(waiting_path)
+if started:
+    foreground_group_owned = remember_foreground_group(terminal_fd) or foreground_group_owned
+    if scenario == "cancel":
+        formatter_pid_path = os.path.join(sync_dir, "formatter.pid")
+        with open(formatter_pid_path, encoding="ascii") as formatter_pid_file:
+            remember_owned_pid(int(formatter_pid_file.read().strip()))
+    os.write(terminal_fd, b"\x03" if scenario == "cancel" else b"input from terminal\n")
+
+completed = False
+deadline = time.monotonic() + 5
+while time.monotonic() < deadline:
+    readable, _, _ = select.select([terminal_fd], [], [], 0.05)
+    if readable:
+        try:
+            output.extend(os.read(terminal_fd, 4096))
+        except OSError:
+            pass
+    if process.poll() is not None:
+        completed = True
+        break
+
+if not completed:
+    record_diagnostic(f"timeout_poll={process.poll()}")
+    record_diagnostic(f"terminal_output={output.decode(errors='replace')[-2000:]!r}")
+    kill_owned_processes()
+    process.wait()
+else:
+    kill_owned_processes()
+try:
+    while True:
+        chunk = os.read(terminal_fd, 4096)
+        if not chunk:
+            break
+        output.extend(chunk)
+except OSError:
+    pass
+os.close(terminal_fd)
+
+input_path = os.path.join(sync_dir, "interactive.input")
+terminal_input = ""
+if os.path.exists(input_path):
+    with open(input_path, encoding="utf-8") as input_file:
+        terminal_input = input_file.read().strip()
+text = output.decode(errors="replace").replace("\r", "")
+job_notice = any(
+    line.startswith("[") and len(line) > 1 and line[1].isdigit()
+    for line in text.splitlines()
+)
+print(f"started={'yes' if started else 'no'}")
+print(f"completed={'yes' if completed else 'no'}")
+print(f"input={terminal_input}")
+print(f"job_notice={'yes' if job_notice else 'no'}")
+print(f"owned_session_isolated={'yes' if owned_session != driver_session else 'no'}")
+print(f"foreground_group_owned={'yes' if foreground_group_owned else 'no'}")
+if not completed:
+    print(f"terminal_output={text[-2000:]!r}")
+if scenario == "cancel" and os.path.exists(cancel_result):
+    with open(cancel_result, encoding="utf-8") as result_file:
+        print(result_file.read().strip())
+else:
+    print(f"ready_rc={'0' if '__READY_RC__=0' in text else 'missing'}")
+PYTHON
+
+echo "=== sley: interactive sourced ready ==="
+
+rm -f "$sync_dir"/*
+interactive_data=$(python3 "$interactive_driver" \
+  "$(command -v bash)" \
+  "$SLEY_REPO_ROOT" \
+  "$repo" \
+  "$home" \
+  "$config" \
+  "$home/cache" \
+  "$ready_tmp" \
+  "$sync_dir" \
+  "$formatter" \
+  normal \
+  "$interactive_cancel_harness" \
+  "$ready_tmp/unused-interactive-cancel-result")
+if [[ "$(_result_value completed "$interactive_data")" != "yes" ]]; then
+  printf '%s\n' "$interactive_data" >&2
+  [[ ! -e "$sync_dir/interactive-driver-normal.diagnostics" ]] ||
+    cat "$sync_dir/interactive-driver-normal.diagnostics" >&2
+fi
+_assert_eq "ready interactive: reaches terminal-reading extension" \
+  "yes" "$(_result_value started "$interactive_data")"
+_assert_eq "ready interactive: reads from the caller terminal" \
+  "input from terminal" "$(_result_value input "$interactive_data")"
+_assert_eq "ready interactive: sourced call returns" \
+  "yes" "$(_result_value completed "$interactive_data")"
+_assert_eq "ready interactive: exits successfully" \
+  "0" "$(_result_value ready_rc "$interactive_data")"
+_assert_eq "ready interactive: emits no job-status notification" \
+  "no" "$(_result_value job_notice "$interactive_data")"
+_assert_eq "ready interactive: driver isolates the child session" \
+  "yes" "$(_result_value owned_session_isolated "$interactive_data")"
+_assert_eq "ready interactive: foreground group belongs to the child session" \
+  "yes" "$(_result_value foreground_group_owned "$interactive_data")"
+rm -f "$ready_tmp"/sley-ready-* 2>/dev/null || true
+
+echo "=== sley: interactive Ctrl-C cleanup ==="
+
+printf 'staged content\n' >"$repo/tracked.txt"
+git -C "$repo" add tracked.txt
+printf 'unstaged content\n' >"$repo/tracked.txt"
+rm -f "$sync_dir"/* "$ready_tmp"/sley-ready-* "$ready_tmp"/sley-fix-bak.* 2>/dev/null || true
+interactive_cancel_result=$(_tmpdir)/interactive-cancel.result
+interactive_cancel_data=$(python3 "$interactive_driver" \
+  "$(command -v bash)" \
+  "$SLEY_REPO_ROOT" \
+  "$repo" \
+  "$home" \
+  "$config" \
+  "$home/cache" \
+  "$ready_tmp" \
+  "$sync_dir" \
+  "$formatter" \
+  cancel \
+  "$interactive_cancel_harness" \
+  "$interactive_cancel_result")
+if [[ "$(_result_value completed "$interactive_cancel_data")" != "yes" ]]; then
+  printf '%s\n' "$interactive_cancel_data" >&2
+  [[ ! -e "$sync_dir/interactive-driver-cancel.diagnostics" ]] ||
+    cat "$sync_dir/interactive-driver-cancel.diagnostics" >&2
+fi
+_assert_eq "ready interactive Ctrl-C: formatter starts" \
+  "yes" "$(_result_value started "$interactive_cancel_data")"
+_assert_eq "ready interactive Ctrl-C: sourced call returns" \
+  "yes" "$(_result_value completed "$interactive_cancel_data")"
+_assert_eq "ready interactive Ctrl-C: returns conventional signal status" \
+  "130" "$(_result_value ready_rc "$interactive_cancel_data")"
+_assert_eq "ready interactive Ctrl-C: cleanup completes after duplicate INT" \
+  "yes" "$(_result_value cleanup_done "$interactive_cancel_data")"
+_assert_eq "ready interactive Ctrl-C: restores partial worktree file" \
+  "unstaged content" "$(cat "$repo/tracked.txt")"
+_assert_eq "ready interactive Ctrl-C: removes backup artifact" \
+  "0" "$(_result_value fix_backup_count "$interactive_cancel_data")"
+_assert_eq "ready interactive Ctrl-C: removes ready artifacts" \
+  "0" "$(_result_value artifact_count "$interactive_cancel_data")"
+_assert_eq "ready interactive Ctrl-C: emits no job-status notification" \
+  "no" "$(_result_value job_notice "$interactive_cancel_data")"
+rm -f "$ready_tmp"/sley-ready-* "$ready_tmp"/sley-fix-bak.* 2>/dev/null || true
 
 failure_output=$(_tmpdir)/failure.out
 failure_result=$(_tmpdir)/failure.result
@@ -191,8 +697,646 @@ _assert_eq "ready failure: leaks no cleanup globals" "yes" "$(_result_value clea
 _assert_eq "ready failure: leaves no temporary artifacts" "0" "$(_result_value artifact_count "$failure_data")"
 _assert_contains "ready failure: keeps actionable phase output" "phase-a blocked" "$(cat "$failure_output")"
 
+background_harness=$(_tmpdir)/ready-background-return-harness
+cat >"$background_harness" <<'HARNESS'
+#!/usr/bin/env bash
+
+root="$1"
+background_pid_file="$2"
+
+# shellcheck disable=SC1090 # The test supplies the checkout under test.
+source "$root/lib/sley/sley.sh"
+
+_sley_ready_impl() {
+  sleep 30 >/dev/null 2>&1 &
+  printf '%s\n' "$!" >"$background_pid_file"
+  return 0
+}
+
+sley_ready
+HARNESS
+chmod +x "$background_harness"
+
+echo "=== sley: worker completion isolation ==="
+
+background_pid_file=$(_tmpdir)/background.pid
+background_run_rc=0
+_with_timeout 3 bash --noprofile --norc \
+  "$background_harness" "$SLEY_REPO_ROOT" "$background_pid_file" || background_run_rc=$?
+if [[ -s "$background_pid_file" ]]; then
+  background_pid=$(cat "$background_pid_file")
+  kill -KILL "$background_pid" 2>/dev/null || true
+fi
+_assert_eq "ready completion: inherited background descriptors do not block return" \
+  "0" "$background_run_rc"
+
+completion_window_harness=$(_tmpdir)/ready-completion-window-harness
+cat >"$completion_window_harness" <<'HARNESS'
+#!/usr/bin/env bash
+
+root="$1"
+result="$2"
+
+# shellcheck disable=SC1090 # The test supplies the checkout under test.
+source "$root/lib/sley/sley.sh"
+
+_sley_ready_process_identity() { return 1; }
+_sley_ready_process_tree() { return 1; }
+_sley_ready_impl() { return 0; }
+
+outer_pid=$BASHPID
+completion_signal_injected=0
+wait() {
+  local wait_rc
+  if builtin wait "$@"; then
+    wait_rc=0
+  else
+    wait_rc=$?
+  fi
+  if [[ "$BASHPID" == "$outer_pid" && "$completion_signal_injected" == "0" ]]; then
+    completion_signal_injected=1
+    kill -TERM "$BASHPID"
+  fi
+  return "$wait_rc"
+}
+
+sley_ready
+ready_rc=$?
+printf 'ready_rc=%s\n' "$ready_rc" >"$result"
+HARNESS
+chmod +x "$completion_window_harness"
+
+completion_window_result=$(_tmpdir)/completion-window.result
+completion_window_run_rc=0
+_with_timeout 3 bash --noprofile --norc \
+  "$completion_window_harness" "$SLEY_REPO_ROOT" "$completion_window_result" ||
+  completion_window_run_rc=$?
+completion_window_data=""
+[[ ! -e "$completion_window_result" ]] || completion_window_data=$(cat "$completion_window_result")
+_assert_eq "ready completion signal: sourced caller returns within bound" \
+  "0" "$completion_window_run_rc"
+_assert_eq "ready completion signal: preserves conventional signal status" \
+  "143" "$(_result_value ready_rc "$completion_window_data")"
+
+worker_kill_harness=$(_tmpdir)/ready-worker-kill-harness
+cat >"$worker_kill_harness" <<'HARNESS'
+#!/usr/bin/env bash
+
+root="$1"
+result="$2"
+worker_pid_file="$3"
+
+# shellcheck disable=SC1090 # The test supplies the checkout under test.
+source "$root/lib/sley/sley.sh"
+
+_sley_ready_impl() {
+  printf '%s\n' "$BASHPID" >"$worker_pid_file"
+  while :; do :; done
+}
+
+sley_ready
+ready_rc=$?
+printf 'ready_rc=%s\n' "$ready_rc" >"$result"
+HARNESS
+chmod +x "$worker_kill_harness"
+
+worker_kill_driver=$(_tmpdir)/ready-worker-kill-driver.py
+cat >"$worker_kill_driver" <<'PYTHON'
+import glob
+import os
+import signal
+import subprocess
+import sys
+import time
+
+bash, harness, root, result, worker_pid_file, tmpdir = sys.argv[1:]
+env = os.environ.copy()
+env["TMPDIR"] = tmpdir
+process = subprocess.Popen(
+    [bash, "--noprofile", "--norc", harness, root, result, worker_pid_file],
+    env=env,
+    stdout=subprocess.DEVNULL,
+    stderr=subprocess.DEVNULL,
+    start_new_session=True,
+)
+
+
+def wait_for(predicate, timeout):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.02)
+    return predicate()
+
+
+started = wait_for(lambda: os.path.exists(worker_pid_file), 5)
+if started:
+    with open(worker_pid_file, encoding="ascii") as pid_file:
+        os.kill(int(pid_file.read().strip()), signal.SIGKILL)
+
+completed = True
+try:
+    process.wait(timeout=5)
+except subprocess.TimeoutExpired:
+    completed = False
+finally:
+    if process.poll() is None:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        process.wait()
+
+result_text = ""
+if os.path.exists(result):
+    with open(result, encoding="utf-8") as result_file:
+        result_text = result_file.read().strip()
+artifact_count = len(glob.glob(os.path.join(tmpdir, "sley-ready-supervisor.*")))
+print(f"started={'yes' if started else 'no'}")
+print(f"completed={'yes' if completed else 'no'}")
+print(f"process_rc={process.returncode}")
+print(f"artifact_count={artifact_count}")
+print(result_text)
+PYTHON
+
+echo "=== sley: untrappable worker termination ==="
+
+worker_kill_result=$(_tmpdir)/worker-kill.result
+worker_kill_pid_file=$(_tmpdir)/worker-kill.pid
+worker_kill_data=$(_with_timeout 8 python3 "$worker_kill_driver" \
+  "$(command -v bash)" \
+  "$worker_kill_harness" \
+  "$SLEY_REPO_ROOT" \
+  "$worker_kill_result" \
+  "$worker_kill_pid_file" \
+  "$ready_tmp")
+_assert_eq "ready worker KILL: worker starts" \
+  "yes" "$(_result_value started "$worker_kill_data")"
+_assert_eq "ready worker KILL: sourced caller returns within bound" \
+  "yes" "$(_result_value completed "$worker_kill_data")"
+_assert_eq "ready worker KILL: preserves worker signal status" \
+  "137" "$(_result_value ready_rc "$worker_kill_data")"
+_assert_eq "ready worker KILL: harness exits after observing status" \
+  "0" "$(_result_value process_rc "$worker_kill_data")"
+_assert_eq "ready worker KILL: removes supervisor artifacts" \
+  "0" "$(_result_value artifact_count "$worker_kill_data")"
+
+startup_failure_harness=$(_tmpdir)/ready-startup-failure-harness
+cat >"$startup_failure_harness" <<'HARNESS'
+#!/usr/bin/env bash
+
+root="$1"
+result="$2"
+forced_status_dir="$3"
+
+# shellcheck disable=SC1090 # The test supplies the checkout under test.
+source "$root/lib/sley/sley.sh"
+
+mktemp() {
+  if [[ "${1:-}" == "-d" && "${2:-}" == */sley-ready-supervisor.XXXXXX ]]; then
+    printf '%s\n' "$forced_status_dir"
+  else
+    command mktemp "$@"
+  fi
+}
+_sley_ready_impl() { return 0; }
+
+sley_ready >/dev/null 2>&1
+ready_rc=$?
+printf 'ready_rc=%s\n' "$ready_rc" >"$result"
+HARNESS
+chmod +x "$startup_failure_harness"
+
+startup_failure_driver=$(_tmpdir)/ready-startup-failure-driver.py
+cat >"$startup_failure_driver" <<'PYTHON'
+import os
+import signal
+import subprocess
+import sys
+import time
+
+bash, harness, root, result, forced_status_dir = sys.argv[1:]
+os.makedirs(os.path.join(forced_status_dir, "worker-gate"))
+process = subprocess.Popen(
+    [bash, "--noprofile", "--norc", harness, root, result, forced_status_dir],
+    stdout=subprocess.DEVNULL,
+    stderr=subprocess.DEVNULL,
+    start_new_session=True,
+)
+session_id = process.pid
+completed = True
+try:
+    process.wait(timeout=5)
+except subprocess.TimeoutExpired:
+    completed = False
+
+
+def session_processes():
+    if os.path.isdir("/proc"):
+        candidates = [int(name) for name in os.listdir("/proc") if name.isdigit()]
+    else:
+        output = subprocess.check_output(
+            ["/bin/ps", "-A", "-o", "pid="], text=True, stderr=subprocess.DEVNULL
+        )
+        candidates = [int(value) for value in output.split() if value.isdigit()]
+    members = []
+    for pid in candidates:
+        try:
+            if os.getsid(pid) == session_id:
+                members.append(pid)
+        except OSError:
+            pass
+    return members
+
+
+time.sleep(0.1)
+leftovers = session_processes()
+if process.poll() is None or leftovers:
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    if process.poll() is None:
+        process.wait()
+
+result_text = ""
+if os.path.exists(result):
+    with open(result, encoding="utf-8") as result_file:
+        result_text = result_file.read().strip()
+print(f"completed={'yes' if completed else 'no'}")
+print(f"leftover_count={len(leftovers)}")
+print(f"artifact_exists={'yes' if os.path.exists(forced_status_dir) else 'no'}")
+print(result_text)
+PYTHON
+
+echo "=== sley: supervisor startup publication failure ==="
+
+startup_failure_result=$(_tmpdir)/startup-failure.result
+forced_status_dir=$ready_tmp/forced-sley-ready-supervisor
+startup_failure_data=$(_with_timeout 8 python3 "$startup_failure_driver" \
+  "$(command -v bash)" \
+  "$startup_failure_harness" \
+  "$SLEY_REPO_ROOT" \
+  "$startup_failure_result" \
+  "$forced_status_dir")
+_assert_eq "ready startup failure: sourced caller returns within bound" \
+  "yes" "$(_result_value completed "$startup_failure_data")"
+_assert_eq "ready startup failure: returns internal-error status" \
+  "2" "$(_result_value ready_rc "$startup_failure_data")"
+_assert_eq "ready startup failure: leaves no helper processes" \
+  "0" "$(_result_value leftover_count "$startup_failure_data")"
+_assert_eq "ready startup failure: removes private protocol directory" \
+  "no" "$(_result_value artifact_exists "$startup_failure_data")"
+
+startup_signal_harness=$(_tmpdir)/ready-startup-signal-harness
+cat >"$startup_signal_harness" <<'HARNESS'
+#!/usr/bin/env bash
+
+root="$1"
+result="$2"
+
+# shellcheck disable=SC1090 # The test supplies the checkout under test.
+source "$root/lib/sley/sley.sh"
+
+outer_pid=$BASHPID
+sleep() {
+  if [[ "$BASHPID" != "$outer_pid" ]]; then
+    : >"$SLEY_READY_STARTUP_SYNC/worker-waiting"
+  fi
+  command sleep "$@"
+}
+trap ':' TERM
+before_term=$(trap -p TERM)
+sley_ready >/dev/null 2>&1
+ready_rc=$?
+traps_restored=no
+[[ "$before_term" == "$(trap -p TERM)" ]] && traps_restored=yes
+{
+  printf 'ready_rc=%s\n' "$ready_rc"
+  printf 'traps_restored=%s\n' "$traps_restored"
+} >"$result"
+HARNESS
+chmod +x "$startup_signal_harness"
+
+startup_signal_bin=$(_tmpdir)
+startup_signal_sync=$(_tmpdir)
+real_cat=$(command -v cat)
+cat >"$startup_signal_bin/cat" <<WRAPPER
+#!/usr/bin/env bash
+: >"\$SLEY_READY_STARTUP_SYNC/reader-started"
+deadline=\$((SECONDS + 2))
+while ((SECONDS < deadline)); do :; done
+exec "$real_cat" "\$@"
+WRAPPER
+chmod +x "$startup_signal_bin/cat"
+
+startup_signal_driver=$(_tmpdir)/ready-startup-signal-driver.py
+cat >"$startup_signal_driver" <<'PYTHON'
+import glob
+import os
+import signal
+import subprocess
+import sys
+import time
+
+bash, harness, root, result, sync_dir, tmpdir = sys.argv[1:]
+process = subprocess.Popen(
+    [bash, "--noprofile", "--norc", harness, root, result],
+    stdout=subprocess.DEVNULL,
+    stderr=subprocess.DEVNULL,
+    start_new_session=True,
+)
+session_id = process.pid
+
+
+def wait_for(predicate, timeout):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.02)
+    return predicate()
+
+
+started = wait_for(
+    lambda: os.path.exists(os.path.join(sync_dir, "reader-started"))
+    and os.path.exists(os.path.join(sync_dir, "worker-waiting")),
+    5,
+)
+if started:
+    os.kill(process.pid, signal.SIGTERM)
+
+completed = True
+try:
+    process.wait(timeout=5)
+except subprocess.TimeoutExpired:
+    completed = False
+
+
+def session_processes():
+    if os.path.isdir("/proc"):
+        candidates = [int(name) for name in os.listdir("/proc") if name.isdigit()]
+    else:
+        output = subprocess.check_output(
+            ["/bin/ps", "-A", "-o", "pid="], text=True, stderr=subprocess.DEVNULL
+        )
+        candidates = [int(value) for value in output.split() if value.isdigit()]
+    members = []
+    for pid in candidates:
+        try:
+            if os.getsid(pid) == session_id:
+                members.append(pid)
+        except OSError:
+            pass
+    return members
+
+
+time.sleep(0.1)
+leftovers = session_processes()
+if process.poll() is None or leftovers:
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    if process.poll() is None:
+        process.wait()
+
+result_text = ""
+if os.path.exists(result):
+    with open(result, encoding="utf-8") as result_file:
+        result_text = result_file.read().strip()
+artifact_count = len(glob.glob(os.path.join(tmpdir, "sley-ready-supervisor.*")))
+print(f"started={'yes' if started else 'no'}")
+print(f"completed={'yes' if completed else 'no'}")
+print(f"leftover_count={len(leftovers)}")
+print(f"artifact_count={artifact_count}")
+print(result_text)
+PYTHON
+
+echo "=== sley: signal during supervisor startup ==="
+
+startup_signal_result=$(_tmpdir)/startup-signal.result
+startup_signal_data=$(PATH="$startup_signal_bin:$PATH" \
+  SLEY_READY_STARTUP_SYNC="$startup_signal_sync" \
+  TMPDIR="$ready_tmp" \
+  _with_timeout 8 python3 "$startup_signal_driver" \
+  "$(command -v bash)" \
+  "$startup_signal_harness" \
+  "$SLEY_REPO_ROOT" \
+  "$startup_signal_result" \
+  "$startup_signal_sync" \
+  "$ready_tmp")
+_assert_eq "ready startup signal: worker and reader reach startup window" \
+  "yes" "$(_result_value started "$startup_signal_data")"
+_assert_eq "ready startup signal: sourced caller returns within bound" \
+  "yes" "$(_result_value completed "$startup_signal_data")"
+_assert_eq "ready startup signal: preserves conventional signal status" \
+  "143" "$(_result_value ready_rc "$startup_signal_data")"
+_assert_eq "ready startup signal: restores caller trap" \
+  "yes" "$(_result_value traps_restored "$startup_signal_data")"
+_assert_eq "ready startup signal: leaves no helper processes" \
+  "0" "$(_result_value leftover_count "$startup_signal_data")"
+_assert_eq "ready startup signal: removes supervisor artifacts" \
+  "0" "$(_result_value artifact_count "$startup_signal_data")"
+
+identity_harness=$(_tmpdir)/ready-identity-harness
+cat >"$identity_harness" <<'HARNESS'
+#!/usr/bin/env bash
+
+root="$1"
+sync_dir="$2"
+system_ps="${3:-}"
+
+# shellcheck disable=SC1090 # The test supplies the checkout under test.
+source "$root/lib/sley/sley.sh"
+
+complex_stat='123 (command ) with ) spaces) S 42 123 123 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 98765'
+_sley_ready_proc_pid=""
+_sley_ready_proc_parent=""
+_sley_ready_proc_identity=""
+if _sley_ready_parse_proc_stat 123 "$complex_stat" 2>/dev/null &&
+  [[ "$_sley_ready_proc_pid" == "123" &&
+    "$_sley_ready_proc_parent" == "42" &&
+    "$_sley_ready_proc_identity" == "proc:98765" ]]; then
+  printf 'complex_proc_stat_parsed=yes\n'
+else
+  printf 'complex_proc_stat_parsed=no\n'
+fi
+
+if [[ -r /proc/self/stat ]]; then
+  _sley_ready_ps() { return 127; }
+fi
+
+worker_pid=""
+cleanup_worker() {
+  [[ -n "$worker_pid" ]] || return 0
+  kill -KILL "$worker_pid" 2>/dev/null || true
+  wait "$worker_pid" 2>/dev/null || true
+}
+trap cleanup_worker EXIT
+
+(
+  : >"$sync_dir/identity.started"
+  while [[ ! -e "$sync_dir/identity.exec" ]]; do
+    :
+  done
+  exec sleep 300
+) &
+worker_pid=$!
+while [[ ! -e "$sync_dir/identity.started" ]]; do
+  :
+done
+worker_identity=$(_sley_ready_process_identity "$worker_pid") || exit 1
+if _sley_ready_process_tree "$worker_pid" "stale:$worker_identity" >/dev/null 2>&1; then
+  printf 'stale_identity_rejected=no\n'
+else
+  printf 'stale_identity_rejected=yes\n'
+fi
+proc_tree_without_ps=yes
+if ! process_tree=$(_sley_ready_process_tree "$worker_pid" "$worker_identity"); then
+  proc_tree_without_ps=no
+  process_tree="$worker_pid"$'\t'"$worker_identity"
+fi
+printf 'proc_tree_without_ps=%s\n' "$proc_tree_without_ps"
+: >"$sync_dir/identity.exec"
+exec_observed=no
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+  if [[ -r "/proc/$worker_pid/comm" ]]; then
+    worker_command=$(<"/proc/$worker_pid/comm")
+  else
+    worker_command=$("$system_ps" -p "$worker_pid" -o comm= 2>/dev/null || true)
+  fi
+  if [[ "$worker_command" == *sleep* ]]; then
+    exec_observed=yes
+    break
+  fi
+  sleep 0.02
+done
+printf 'exec_observed=%s\n' "$exec_observed"
+_sley_ready_signal_processes KILL "$process_tree"
+exec_survivor=yes
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+  if [[ -r "/proc/$worker_pid/stat" ]]; then
+    { worker_stat=$(<"/proc/$worker_pid/stat"); } 2>/dev/null || worker_stat=""
+    worker_stat=${worker_stat##*) }
+    worker_state=${worker_stat%% *}
+  else
+    worker_state=$("$system_ps" -p "$worker_pid" -o stat= 2>/dev/null || true)
+  fi
+  if [[ -z "$worker_state" || "$worker_state" == *Z* ]]; then
+    exec_survivor=no
+    break
+  fi
+  sleep 0.02
+done
+if [[ "$exec_survivor" == "yes" ]]; then
+  printf 'exec_survivor=yes\n'
+else
+  printf 'exec_survivor=no\n'
+fi
+wait "$worker_pid" 2>/dev/null || true
+worker_pid=""
+HARNESS
+chmod +x "$identity_harness"
+
+echo "=== sley: process identity across exec ==="
+
+rm -f "$sync_dir"/identity.*
+restricted_path=$(_tmpdir)
+for restricted_tool in bash dirname sleep; do
+  ln -s "$(command -v "$restricted_tool")" "$restricted_path/$restricted_tool"
+done
+identity_data=$(PATH="$restricted_path" \
+  "$restricted_path/bash" --noprofile --norc \
+  "$identity_harness" "$SLEY_REPO_ROOT" "$sync_dir" "$system_ps")
+_assert_eq "ready identity: parses complex proc stat command names" \
+  "yes" "$(_result_value complex_proc_stat_parsed "$identity_data")"
+if [[ -r /proc/self/stat ]]; then
+  _assert_eq "ready identity: discovers process trees without ps" \
+    "yes" "$(_result_value proc_tree_without_ps "$identity_data")"
+fi
+_assert_eq "ready identity: fixture observes the exec transition" \
+  "yes" "$(_result_value exec_observed "$identity_data")"
+_assert_eq "ready identity: stale launch identity is rejected" \
+  "yes" "$(_result_value stale_identity_rejected "$identity_data")"
+_assert_eq "ready identity: owned exec survivor remains signalable" \
+  "no" "$(_result_value exec_survivor "$identity_data")"
+
+errexit_harness=$(_tmpdir)/ready-errexit-harness
+cat >"$errexit_harness" <<'HARNESS'
+#!/usr/bin/env bash
+
+root="$1"
+result="$2"
+
+# shellcheck disable=SC1090 # The test supplies the checkout under test.
+source "$root/lib/sley/sley.sh"
+
+trap ':' INT
+trap ':' TERM
+trap ':' HUP
+before_int=$(trap -p INT)
+before_term=$(trap -p TERM)
+before_hup=$(trap -p HUP)
+
+record_exit() {
+  local ready_rc="$1" traps_restored=no
+  if [[ "$before_int" == "$(trap -p INT)" &&
+    "$before_term" == "$(trap -p TERM)" &&
+    "$before_hup" == "$(trap -p HUP)" ]]; then
+    traps_restored=yes
+  fi
+  {
+    printf 'ready_rc=%s\n' "$ready_rc"
+    printf 'traps_restored=%s\n' "$traps_restored"
+    case "$-" in
+      *e*) printf 'errexit_preserved=yes\n' ;;
+      *) printf 'errexit_preserved=no\n' ;;
+    esac
+  } >"$result"
+}
+trap 'record_exit "$?"' EXIT
+
+set -e
+sley_ready \
+  --exclude status \
+  --exclude check \
+  --exclude secrets \
+  --exclude verify >/dev/null 2>&1
+exit 99
+HARNESS
+chmod +x "$errexit_harness"
+
+echo "=== sley: ready caller errexit cleanup ==="
+
+errexit_result=$(_tmpdir)/errexit.result
+errexit_was_set=0
+[[ "$-" == *e* ]] && errexit_was_set=1
+set +e
+(
+  cd "$repo" || exit 1
+  HOME="$home" \
+    XDG_CONFIG_HOME="$config" \
+    XDG_CACHE_HOME="$home/cache" \
+    GIT_CONFIG_GLOBAL="$repo/.gitconfig-test" \
+    SLEY_READY_TEST_MODE=failure \
+    SLEY_READY_SYNC="$sync_dir" \
+    TMPDIR="$ready_tmp" \
+    bash --noprofile --norc "$errexit_harness" "$SLEY_REPO_ROOT" "$errexit_result"
+)
+errexit_process_rc=$?
+[[ "$errexit_was_set" == "1" ]] && set -e
+errexit_data=$(cat "$errexit_result")
+_assert_eq "ready errexit: preserves blocking status" "1" "$errexit_process_rc"
+_assert_eq "ready errexit: restores caller traps before shell exit" \
+  "yes" "$(_result_value traps_restored "$errexit_data")"
+_assert_eq "ready errexit: preserves caller option" \
+  "yes" "$(_result_value errexit_preserved "$errexit_data")"
+
 signal_driver=$(_tmpdir)/ready-signal-driver.py
 cat >"$signal_driver" <<'PYTHON'
+import atexit
 import glob
 import os
 import signal
@@ -210,6 +1354,7 @@ import time
     cache,
     tmpdir,
     sync_dir,
+    mode,
     signal_name,
     output,
     result,
@@ -223,21 +1368,123 @@ env.update(
         "XDG_CONFIG_HOME": config,
         "XDG_CACHE_HOME": cache,
         "GIT_CONFIG_GLOBAL": os.path.join(repo, ".gitconfig-test"),
-        "SLEY_READY_TEST_MODE": "long",
+        "SLEY_READY_TEST_MODE": "long" if mode == "identity-unavailable" else mode,
+        "SLEY_READY_TEST_NO_IDENTITY": "1" if mode == "identity-unavailable" else "0",
         "SLEY_READY_SYNC": sync_dir,
+        "SLEY_READY_FORMATTER": os.environ["SLEY_READY_FORMATTER"],
         "SLEY_READY_TRAP_LOG": trap_log,
         "TMPDIR": tmpdir,
     }
 )
 
-with open(output, "wb") as output_file:
-    process = subprocess.Popen(
-        [bash, "--noprofile", "--norc", harness, root, output, result],
-        cwd=repo,
-        env=env,
-        stdout=output_file,
-        stderr=subprocess.STDOUT,
-    )
+process = None
+owned_session = None
+owned_pids = set()
+owned_groups = set()
+driver_session = os.getsid(0)
+
+
+def remember_owned_pid(pid):
+    if owned_session is None or pid == os.getpid():
+        return False
+    try:
+        if os.getsid(pid) != owned_session:
+            return False
+        owned_pids.add(pid)
+        owned_groups.add(os.getpgid(pid))
+        return True
+    except OSError:
+        return False
+
+
+def discover_owned_processes():
+    if os.path.isdir("/proc"):
+        try:
+            entries = os.scandir("/proc")
+        except OSError:
+            return
+        with entries:
+            for entry in entries:
+                if entry.name.isdigit():
+                    remember_owned_pid(int(entry.name))
+        return
+    ps_command = os.environ.get("SLEY_READY_SYSTEM_PS")
+    if not ps_command:
+        return
+    try:
+        pid_output = subprocess.check_output(
+            [ps_command, "-A", "-o", "pid="],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return
+    for pid_text in pid_output.split():
+        if pid_text.isdigit():
+            remember_owned_pid(int(pid_text))
+
+
+def kill_owned_processes():
+    if owned_session is None or owned_session == driver_session:
+        return
+    for _ in range(3):
+        discover_owned_processes()
+        for pid in tuple(owned_pids):
+            remember_owned_pid(pid)
+        for process_group in tuple(owned_groups):
+            try:
+                os.killpg(process_group, signal.SIGKILL)
+            except OSError:
+                pass
+        for pid in tuple(owned_pids):
+            try:
+                if os.getsid(pid) == owned_session:
+                    os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
+        time.sleep(0.02)
+
+
+def cleanup_owned_session():
+    if owned_session is not None:
+        kill_owned_processes()
+    elif process is not None:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except OSError:
+            pass
+
+
+def interrupted(_signal_number, _frame):
+    raise SystemExit(1)
+
+
+atexit.register(cleanup_owned_session)
+handled_signals = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
+for handled_signal in handled_signals:
+    signal.signal(handled_signal, interrupted)
+
+previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, handled_signals)
+try:
+    with open(output, "wb") as output_file:
+        process = subprocess.Popen(
+            [bash, "--noprofile", "--norc", harness, root, output, result],
+            cwd=repo,
+            env=env,
+            stdout=output_file,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+            preexec_fn=lambda: signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask),
+        )
+    owned_session = os.getsid(process.pid)
+    if owned_session != process.pid or owned_session == driver_session:
+        raise RuntimeError(
+            f"child session is not isolated: pid={process.pid} sid={owned_session} "
+            f"driver_sid={driver_session}"
+        )
+    remember_owned_pid(process.pid)
+finally:
+    signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
 
 
 def wait_for(predicate, timeout):
@@ -250,15 +1497,31 @@ def wait_for(predicate, timeout):
 
 
 phase_names = ("phase-a", "phase-b")
-started = wait_for(
-    lambda: all(os.path.exists(os.path.join(sync_dir, f"{name}.started")) for name in phase_names),
-    5,
-)
 pids = []
-if started:
+descendant_pids = []
+formatter_pids = []
+if mode == "format-long":
+    started = wait_for(lambda: os.path.exists(os.path.join(sync_dir, "formatter.started")), 5)
+else:
+    started = wait_for(
+        lambda: all(os.path.exists(os.path.join(sync_dir, f"{name}.started")) for name in phase_names),
+        5,
+    )
+if started and mode != "format-long":
     for name in phase_names:
         with open(os.path.join(sync_dir, f"{name}.pid"), encoding="ascii") as pid_file:
             pids.append(int(pid_file.read().strip()))
+            remember_owned_pid(pids[-1])
+        descendant_path = os.path.join(sync_dir, f"{name}.descendant.pid")
+        if os.path.exists(descendant_path):
+            with open(descendant_path, encoding="ascii") as pid_file:
+                descendant_pids.append(int(pid_file.read().strip()))
+                remember_owned_pid(descendant_pids[-1])
+if started and mode == "format-long":
+    with open(os.path.join(sync_dir, "formatter.pid"), encoding="ascii") as pid_file:
+        formatter_pids.append(int(pid_file.read().strip()))
+        remember_owned_pid(formatter_pids[-1])
+if started:
     os.kill(process.pid, getattr(signal, f"SIG{signal_name}"))
 
 completed = True
@@ -279,29 +1542,38 @@ def pid_exists(pid):
 
 
 children_gone = wait_for(lambda: all(not pid_exists(pid) for pid in pids), 2)
+descendants_gone = wait_for(lambda: all(not pid_exists(pid) for pid in descendant_pids), 2)
+formatters_gone = wait_for(lambda: all(not pid_exists(pid) for pid in formatter_pids), 2)
+term_cleanup_done = all(
+    os.path.exists(os.path.join(sync_dir, f"{name}.term-cleanup")) for name in phase_names
+)
 artifacts = sorted(glob.glob(os.path.join(tmpdir, "sley-ready-*")))
+fix_backups = sorted(glob.glob(os.path.join(tmpdir, "sley-fix-bak.*")))
 trap_fired = os.path.exists(trap_log) and os.path.getsize(trap_log) > 0
 result_text = ""
 if os.path.exists(result):
     with open(result, encoding="utf-8") as result_file:
         result_text = result_file.read().strip()
 
-# A failing implementation must not leave the test's synthetic workers alive.
-for pid in pids:
-    if pid_exists(pid):
-        try:
-            os.kill(pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-if process.poll() is None:
-    process.kill()
+# The harness owns a dedicated session, including monitor-mode process groups.
+# Cleanup is also registered with atexit and signal handlers above, so errors
+# and test interruption cannot leave a synthetic worker tree behind.
+if process.poll() is None or any(
+    pid_exists(pid) for pid in pids + descendant_pids + formatter_pids
+):
+    kill_owned_processes()
 process.wait()
 
 print(f"started={'yes' if started else 'no'}")
 print(f"completed={'yes' if completed else 'no'}")
 print(f"children_gone={'yes' if children_gone else 'no'}")
+print(f"descendants_gone={'yes' if descendants_gone else 'no'}")
+print(f"formatters_gone={'yes' if formatters_gone else 'no'}")
+print(f"term_cleanup_done={'yes' if term_cleanup_done else 'no'}")
 print(f"artifact_count={len(artifacts)}")
+print(f"fix_backup_count={len(fix_backups)}")
 print(f"caller_trap_fired={'yes' if trap_fired else 'no'}")
+print(f"owned_session_isolated={'yes' if owned_session != driver_session else 'no'}")
 print(result_text)
 PYTHON
 
@@ -322,6 +1594,7 @@ for cancel_signal in INT TERM HUP; do
     "$home/cache" \
     "$ready_tmp" \
     "$sync_dir" \
+    long \
     "$cancel_signal" \
     "$cancel_output" \
     "$cancel_result" \
@@ -348,6 +1621,162 @@ for cancel_signal in INT TERM HUP; do
     "yes" "$(_result_value options_restored "$cancel_data")"
   _assert_eq "ready $cancel_signal: leaks no cleanup globals" \
     "yes" "$(_result_value cleanup_globals_absent "$cancel_data")"
+  _assert_eq "ready $cancel_signal: driver isolates the child session" \
+    "yes" "$(_result_value owned_session_isolated "$cancel_data")"
 done
+
+echo "=== sley: cancellation without process identity ==="
+
+rm -f "$sync_dir"/* "$ready_tmp"/sley-ready-* 2>/dev/null || true
+no_identity_output=$(_tmpdir)/no-identity-TERM.out
+no_identity_result=$(_tmpdir)/no-identity-TERM.result
+no_identity_trap_log=$(_tmpdir)/no-identity-TERM.traps
+no_identity_data=$(python3 "$signal_driver" \
+  "$(command -v bash)" \
+  "$harness" \
+  "$SLEY_REPO_ROOT" \
+  "$repo" \
+  "$home" \
+  "$config" \
+  "$home/cache" \
+  "$ready_tmp" \
+  "$sync_dir" \
+  identity-unavailable \
+  TERM \
+  "$no_identity_output" \
+  "$no_identity_result" \
+  "$no_identity_trap_log")
+_assert_eq "ready identity unavailable: phases start" \
+  "yes" "$(_result_value started "$no_identity_data")"
+_assert_eq "ready identity unavailable: sourced call returns" \
+  "yes" "$(_result_value completed "$no_identity_data")"
+_assert_eq "ready identity unavailable: returns conventional signal status" \
+  "143" "$(_result_value ready_rc "$no_identity_data")"
+_assert_eq "ready identity unavailable: direct phase children are gone" \
+  "yes" "$(_result_value children_gone "$no_identity_data")"
+_assert_eq "ready identity unavailable: leaves no temporary artifacts" \
+  "0" "$(_result_value artifact_count "$no_identity_data")"
+
+echo "=== sley: nested formatter cancellation cleanup ==="
+
+printf 'staged content\n' >"$repo/tracked.txt"
+git -C "$repo" add tracked.txt
+printf 'unstaged content\n' >"$repo/tracked.txt"
+rm -f "$sync_dir"/* "$ready_tmp"/sley-ready-* "$ready_tmp"/sley-fix-bak.* 2>/dev/null || true
+format_output=$(_tmpdir)/format-TERM.out
+format_result=$(_tmpdir)/format-TERM.result
+format_trap_log=$(_tmpdir)/format-TERM.traps
+format_data=$(python3 "$signal_driver" \
+  "$(command -v bash)" \
+  "$harness" \
+  "$SLEY_REPO_ROOT" \
+  "$repo" \
+  "$home" \
+  "$config" \
+  "$home/cache" \
+  "$ready_tmp" \
+  "$sync_dir" \
+  format-long \
+  TERM \
+  "$format_output" \
+  "$format_result" \
+  "$format_trap_log")
+_assert_eq "ready formatter TERM: formatter starts" "yes" "$(_result_value started "$format_data")"
+_assert_eq "ready formatter TERM: sourced call returns within timeout" \
+  "yes" "$(_result_value completed "$format_data")"
+_assert_eq "ready formatter TERM: returns conventional signal status" \
+  "143" "$(_result_value ready_rc "$format_data")"
+_assert_eq "ready formatter TERM: TERM-ignoring formatter is gone" \
+  "yes" "$(_result_value formatters_gone "$format_data")"
+_assert_eq "ready formatter TERM: restores partial worktree file" \
+  "unstaged content" "$(cat "$repo/tracked.txt")"
+_assert_eq "ready formatter TERM: removes backup artifact" \
+  "0" "$(_result_value fix_backup_count "$format_data")"
+_assert_eq "ready formatter TERM: removes ready artifacts" \
+  "0" "$(_result_value artifact_count "$format_data")"
+_assert_eq "ready formatter TERM: restores caller traps" \
+  "yes" "$(_result_value traps_restored "$format_data")"
+_assert_eq "ready formatter TERM: preserves caller shell options" \
+  "yes" "$(_result_value options_restored "$format_data")"
+
+echo "=== sley: descendant cancellation cleanup ==="
+
+for descendant_signal in INT TERM; do
+  rm -f "$sync_dir"/* "$ready_tmp"/sley-ready-* 2>/dev/null || true
+  descendant_output=$(_tmpdir)/"descendant-$descendant_signal.out"
+  descendant_result=$(_tmpdir)/"descendant-$descendant_signal.result"
+  descendant_trap_log=$(_tmpdir)/"descendant-$descendant_signal.traps"
+  descendant_data=$(python3 "$signal_driver" \
+    "$(command -v bash)" \
+    "$harness" \
+    "$SLEY_REPO_ROOT" \
+    "$repo" \
+    "$home" \
+    "$config" \
+    "$home/cache" \
+    "$ready_tmp" \
+    "$sync_dir" \
+    descendant \
+    "$descendant_signal" \
+    "$descendant_output" \
+    "$descendant_result" \
+    "$descendant_trap_log")
+  case "$descendant_signal" in
+    INT) descendant_expected_rc=130 ;;
+    TERM) descendant_expected_rc=143 ;;
+  esac
+  _assert_eq "ready descendant $descendant_signal: phases start" \
+    "yes" "$(_result_value started "$descendant_data")"
+  _assert_eq "ready descendant $descendant_signal: sourced call returns" \
+    "yes" "$(_result_value completed "$descendant_data")"
+  _assert_eq "ready descendant $descendant_signal: returns conventional signal status" \
+    "$descendant_expected_rc" "$(_result_value ready_rc "$descendant_data")"
+  _assert_eq "ready descendant $descendant_signal: phase children are gone" \
+    "yes" "$(_result_value children_gone "$descendant_data")"
+  _assert_eq "ready descendant $descendant_signal: phase descendants are gone" \
+    "yes" "$(_result_value descendants_gone "$descendant_data")"
+  _assert_eq "ready descendant $descendant_signal: leaves no temporary artifacts" \
+    "0" "$(_result_value artifact_count "$descendant_data")"
+  _assert_eq "ready descendant $descendant_signal: does not invoke caller trap" \
+    "no" "$(_result_value caller_trap_fired "$descendant_data")"
+  _assert_eq "ready descendant $descendant_signal: restores caller traps" \
+    "yes" "$(_result_value traps_restored "$descendant_data")"
+  _assert_eq "ready descendant $descendant_signal: preserves caller shell options" \
+    "yes" "$(_result_value options_restored "$descendant_data")"
+  _assert_eq "ready descendant $descendant_signal: leaks no cleanup globals" \
+    "yes" "$(_result_value cleanup_globals_absent "$descendant_data")"
+done
+
+echo "=== sley: cooperative phase TERM cleanup ==="
+
+rm -f "$sync_dir"/* "$ready_tmp"/sley-ready-* 2>/dev/null || true
+term_cleanup_output=$(_tmpdir)/term-cleanup.out
+term_cleanup_result=$(_tmpdir)/term-cleanup.result
+term_cleanup_trap_log=$(_tmpdir)/term-cleanup.traps
+term_cleanup_data=$(python3 "$signal_driver" \
+  "$(command -v bash)" \
+  "$harness" \
+  "$SLEY_REPO_ROOT" \
+  "$repo" \
+  "$home" \
+  "$config" \
+  "$home/cache" \
+  "$ready_tmp" \
+  "$sync_dir" \
+  term-cleanup \
+  TERM \
+  "$term_cleanup_output" \
+  "$term_cleanup_result" \
+  "$term_cleanup_trap_log")
+_assert_eq "ready cooperative TERM: phases start" \
+  "yes" "$(_result_value started "$term_cleanup_data")"
+_assert_eq "ready cooperative TERM: sourced call returns" \
+  "yes" "$(_result_value completed "$term_cleanup_data")"
+_assert_eq "ready cooperative TERM: returns conventional signal status" \
+  "143" "$(_result_value ready_rc "$term_cleanup_data")"
+_assert_eq "ready cooperative TERM: phase traps finish before escalation" \
+  "yes" "$(_result_value term_cleanup_done "$term_cleanup_data")"
+_assert_eq "ready cooperative TERM: leaves no temporary artifacts" \
+  "0" "$(_result_value artifact_count "$term_cleanup_data")"
 
 _test_summary
