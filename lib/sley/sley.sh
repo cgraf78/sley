@@ -521,7 +521,7 @@ _sley_fix() {
   # `sley fix` must use the same formatting policy as editor, agent, Git, and
   # Sapling hooks. Base installs route through autoformat; environment
   # extensions may override `sley_hook_format_file` for repo-native tools.
-  sley_hook_init
+  sley_hook_init || return $?
 
   if [[ "$_REPO_TYPE" == "git" && "$_SLEY_SCOPE_CHANGE" == "staged" ]]; then
     # Formatting a partially staged file rewrites the whole worktree file,
@@ -600,7 +600,7 @@ _sley_check() {
   # `sley check` owns the scoped file list. Extensions may swap in repo-local
   # lint/validate behavior, but must preserve this sley-selected scope when the
   # scoped flag is set; hooks can still use their faster hook defaults.
-  sley_hook_init
+  sley_hook_init || return $?
   sley_hook_lint "$runnable"
   case $? in
     0) ;;
@@ -1041,7 +1041,7 @@ _sley_hook() {
 
   case "$cmd" in
     changed-files)
-      sley_hook_init
+      sley_hook_init || return $?
       sley_hook_changed_files
       ;;
     format-file)
@@ -1050,7 +1050,7 @@ _sley_hook() {
         return 2
       }
       _sley_hook_cd_for_absolute_file_arg "$@" || return $?
-      sley_hook_init
+      sley_hook_init || return $?
       sley_hook_format_file "$@"
       ;;
     lint-file)
@@ -1059,7 +1059,7 @@ _sley_hook() {
         return 2
       }
       _sley_hook_cd_for_absolute_file_arg "$@" || return $?
-      sley_hook_init
+      sley_hook_init || return $?
       sley_hook_lint_file "$@"
       ;;
     format)
@@ -1068,7 +1068,7 @@ _sley_hook() {
         return 2
       }
       files=$(cat)
-      sley_hook_init
+      sley_hook_init || return $?
       sley_hook_format "$files"
       ;;
     lint)
@@ -1077,11 +1077,11 @@ _sley_hook() {
         return 2
       }
       files=$(cat)
-      sley_hook_init
+      sley_hook_init || return $?
       sley_hook_lint "$files"
       ;;
     validate)
-      sley_hook_init
+      sley_hook_init || return $?
       sley_hook_validate
       ;;
     -h | --help | help)

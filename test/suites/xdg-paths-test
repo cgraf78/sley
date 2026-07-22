@@ -97,6 +97,169 @@ printf 'changed\n' >>"$repo/app.txt"
 xdg_bin=$(_mock_bin)
 ln -s /usr/bin/git "$xdg_bin/git"
 
+action_log=$(_tmpdir)/actions.log
+: >"$action_log"
+cat >"$xdg_bin/autoformat" <<'EOF'
+#!/usr/bin/env bash
+printf 'format:%s\n' "$*" >>"$ACTION_LOG"
+EOF
+cat >"$xdg_bin/autolint" <<'EOF'
+#!/usr/bin/env bash
+printf 'lint:%s\n' "$*" >>"$ACTION_LOG"
+EOF
+chmod +x "$xdg_bin/autoformat" "$xdg_bin/autolint"
+
+for command in fix check; do
+  command_out=$(
+    cd "$repo" || exit 1
+    env -u HOME -u SLEY_EXTENSION_DIR ACTION_LOG="$action_log" \
+      XDG_CONFIG_HOME=relative/config XDG_CACHE_HOME="$(_tmpdir)/cache" \
+      GIT_CONFIG_GLOBAL="$repo/.gitconfig-test" PATH="$xdg_bin:$PATH" \
+      "$SLEY" "$command" 2>&1
+  )
+  command_rc=$?
+  _assert_exit "$command init: unresolved XDG fallback fails closed" 1 "$command_rc"
+  _assert_contains "$command init: failure explains extension path" \
+    "cannot resolve Sley extension directory" "$command_out"
+done
+_assert_eq "fix/check init: actions do not run after failure" "" "$(cat "$action_log")"
+
+clean_repo=$(_tmpdir)
+git -C "$clean_repo" init -q
+git -C "$clean_repo" config user.email test@test.local
+git -C "$clean_repo" config user.name "Test User"
+git -C "$clean_repo" config commit.gpgsign false
+mkdir -p "$clean_repo/.hooks"
+git -C "$clean_repo" config core.hooksPath "$clean_repo/.hooks"
+printf 'clean\n' >"$clean_repo/clean.txt"
+git -C "$clean_repo" add clean.txt
+git -C "$clean_repo" commit -q -m seed
+for command in fix check; do
+  command_out=$(
+    cd "$clean_repo" || exit 1
+    env -u HOME -u SLEY_EXTENSION_DIR ACTION_LOG="$action_log" \
+      XDG_CONFIG_HOME=relative/config XDG_CACHE_HOME="$(_tmpdir)/cache" \
+      GIT_CONFIG_GLOBAL="$clean_repo/.gitconfig-test" PATH="$xdg_bin:$PATH" \
+      "$SLEY" "$command" 2>&1
+  )
+  command_rc=$?
+  _assert_exit "$command empty selection: config resolution stays lazy" 0 "$command_rc"
+  _assert_contains "$command empty selection: reports no work" \
+    "no matching changed files" "$command_out"
+  _assert_not_contains "$command empty selection: omits config errors" \
+    "cannot resolve Sley extension directory" "$command_out"
+done
+
+argument_out=$(
+  cd "$repo" || exit 1
+  env -u HOME -u SLEY_EXTENSION_DIR XDG_CONFIG_HOME=relative/config \
+    GIT_CONFIG_GLOBAL="$repo/.gitconfig-test" PATH="$xdg_bin:$PATH" \
+    "$SLEY" fix --bogus 2>&1
+)
+argument_rc=$?
+_assert_exit "argument validation: invalid fix option remains a usage error" 2 "$argument_rc"
+_assert_contains "argument validation: invalid fix option is reported" \
+  "unknown option: --bogus" "$argument_out"
+_assert_not_contains "argument validation: invalid fix option needs no config" \
+  "cannot resolve Sley extension directory" "$argument_out"
+
+argument_out=$(
+  cd "$repo" || exit 1
+  env -u HOME -u SLEY_EXTENSION_DIR XDG_CONFIG_HOME=relative/config \
+    GIT_CONFIG_GLOBAL="$repo/.gitconfig-test" PATH="$xdg_bin:$PATH" \
+    "$SLEY" hook format-file 2>&1
+)
+argument_rc=$?
+_assert_exit "hook argument validation: missing file remains a usage error" 2 "$argument_rc"
+_assert_contains "hook argument validation: missing file is reported" \
+  "hook format-file requires a file" "$argument_out"
+_assert_not_contains "hook argument validation: missing file needs no config" \
+  "cannot resolve Sley extension directory" "$argument_out"
+
+help_out=$(
+  cd "$repo" || exit 1
+  env -u HOME -u SLEY_EXTENSION_DIR XDG_CONFIG_HOME=relative/config \
+    GIT_CONFIG_GLOBAL="$repo/.gitconfig-test" PATH="$xdg_bin:$PATH" \
+    "$SLEY" hook --help 2>&1
+)
+help_rc=$?
+_assert_exit "hook help: remains config-independent" 0 "$help_rc"
+_assert_contains "hook help: prints usage" "Usage: sley hook COMMAND" "$help_out"
+
+_probe_hook_init_failure() {
+  local label="$1" hook_out hook_rc
+  shift
+  : >"$action_log"
+  hook_out=$(
+    cd "$repo" || exit 1
+    # shellcheck disable=SC2016 # Variables expand in the isolated child shell.
+    env -u HOME -u SLEY_EXTENSION_DIR ACTION_LOG="$action_log" \
+      XDG_CONFIG_HOME=relative/config GIT_CONFIG_GLOBAL="$repo/.gitconfig-test" \
+      PATH="$xdg_bin:$PATH" bash -c '
+        source "$1/lib/sley/sley.sh"
+        shift
+        sley_hook_changed_files() { printf "changed-files\n" >>"$ACTION_LOG"; }
+        sley_hook_format_file() { printf "format-file\n" >>"$ACTION_LOG"; }
+        sley_hook_lint_file() { printf "lint-file\n" >>"$ACTION_LOG"; }
+        sley_hook_format() { printf "format\n" >>"$ACTION_LOG"; }
+        sley_hook_lint() { printf "lint\n" >>"$ACTION_LOG"; }
+        sley_hook_validate() { printf "validate\n" >>"$ACTION_LOG"; }
+        sley_hook "$@" <<<"app.txt"
+      ' _ "$SLEY_REPO_ROOT" "$@" 2>&1
+  )
+  hook_rc=$?
+  _assert_exit "hook $label: initialization failure propagates" 1 "$hook_rc"
+  _assert_contains "hook $label: failure explains extension path" \
+    "cannot resolve Sley extension directory" "$hook_out"
+  _assert_eq "hook $label: action does not run after failure" "" "$(cat "$action_log")"
+}
+
+_probe_hook_init_failure changed-files changed-files
+_probe_hook_init_failure format-file format-file app.txt
+_probe_hook_init_failure lint-file lint-file --json app.txt
+_probe_hook_init_failure format format --stdin
+_probe_hook_init_failure lint lint --stdin
+_probe_hook_init_failure validate validate
+
+ready_tmp=$(_tmpdir)
+: >"$action_log"
+ready_out=$(
+  cd "$repo" || exit 1
+  # shellcheck disable=SC2016 # Variables expand in the isolated child shell.
+  env -u HOME -u SLEY_EXTENSION_DIR ACTION_LOG="$action_log" \
+    XDG_CONFIG_HOME=relative/config GIT_CONFIG_GLOBAL="$repo/.gitconfig-test" \
+    PATH="$xdg_bin:$PATH" TMPDIR="$ready_tmp" bash -c '
+      source "$1/lib/sley/sley.sh"
+      _sley_selected_files_for_filters() { printf "selection\n" >>"$ACTION_LOG"; }
+      sley_ext_ready_phases() { printf "extensions\n" >>"$ACTION_LOG"; }
+      _sley_ready_run_phase() { printf "phase\n" >>"$ACTION_LOG"; }
+      sley_ready
+    ' _ "$SLEY_REPO_ROOT" 2>&1
+)
+ready_rc=$?
+_assert_exit "ready init: unresolved XDG fallback fails closed" 1 "$ready_rc"
+_assert_contains "ready init: failure explains extension path" \
+  "cannot resolve Sley extension directory" "$ready_out"
+_assert_not_contains "ready init: failure occurs before selection progress" \
+  "selecting changed files" "$ready_out"
+_assert_eq "ready init: selection, extensions, and phases do not run" "" "$(cat "$action_log")"
+ready_cache_count=$(
+  shopt -s nullglob
+  ready_cache_files=("$ready_tmp"/sley-ready-selected.*)
+  printf '%s' "${#ready_cache_files[@]}"
+)
+_assert_eq "ready init: failure leaves no selected-file cache" "0" "$ready_cache_count"
+
+help_out=$(
+  cd "$repo" || exit 1
+  env -u HOME -u SLEY_EXTENSION_DIR XDG_CONFIG_HOME=relative/config \
+    GIT_CONFIG_GLOBAL="$repo/.gitconfig-test" PATH="$xdg_bin:$PATH" \
+    "$SLEY" ready --help 2>&1
+)
+help_rc=$?
+_assert_exit "ready help: remains config-independent" 0 "$help_rc"
+_assert_contains "ready help: prints usage" "Usage: sley ready" "$help_out"
+
 xdg_config=$(_tmpdir)/config
 mkdir -p "$xdg_config/sley/verify.d"
 cat >"$xdg_config/sley/verify.d/xdg.json" <<EOF

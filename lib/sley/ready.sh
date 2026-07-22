@@ -124,6 +124,13 @@ _sley_ready() {
   # re-run a VCS pass right after this block.
   local filters selected selected_cache_file
   filters=$(_sley_path_filters) || return $?
+  SLEY_CALLER="${SLEY_CALLER:-human}"
+  # shellcheck disable=SC2034 # consumed by sourced local extensions.
+  SLEY_SCOPED=1
+  # Initialize before selecting files or creating the shared selection cache.
+  # A configuration failure must not launch phases, enumerate extension phases,
+  # or leave a cache file behind.
+  sley_hook_init || return $?
   [[ "$progress" == "1" ]] && echo "sley ready: selecting changed files" >&2
   selected=$(_sley_selected_files_for_filters "$filters") || return 2
   if [[ "$progress" == "1" ]]; then
@@ -148,10 +155,6 @@ _sley_ready() {
   local -a phases=("status" "check" "secrets" "verify")
   local -a phase_pids=() phase_stdout_files=() phase_stderr_files=()
   local extension_phases extension_phase
-  SLEY_CALLER="${SLEY_CALLER:-human}"
-  # shellcheck disable=SC2034 # consumed by sourced local extensions.
-  SLEY_SCOPED=1
-  sley_hook_init
   extension_phases=$(sley_ext_ready_phases || true)
   while IFS= read -r extension_phase; do
     [[ -n "$extension_phase" ]] && phases+=("$extension_phase")
