@@ -59,6 +59,65 @@ EOF
 }
 
 _sley_ready() {
+  # `ready` is part of the sourceable API, so temporary signal handlers must
+  # not replace traps owned by the calling shell after this invocation ends.
+  local _saved_int _saved_term _saved_hup _rc
+  _saved_int=$(trap -p INT)
+  _saved_term=$(trap -p TERM)
+  _saved_hup=$(trap -p HUP)
+
+  _sley_ready_impl "$@"
+  _rc=$?
+
+  eval "${_saved_int:-trap - INT}"
+  eval "${_saved_term:-trap - TERM}"
+  eval "${_saved_hup:-trap - HUP}"
+  return "$_rc"
+}
+
+_sley_ready_cleanup() {
+  # All state is local to `_sley_ready_impl` and reached through Bash's dynamic
+  # scope. Clearing it as resources are released keeps repeated cleanup safe
+  # and prevents a completed child's PID from being acted on again.
+  local child_pid owned_file
+  [[ "${_sley_ready_cleanup_done:-0}" == "0" ]] || return 0
+  _sley_ready_cleanup_done=1
+
+  for child_pid in "${phase_pids[@]+"${phase_pids[@]}"}"; do
+    [[ -n "$child_pid" ]] || continue
+    kill -TERM "$child_pid" 2>/dev/null || true
+  done
+  # Cancellation favors prompt, bounded teardown. A phase that ignores TERM
+  # must not keep the sourced caller stuck in cleanup indefinitely.
+  for child_pid in "${phase_pids[@]+"${phase_pids[@]}"}"; do
+    [[ -n "$child_pid" ]] || continue
+    if kill -0 "$child_pid" 2>/dev/null; then
+      kill -KILL "$child_pid" 2>/dev/null || true
+    fi
+  done
+  for child_pid in "${phase_pids[@]+"${phase_pids[@]}"}"; do
+    [[ -n "$child_pid" ]] || continue
+    wait "$child_pid" 2>/dev/null || true
+  done
+  phase_pids=()
+
+  for owned_file in \
+    "${phase_stdout_files[@]+"${phase_stdout_files[@]}"}" \
+    "${phase_stderr_files[@]+"${phase_stderr_files[@]}"}" \
+    "${stdout_file:-}" \
+    "${stderr_file:-}" \
+    "${selected_cache_file:-}"; do
+    [[ -n "$owned_file" ]] || continue
+    rm -f -- "$owned_file"
+  done
+  phase_stdout_files=()
+  phase_stderr_files=()
+  stdout_file=""
+  stderr_file=""
+  selected_cache_file=""
+}
+
+_sley_ready_impl() {
   # Pre-scan for --help before _sley_init_repo because init fails with
   # "unsupported repo" when the cwd isn't a recognized VCS checkout.
   # --help should work from anywhere.
@@ -122,15 +181,30 @@ _sley_ready() {
   # Compute the path filters and the selected file list ONCE here, then hand
   # the precomputed selection to `_sley_warn_out_of_scope` so it does not
   # re-run a VCS pass right after this block.
-  local filters selected selected_cache_file
+  local filters selected selected_cache_file=""
+  local rc global=0 phase status phases_json="" first=1 blocking=0 unavailable=0 errors=0
+  local phase_stdout phase_stderr phase_combined summary_line
+  local phase_extra_json status_detail verify_cached verify_total
+  local _ready_report="" _verify_observed=0
+  local stdout_file="" stderr_file="" pid phase_index
+  local -a phases=("status" "check" "secrets" "verify")
+  local -a phase_pids=() phase_stdout_files=() phase_stderr_files=()
+  local extension_phases extension_phase
+  local _sley_ready_cleanup_done=0
+  # shellcheck disable=SC2034 # Dynamically consumed by sourced extensions.
+  local SLEY_CALLER="${SLEY_CALLER:-human}" SLEY_SCOPED=1
+  local _SLEY_SELECTED_FILES_CACHE_FILE="" _SLEY_SELECTED_FILES_CACHE_KEY=""
   filters=$(_sley_path_filters) || return $?
-  SLEY_CALLER="${SLEY_CALLER:-human}"
-  # shellcheck disable=SC2034 # consumed by sourced local extensions.
-  SLEY_SCOPED=1
   # Initialize before selecting files or creating the shared selection cache.
   # A configuration failure must not launch phases, enumerate extension phases,
   # or leave a cache file behind.
   sley_hook_init || return $?
+  # Install cancellation cleanup before creating any invocation-owned files or
+  # starting phase children. `return` unwinds only the implementation function;
+  # the wrapper above then restores the caller's original handlers.
+  trap 'trap - INT TERM HUP; _sley_ready_cleanup; return 130' INT
+  trap 'trap - INT TERM HUP; _sley_ready_cleanup; return 143' TERM
+  trap 'trap - INT TERM HUP; _sley_ready_cleanup; return 129' HUP
   [[ "$progress" == "1" ]] && echo "sley ready: selecting changed files" >&2
   selected=$(_sley_selected_files_for_filters "$filters") || return 2
   if [[ "$progress" == "1" ]]; then
@@ -143,18 +217,10 @@ _sley_ready() {
   _SLEY_SELECTED_FILES_CACHE_FILE="$selected_cache_file"
   _SLEY_SELECTED_FILES_CACHE_KEY=$(_sley_selected_files_cache_key "$filters")
   _sley_warn_out_of_scope "$selected"
-  local rc global=0 phase status phases_json="" first=1 blocking=0 unavailable=0 errors=0
-  local phase_stdout phase_stderr phase_combined summary_line
-  local phase_extra_json status_detail verify_cached verify_total
   # _ready_report buffers human-mode output so --quiet can suppress it on
   # pass. _verify_observed tracks whether the verify phase did real work (cached
   # or fresh) so we can write a session marker for SLEY_VERIFY_STATE_DIR
   # consumers without them having to parse our output.
-  local _ready_report="" _verify_observed=0
-  local stdout_file stderr_file pid phase_index
-  local -a phases=("status" "check" "secrets" "verify")
-  local -a phase_pids=() phase_stdout_files=() phase_stderr_files=()
-  local extension_phases extension_phase
   extension_phases=$(sley_ext_ready_phases || true)
   while IFS= read -r extension_phase; do
     [[ -n "$extension_phase" ]] && phases+=("$extension_phase")
@@ -172,7 +238,7 @@ _sley_ready() {
       done
       if [[ "$_known" -eq 0 ]]; then
         echo "sley ready: unknown phase for --exclude: $_ex" >&2
-        rm -f "$selected_cache_file"
+        _sley_ready_cleanup
         return 2
       fi
     done
@@ -257,7 +323,7 @@ _sley_ready() {
             if ! cp -p "$_fix_bak" "$_fix_f"; then
               printf 'sley fix: failed to restore %s from backup %s; the worktree may hold formatter output — recover it from the backup.\n' \
                 "$_fix_f" "$_fix_bak" >&2
-              rm -f "$selected_cache_file"
+              _sley_ready_cleanup
               return 2
             fi
             rm -f "$_fix_bak"
@@ -294,7 +360,7 @@ _sley_ready() {
           done
           _ready_report+="stage or stash the rest of these files, then re-run the commit."$'\n'
           printf '%s' "$_ready_report" >&2
-          rm -f "$selected_cache_file"
+          _sley_ready_cleanup
           return 2
         fi
         if [[ "${#_fix_modified[@]}" -gt 0 ]]; then
@@ -307,7 +373,7 @@ _sley_ready() {
           # Fix found mutations — always emit the report (even in quiet
           # mode) so the caller knows what to re-stage.
           printf '%s' "$_ready_report" >&2
-          rm -f "$selected_cache_file"
+          _sley_ready_cleanup
           return 1
         fi
       else
@@ -326,8 +392,16 @@ _sley_ready() {
     # content on stdout that we want to surface in the report; failing phases
     # produce a diagnostic on stderr that we want to surface as the summary.
     # Discarding either would hide the actionable parts of `ready`.
-    stdout_file=$(mktemp "${TMPDIR:-/tmp}/sley-ready-stdout.XXXXXX")
-    stderr_file=$(mktemp "${TMPDIR:-/tmp}/sley-ready-stderr.XXXXXX")
+    stdout_file=$(mktemp "${TMPDIR:-/tmp}/sley-ready-stdout.XXXXXX") || {
+      _sley_ready_cleanup
+      return 2
+    }
+    phase_stdout_files+=("$stdout_file")
+    stderr_file=$(mktemp "${TMPDIR:-/tmp}/sley-ready-stderr.XXXXXX") || {
+      _sley_ready_cleanup
+      return 2
+    }
+    phase_stderr_files+=("$stderr_file")
     (
       # shellcheck disable=SC2034 # read by `_sley_init_repo` in this subshell.
       SLEY_ORIGINAL_PWD="$_SLEY_CALLER_PWD"
@@ -335,8 +409,8 @@ _sley_ready() {
     ) >"$stdout_file" 2>"$stderr_file" &
     pid=$!
     phase_pids+=("$pid")
-    phase_stdout_files+=("$stdout_file")
-    phase_stderr_files+=("$stderr_file")
+    stdout_file=""
+    stderr_file=""
   done
 
   for phase_index in "${!phases[@]}"; do
@@ -349,9 +423,14 @@ _sley_ready() {
     else
       rc=$?
     fi
+    phase_pids[phase_index]=""
     phase_stdout=$(cat "$stdout_file")
     phase_stderr=$(cat "$stderr_file")
     rm -f "$stdout_file" "$stderr_file"
+    phase_stdout_files[phase_index]=""
+    phase_stderr_files[phase_index]=""
+    stdout_file=""
+    stderr_file=""
 
     case "$rc" in
       0)
@@ -444,7 +523,7 @@ _sley_ready() {
       fi
     fi
   done
-  rm -f "$selected_cache_file"
+  _sley_ready_cleanup
 
   # Write verify marker when the verify phase did real work and the
   # caller provided a state directory. Agents use this so session-scoped
