@@ -96,6 +96,11 @@ value falls back to
 If an XDG fallback is required and
 .B HOME
 is unavailable, Sley reports an error rather than resolving a relative path.
+An explicit
+.B SLEY_VERIFY_CONFIG
+does not disable extension discovery, so
+.B SLEY_EXTENSION_DIR
+must also be explicit when no default config root can be resolved.
 .SH FILES
 .TP
 .I share/sley/schemas/verify.schema.json

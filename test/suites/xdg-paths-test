@@ -83,6 +83,7 @@ _assert_eq "extension override: trailing newline path reaches the consumer uncha
   "newline" "$newline_extension_result"
 
 repo=$(_tmpdir)
+repo=$(cd "$repo" && pwd -P)
 git -C "$repo" init -q
 git -C "$repo" config user.email test@test.local
 git -C "$repo" config user.name "Test User"
@@ -93,6 +94,8 @@ printf 'initial\n' >"$repo/app.txt"
 git -C "$repo" add app.txt
 git -C "$repo" commit -q -m seed
 printf 'changed\n' >>"$repo/app.txt"
+xdg_bin=$(_mock_bin)
+ln -s /usr/bin/git "$xdg_bin/git"
 
 xdg_config=$(_tmpdir)/config
 mkdir -p "$xdg_config/sley/verify.d"
@@ -103,7 +106,8 @@ verify_out=$(
   cd "$repo" || exit 1
   env -u HOME -u SLEY_VERIFY_CONFIG \
     XDG_CONFIG_HOME="$xdg_config" XDG_CACHE_HOME="$(_tmpdir)/cache" \
-    GIT_CONFIG_GLOBAL="$repo/.gitconfig-test" "$SLEY" verify 2>&1
+    GIT_CONFIG_GLOBAL="$repo/.gitconfig-test" PATH="$xdg_bin:$PATH" \
+    "$SLEY" verify 2>&1
 )
 verify_rc=$?
 _assert_exit "verify registry: absolute XDG config works without HOME" 0 "$verify_rc"
@@ -111,25 +115,52 @@ _assert_contains "verify registry: XDG config reaches registry consumer" \
   "echo xdg-verify" "$verify_out"
 
 newline_config="$(_tmpdir)/verify.json"$'\n'
+explicit_extension_dir=$(_tmpdir)/extensions
+mkdir -p "$explicit_extension_dir"
 cat >"$newline_config" <<EOF
 {"repos":[{"match":{"root":"$repo"},"rules":[{"paths":["app.txt"],"commands":["echo newline-verify"]}]}]}
 EOF
 verify_out=$(
   cd "$repo" || exit 1
-  env -u HOME SLEY_VERIFY_CONFIG="$newline_config" XDG_CONFIG_HOME=relative/config \
+  env -u HOME SLEY_VERIFY_CONFIG="$newline_config" \
+    SLEY_EXTENSION_DIR="$explicit_extension_dir" XDG_CONFIG_HOME=relative/config \
     XDG_CACHE_HOME="$(_tmpdir)/cache" GIT_CONFIG_GLOBAL="$repo/.gitconfig-test" \
-    "$SLEY" verify 2>&1
+    PATH="$xdg_bin:$PATH" "$SLEY" verify --json 2>&1
 )
 verify_rc=$?
 _assert_exit "verify override: trailing newline path works without HOME" 0 "$verify_rc"
 _assert_contains "verify override: exact path reaches registry consumer" \
   "echo newline-verify" "$verify_out"
+expected_source_hex=$(printf '%s' "$newline_config" | od -An -tx1 | tr -d ' \n')
+actual_source_hex=$(printf '%s' "$verify_out" | python3 -c '
+import json
+import sys
+
+payload = json.load(sys.stdin)
+command = next(item for item in payload["commands"] if item["command"] == "echo newline-verify")
+print(command["source_contexts"][0]["source"].encode().hex())
+')
+_assert_eq "verify override: structured source preserves trailing newline" \
+  "$expected_source_hex" "$actual_source_hex"
 
 verify_out=$(
   cd "$repo" || exit 1
-  env -u HOME -u SLEY_VERIFY_CONFIG XDG_CONFIG_HOME=relative/config \
-    XDG_CACHE_HOME="$(_tmpdir)/cache" GIT_CONFIG_GLOBAL="$repo/.gitconfig-test" \
+  env -u HOME -u SLEY_EXTENSION_DIR SLEY_VERIFY_CONFIG="$newline_config" \
+    XDG_CONFIG_HOME=relative/config XDG_CACHE_HOME="$(_tmpdir)/cache" \
+    GIT_CONFIG_GLOBAL="$repo/.gitconfig-test" PATH="$xdg_bin:$PATH" \
     "$SLEY" verify 2>&1
+)
+verify_rc=$?
+_assert_exit "verify extensions: unresolved XDG fallback blocks discovery" 1 "$verify_rc"
+_assert_contains "verify extensions: unresolved fallback has actionable error" \
+  "cannot resolve Sley extension directory" "$verify_out"
+
+verify_out=$(
+  cd "$repo" || exit 1
+  env -u HOME -u SLEY_VERIFY_CONFIG SLEY_EXTENSION_DIR="$explicit_extension_dir" \
+    XDG_CONFIG_HOME=relative/config \
+    XDG_CACHE_HOME="$(_tmpdir)/cache" GIT_CONFIG_GLOBAL="$repo/.gitconfig-test" \
+    PATH="$xdg_bin:$PATH" "$SLEY" verify 2>&1
 )
 verify_rc=$?
 _assert_exit "verify registry: relative XDG without HOME fails" 1 "$verify_rc"

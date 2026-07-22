@@ -153,6 +153,11 @@ or relative root falls back to `HOME`, and resolution fails with an actionable
 error when that fallback is required but `HOME` is unavailable. Explicit
 `SLEY_*` paths retain their exact value, including relative paths.
 
+`sley verify` always initializes extension discovery before collecting command
+sources. An explicit `SLEY_VERIFY_CONFIG` does not disable extensions; when no
+absolute config root or `HOME` is available, set `SLEY_EXTENSION_DIR` explicitly
+as well.
+
 The same boundary applies to hooks and editor integrations: Sley should decide
 repo scope, caller timing, and readiness phase composition, while Checkrun
 decides filetype inference, low-level tool selection, and diagnostic shape.

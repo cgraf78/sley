@@ -158,10 +158,14 @@ _sley_verify_config_context() {
 }
 
 _sley_verify_config_source() {
-  case "$1" in
-    "$_REPO_ROOT"/*) printf '%s\n' "${1#"$_REPO_ROOT"/}" ;;
-    *) printf '%s\n' "$1" ;;
+  local output_name="$1" config="$2" source_value
+  case "$config" in
+    "$_REPO_ROOT"/*) source_value="${config#"$_REPO_ROOT"/}" ;;
+    *) source_value="$config" ;;
   esac
+  # The source path is structured command metadata. Assign it directly so
+  # command substitution cannot strip trailing newline bytes from the value.
+  printf -v "$output_name" '%s' "$source_value"
 }
 
 _sley_verify_config_base() {
@@ -392,7 +396,7 @@ _sley_verify_registry_commands() {
     origin="${config_origins[$i]}"
     config="${config_paths[$i]}"
     context=$(_sley_verify_config_context "$origin")
-    source=$(_sley_verify_config_source "$config")
+    _sley_verify_config_source source "$config"
     base=$(_sley_verify_config_base "$config" "$context")
     if ! _sley_verify_validate_config "$config" 2>/dev/null; then
       echo "sley verify: invalid verify registry: $source" >&2
@@ -1066,7 +1070,7 @@ _sley_verify() {
   SLEY_CALLER="${SLEY_CALLER:-human}"
   # shellcheck disable=SC2034 # consumed by sourced local extensions.
   SLEY_SCOPED=1
-  sley_hook_init
+  sley_hook_init || return $?
 
   declare -A _seen_dirs
   while IFS= read -r file; do
