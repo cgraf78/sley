@@ -672,13 +672,166 @@ _sley_ready_process_group() {
   printf '%s\n' "$process_group"
 }
 
+_sley_ready_process_group_tree() {
+  local process_group="$1" guardian_pid="$2"
+  local stat_file stat_line process_pid process_parent process_identity
+  local snapshot day_name month day process_time year session member_group started
+  local index candidate generation has_child progress count emitted_count=0 member_count=0
+  local guardian_seen=0 scanner_seen=0 _sley_ready_group_scanner_pid=$BASHPID
+  local _sley_ready_proc_pid="" _sley_ready_proc_parent="" _sley_ready_proc_group=""
+  local _sley_ready_proc_identity=""
+  local -a process_pids=() process_parents=() process_identities=()
+  local -a excluded=() emitted=() ready=()
+
+  if snapshot=$(
+    _sley_ready_ps -A -o pid= -o ppid= -o lstart= -o sess= -o pgid= 2>/dev/null
+  ); then
+    while read -r process_pid process_parent day_name month day process_time year \
+      session member_group; do
+      [[ "$member_group" == "$process_group" ]] || continue
+      started="$day_name $month $day $process_time $year"
+      if [[ -r "/proc/$process_pid/stat" ]]; then
+        stat_line=$(<"/proc/$process_pid/stat") || continue
+        _sley_ready_parse_proc_stat "$process_pid" "$stat_line" || continue
+        [[ "$_sley_ready_proc_group" == "$process_group" ]] || continue
+        process_identity=$_sley_ready_proc_identity
+      else
+        process_identity="ps:$started"
+      fi
+      if [[ "$process_pid" == "$guardian_pid" ]]; then
+        guardian_seen=1
+        continue
+      fi
+      process_pids+=("$process_pid")
+      process_parents+=("$process_parent")
+      process_identities+=("$process_identity")
+      excluded+=(0)
+      emitted+=(0)
+      ready+=(0)
+    done <<<"$snapshot"
+  elif [[ -d /proc ]]; then
+    for stat_file in /proc/[0-9]*/stat; do
+      [[ -r "$stat_file" ]] || continue
+      stat_line=$(<"$stat_file") || continue
+      process_pid=${stat_file#/proc/}
+      process_pid=${process_pid%/stat}
+      _sley_ready_parse_proc_stat "$process_pid" "$stat_line" || continue
+      [[ "$_sley_ready_proc_group" == "$process_group" ]] || continue
+      if [[ "$_sley_ready_proc_pid" == "$guardian_pid" ]]; then
+        guardian_seen=1
+        continue
+      fi
+      process_pids+=("$_sley_ready_proc_pid")
+      process_parents+=("$_sley_ready_proc_parent")
+      process_identities+=("$_sley_ready_proc_identity")
+      excluded+=(0)
+      emitted+=(0)
+      ready+=(0)
+    done
+  else
+    return 1
+  fi
+
+  [[ "$guardian_seen" == 1 ]] || return 1
+  count=${#process_pids[@]}
+  for index in "${!process_pids[@]}"; do
+    if [[ "${process_pids[$index]}" == "$_sley_ready_group_scanner_pid" ]]; then
+      excluded[index]=1
+      scanner_seen=1
+    fi
+  done
+  [[ "$scanner_seen" == 1 ]] || return 1
+
+  # The scan runs in a command substitution inside the guardian's process
+  # group. Exclude that scanner and every helper it spawned from the ownership
+  # result before layering the actual workload descendants.
+  for ((generation = 0; generation < count; generation++)); do
+    progress=0
+    for index in "${!process_pids[@]}"; do
+      [[ "${excluded[$index]}" == 0 ]] || continue
+      for candidate in "${!process_pids[@]}"; do
+        [[ "${excluded[$candidate]}" == 1 ]] || continue
+        if [[ "${process_parents[$index]}" == "${process_pids[$candidate]}" ]]; then
+          excluded[index]=1
+          progress=1
+          break
+        fi
+      done
+    done
+    [[ "$progress" == 1 ]] || break
+  done
+
+  for index in "${!process_pids[@]}"; do
+    [[ "${excluded[$index]}" == 1 ]] || member_count=$((member_count + 1))
+  done
+  generation=0
+  while ((emitted_count < member_count)); do
+    progress=0
+    for index in "${!process_pids[@]}"; do
+      ready[index]=0
+      [[ "${excluded[$index]}" == 0 && "${emitted[$index]}" == 0 ]] || continue
+      has_child=0
+      for candidate in "${!process_pids[@]}"; do
+        [[ "${excluded[$candidate]}" == 0 && "${emitted[$candidate]}" == 0 ]] || continue
+        if [[ "${process_parents[$candidate]}" == "${process_pids[$index]}" ]]; then
+          has_child=1
+          break
+        fi
+      done
+      [[ "$has_child" == 0 ]] || continue
+      ready[index]=1
+      progress=1
+    done
+    [[ "$progress" == 1 ]] || return 1
+    for index in "${!process_pids[@]}"; do
+      [[ "${ready[$index]}" == 1 ]] || continue
+      printf '%s\t%s\t%s\n' \
+        "$generation" "${process_pids[$index]}" "${process_identities[$index]}"
+      emitted[index]=1
+      emitted_count=$((emitted_count + 1))
+    done
+    generation=$((generation + 1))
+  done
+}
+
 _sley_ready_signal_process_group() {
   local signal_name="$1" process_group="$2"
   [[ -n "$process_group" && "$process_group" != *[!0-9]* && "$process_group" != "0" ]] || return 0
   # A process-group ID cannot be reused while any member survives. Managed
-  # wrappers are group leaders, so this still reaches descendants after the
-  # wrapper exits and they are reparented.
+  # guardians retain group leadership during cancellation, so their own final
+  # group signal also reaches replacements after intermediate parents exit.
   kill -"$signal_name" -- "-$process_group" 2>/dev/null || true
+}
+
+_sley_ready_guardian_cancel() {
+  local signal_status="$1" guardian_pid=$BASHPID
+  local group_members attempt
+  trap '' INT TERM HUP
+  # Keep the group leader alive while TERM handlers finish. Kill descendants
+  # deepest-first so each still-live parent can reap before it is killed; this
+  # avoids leaving zombies behind when a container's PID 1 does not reap orphans.
+  sleep 0.25
+  # Keep every parent alive until its children disappear so it can reap them
+  # even on systems whose PID 1 does not reap adopted zombies promptly. A
+  # bounded rescan catches descendants forked after the first snapshot.
+  for ((attempt = 0; attempt < 3; attempt++)); do
+    group_members=$(
+      _sley_ready_process_group_tree "$guardian_pid" "$guardian_pid"
+    ) || {
+      _sley_ready_signal_process_group KILL "$guardian_pid"
+      return "$signal_status"
+    }
+    [[ -n "$group_members" ]] || break
+    _sley_ready_kill_processes_reapably "$group_members" || break
+  done
+  if ! group_members=$(
+    _sley_ready_process_group_tree "$guardian_pid" "$guardian_pid"
+  ) || [[ -n "$group_members" ]]; then
+    _sley_ready_signal_process_group KILL "$guardian_pid"
+    return "$signal_status"
+  fi
+  _sley_ready_guardian_status=$signal_status
+  return 0
 }
 
 _sley_ready_signal_owned_tree_term() {
@@ -709,6 +862,62 @@ _sley_ready_signal_processes() {
     _sley_ready_process_is_same "$process_pid" "$process_identity" || continue
     kill -"$signal_name" "$process_pid" 2>/dev/null || true
   done <<<"$process_list"
+}
+
+_sley_ready_kill_processes_reapably() {
+  local process_list="$1" generation process_pid process_identity current_generation=""
+  local generation_processes=""
+  while IFS=$'\t' read -r generation process_pid process_identity; do
+    [[ -n "$process_pid" ]] || continue
+    if [[ -n "$current_generation" && "$generation" != "$current_generation" ]]; then
+      _sley_ready_wait_for_group_members "$generation_processes" "$BASHPID" || return 1
+      generation_processes=""
+    fi
+    current_generation=$generation
+    _sley_ready_process_is_same_group_member \
+      "$process_pid" "$process_identity" "$BASHPID" || continue
+    kill -KILL "$process_pid" 2>/dev/null || true
+    generation_processes+=$'\n'"$process_pid"$'\t'"$process_identity"
+  done <<<"$process_list"
+  [[ -z "$generation_processes" ]] ||
+    _sley_ready_wait_for_group_members "$generation_processes" "$BASHPID"
+}
+
+_sley_ready_wait_for_group_members() {
+  local process_list="$1" expected_group="$2" attempt process_pid process_identity
+  local any_alive
+  for ((attempt = 0; attempt < 10; attempt++)); do
+    any_alive=0
+    while IFS=$'\t' read -r process_pid process_identity; do
+      [[ -n "$process_pid" ]] || continue
+      if _sley_ready_process_is_same_group_member \
+        "$process_pid" "$process_identity" "$expected_group"; then
+        any_alive=1
+        break
+      fi
+    done <<<"$process_list"
+    [[ "$any_alive" == 1 ]] || return 0
+    sleep 0.01
+  done
+  return 1
+}
+
+_sley_ready_process_is_same_group_member() {
+  local process_pid="$1" expected_identity="$2" expected_group="$3"
+  local stat_line current_identity current_group
+  local _sley_ready_proc_pid="" _sley_ready_proc_parent="" _sley_ready_proc_group=""
+  local _sley_ready_proc_identity=""
+  if [[ -r "/proc/$process_pid/stat" ]]; then
+    stat_line=$(<"/proc/$process_pid/stat") || return 1
+    _sley_ready_parse_proc_stat "$process_pid" "$stat_line" || return 1
+    [[ "$_sley_ready_proc_identity" == "$expected_identity" &&
+      "$_sley_ready_proc_group" == "$expected_group" ]]
+    return
+  fi
+  current_identity=$(_sley_ready_process_identity "$process_pid") || return 1
+  [[ "$current_identity" == "$expected_identity" ]] || return 1
+  current_group=$(_sley_ready_process_group "$process_pid") || return 1
+  [[ "$current_group" == "$expected_group" ]]
 }
 
 _sley_ready_processes_except() {
@@ -961,9 +1170,10 @@ _sley_ready_run_owned() {
   [[ "$-" == *m* ]] && child_had_monitor=1
   set -m
   (
-    trap 'exit 129' HUP
-    trap 'exit 130' INT
-    trap 'exit 143' TERM
+    _sley_ready_guardian_status=""
+    trap '_sley_ready_guardian_cancel 129' HUP
+    trap '_sley_ready_guardian_cancel 130' INT
+    trap '_sley_ready_guardian_cancel 143' TERM
     while [[ ! -e "$child_run" && ! -e "$child_abort" && ! -e "$_sley_ready_worker_dead" ]]; do
       sleep 0.01
     done
@@ -971,7 +1181,15 @@ _sley_ready_run_owned() {
     # Keep hook-owned trap changes inside a foreground child. This process-group
     # leader remains a guardian with immutable cancellation traps, so graceful
     # hook cleanup cannot replace the guardian's final escalation behavior.
-    (_sley_ready_run_guarded_command "$@")
+    if (_sley_ready_run_guarded_command "$@"); then
+      child_rc=0
+    else
+      child_rc=$?
+    fi
+    if [[ -n "$_sley_ready_guardian_status" ]]; then
+      exit "$_sley_ready_guardian_status"
+    fi
+    exit "$child_rc"
   ) </dev/null &
   started_pid=$!
   [[ "$child_had_monitor" == "1" ]] || set +m
@@ -1516,19 +1734,28 @@ _sley_ready_impl() {
     [[ "$-" == *m* ]] && child_had_monitor=1
     set -m
     (
-      trap 'exit 129' HUP
-      trap 'exit 130' INT
-      trap 'exit 143' TERM
+      _sley_ready_guardian_status=""
+      trap '_sley_ready_guardian_cancel 129' HUP
+      trap '_sley_ready_guardian_cancel 130' INT
+      trap '_sley_ready_guardian_cancel 143' TERM
       while [[ ! -e "$child_run" && ! -e "$child_abort" && ! -e "$_sley_ready_worker_dead" ]]; do
         sleep 0.01
       done
       [[ ! -e "$child_abort" && ! -e "$_sley_ready_worker_dead" ]] || exit 2
-      (
+      if (
         # shellcheck disable=SC2034 # read by `_sley_init_repo` in this subshell.
         SLEY_ORIGINAL_PWD="$_SLEY_CALLER_PWD"
         _sley_ready_run_guarded_command \
           _sley_ready_run_phase "$phase" "$full" "$force" "${scope_args[@]}"
-      )
+      ); then
+        phase_rc=0
+      else
+        phase_rc=$?
+      fi
+      if [[ -n "$_sley_ready_guardian_status" ]]; then
+        exit "$_sley_ready_guardian_status"
+      fi
+      exit "$phase_rc"
     ) </dev/null >"$stdout_file" 2>"$stderr_file" &
     pid=$!
     [[ "$child_had_monitor" == "1" ]] || set +m

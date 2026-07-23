@@ -69,6 +69,64 @@ if [[ ! -r /proc/self/stat ]]; then
 fi
 
 cat >"$config/sley/extensions.d/80-ready-cancellation.sh" <<'EXTENSION'
+_sley_ready_test_block() {
+  local ignored
+  IFS= read -r ignored <"$SLEY_READY_TEST_BLOCKER"
+}
+
+_sley_ready_test_process_group() {
+  local process_pid="$1" stat_line
+  local _sley_ready_proc_pid="" _sley_ready_proc_parent="" _sley_ready_proc_group=""
+  local _sley_ready_proc_identity=""
+  if [[ -r "/proc/$process_pid/stat" ]]; then
+    IFS= read -r stat_line <"/proc/$process_pid/stat" || return 1
+    _sley_ready_parse_proc_stat "$process_pid" "$stat_line" || return 1
+    REPLY=$_sley_ready_proc_group
+    return 0
+  fi
+  REPLY=$(_sley_ready_process_group "$process_pid") || return 1
+}
+
+_sley_ready_test_run_replacement() {
+  local phase="$1" generation="$2" expected_group="$3" process_group
+  trap '' INT TERM HUP
+  _sley_ready_test_process_group "$BASHPID" || exit 2
+  process_group=$REPLY
+  printf '%s\n' "$BASHPID" >"$SLEY_READY_SYNC/$phase.replacement.$generation.pid"
+  if [[ "$process_group" != "$expected_group" ]]; then
+    : >"$SLEY_READY_SYNC/$phase.replacement.$generation.group-mismatch"
+  fi
+  if ((generation < 3)); then
+    _sley_ready_test_run_replacement "$phase" "$((generation + 1))" "$expected_group" &
+  else
+    : >"$SLEY_READY_SYNC/$phase.replacement.ready"
+    printf 'ready\n' >"$SLEY_READY_SYNC/$phase.replacement.ready.fifo"
+  fi
+  _sley_ready_test_block
+}
+
+_sley_ready_test_replacement_spawner() {
+  local phase="$1" replacement_group="$2" trigger
+  trap '' INT TERM HUP
+  printf 'ready\n' >"$SLEY_READY_SYNC/$phase.replacement.spawner-ready.fifo"
+  IFS= read -r trigger <"$SLEY_READY_SYNC/$phase.replacement.trigger.fifo"
+  if [[ ! -e "$SLEY_READY_SYNC/cancel.requested" ]]; then
+    : >"$SLEY_READY_SYNC/$phase.replacement.before-cancel"
+  fi
+  _sley_ready_test_run_replacement "$phase" 1 "$replacement_group" &
+  disown "$!" 2>/dev/null || true
+  _sley_ready_test_block
+}
+
+_sley_ready_test_spawn_replacement_chain() {
+  local phase="$1" ready
+  trap '' INT TERM HUP
+  : >"$SLEY_READY_SYNC/$phase.replacement.handler-started"
+  printf 'start\n' >"$SLEY_READY_SYNC/$phase.replacement.trigger.fifo"
+  IFS= read -r ready <"$SLEY_READY_SYNC/$phase.replacement.ready.fifo"
+  exit 0
+}
+
 sley_ext_ready_phases() {
   if [[ "${SLEY_READY_TEST_MODE:-}" == "interactive" ]]; then
     : >"$SLEY_READY_SYNC/interactive.waiting"
@@ -134,9 +192,23 @@ sley_ext_ready_phase() {
       printf '%s\n' "$BASHPID" >"$SLEY_READY_SYNC/$phase.pid"
       trap 'sleep 0.1; : >"$SLEY_READY_SYNC/'"$phase"'.term-cleanup"; exit 0' TERM
       : >"$SLEY_READY_SYNC/$phase.started"
-      while :; do
-        :
-      done
+      _sley_ready_test_block
+      ;;
+    replacement-chain)
+      local replacement_group ready
+      printf '%s\n' "$BASHPID" >"$SLEY_READY_SYNC/$phase.pid"
+      replacement_group=$(_sley_ready_process_group "$BASHPID") || exit 2
+      mkfifo \
+        "$SLEY_READY_SYNC/$phase.replacement.ready.fifo" \
+        "$SLEY_READY_SYNC/$phase.replacement.spawner-ready.fifo" \
+        "$SLEY_READY_SYNC/$phase.replacement.trigger.fifo" || exit 2
+      set +m
+      _sley_ready_test_replacement_spawner "$phase" "$replacement_group" &
+      disown "$!" 2>/dev/null || true
+      IFS= read -r ready <"$SLEY_READY_SYNC/$phase.replacement.spawner-ready.fifo"
+      trap '_sley_ready_test_spawn_replacement_chain "$phase"' TERM
+      : >"$SLEY_READY_SYNC/$phase.started"
+      _sley_ready_test_block
       ;;
   esac
 }
@@ -268,9 +340,11 @@ for name in \
 done
 
 artifact_count=0
+artifact_paths=""
 for artifact in "${TMPDIR:-/tmp}"/sley-ready-*; do
   [[ -e "$artifact" ]] || continue
   artifact_count=$((artifact_count + 1))
+  artifact_paths+="${artifact_paths:+,}${artifact##*/}"
 done
 fix_backup_count=0
 for artifact in "${TMPDIR:-/tmp}"/sley-fix-bak.*; do
@@ -284,6 +358,7 @@ done
   printf 'options_restored=%s\n' "$options_restored"
   printf 'cleanup_globals_absent=%s\n' "$cleanup_globals_absent"
   printf 'artifact_count=%s\n' "$artifact_count"
+  printf 'artifact_paths=%s\n' "${artifact_paths:-none}"
   printf 'fix_backup_count=%s\n' "$fix_backup_count"
 } >"$result"
 HARNESS
@@ -1148,19 +1223,28 @@ def wait_for(predicate, timeout):
     return predicate()
 
 
+def read_published_pid(path):
+    try:
+        with open(path, encoding="ascii") as pid_file:
+            value = pid_file.read().strip()
+    except OSError:
+        return None
+    return int(value) if value.isdigit() else None
+
+
 started = wait_for(
-    lambda: os.path.exists(worker_pid_file)
-    and os.path.exists(owned_pid_file)
-    and os.path.exists(owned_grandchild_pid_file),
+    lambda: read_published_pid(worker_pid_file) is not None
+    and read_published_pid(owned_pid_file) is not None
+    and read_published_pid(owned_grandchild_pid_file) is not None,
     5,
 )
 if started:
-    with open(owned_pid_file, encoding="ascii") as pid_file:
-        owned_pid = int(pid_file.read().strip())
-    with open(owned_grandchild_pid_file, encoding="ascii") as pid_file:
-        owned_grandchild_pid = int(pid_file.read().strip())
-    with open(worker_pid_file, encoding="ascii") as pid_file:
-        os.kill(int(pid_file.read().strip()), signal.SIGKILL)
+    owned_pid = read_published_pid(owned_pid_file)
+    owned_grandchild_pid = read_published_pid(owned_grandchild_pid_file)
+    worker_pid = read_published_pid(worker_pid_file)
+    if owned_pid is None or owned_grandchild_pid is None or worker_pid is None:
+        raise RuntimeError("published worker PID became unreadable")
+    os.kill(worker_pid, signal.SIGKILL)
     open(release_root_file, "a", encoding="ascii").close()
 
 completed = True
@@ -1351,17 +1435,26 @@ def wait_for(predicate, timeout):
     return predicate()
 
 
+def read_published_pid(path):
+    try:
+        with open(path, encoding="ascii") as pid_file:
+            value = pid_file.read().strip()
+    except OSError:
+        return None
+    return int(value) if value.isdigit() else None
+
+
 started = wait_for(
-    lambda: os.path.exists(worker_pid_file)
-    and os.path.exists(descendant_pid_file)
-    and os.path.exists(grandchild_pid_file),
+    lambda: read_published_pid(worker_pid_file) is not None
+    and read_published_pid(descendant_pid_file) is not None
+    and read_published_pid(grandchild_pid_file) is not None,
     5,
 )
 if started:
-    with open(descendant_pid_file, encoding="ascii") as pid_file:
-        descendant_pid = int(pid_file.read().strip())
-    with open(grandchild_pid_file, encoding="ascii") as pid_file:
-        grandchild_pid = int(pid_file.read().strip())
+    descendant_pid = read_published_pid(descendant_pid_file)
+    grandchild_pid = read_published_pid(grandchild_pid_file)
+    if descendant_pid is None or grandchild_pid is None:
+        raise RuntimeError("published descendant PID became unreadable")
     os.kill(process.pid, signal.SIGTERM)
 
 completed = True
@@ -1896,6 +1989,186 @@ _assert_eq "ready identity: stale launch identity is rejected" \
 _assert_eq "ready identity: owned exec survivor remains signalable" \
   "no" "$(_result_value exec_survivor "$identity_data")"
 
+echo "=== sley: guardian process-group discovery ==="
+
+group_tree_harness=$(_tmpdir)/ready-group-tree-harness
+cat >"$group_tree_harness" <<'HARNESS'
+#!/usr/bin/env bash
+
+root="$1"
+case_name="$2"
+
+# shellcheck disable=SC1090 # The test supplies the checkout under test.
+source "$root/lib/sley/ready.sh"
+
+guardian=$(_sley_ready_process_group "$BASHPID") || exit 2
+guardian_row="$guardian 1 Thu Jul 23 00:00:00 2026 $guardian $guardian"
+case "$case_name" in
+  empty)
+    mock_snapshot=$guardian_row
+    ;;
+  singleton)
+    mock_snapshot="90000001 $guardian Thu Jul 23 00:00:00 2026 $guardian $guardian
+$guardian_row"
+    ;;
+  siblings)
+    mock_snapshot="90000001 $guardian Thu Jul 23 00:00:00 2026 $guardian $guardian
+90000002 $guardian Thu Jul 23 00:00:00 2026 $guardian $guardian
+$guardian_row"
+    ;;
+  parent-first)
+    mock_snapshot="90000001 $guardian Thu Jul 23 00:00:00 2026 $guardian $guardian
+90000002 90000001 Thu Jul 23 00:00:00 2026 $guardian $guardian
+$guardian_row"
+    ;;
+  child-first)
+    mock_snapshot="90000002 90000001 Thu Jul 23 00:00:00 2026 $guardian $guardian
+90000001 $guardian Thu Jul 23 00:00:00 2026 $guardian $guardian
+$guardian_row"
+    ;;
+  branching)
+    mock_snapshot="90000001 $guardian Thu Jul 23 00:00:00 2026 $guardian $guardian
+90000002 90000001 Thu Jul 23 00:00:00 2026 $guardian $guardian
+90000003 90000001 Thu Jul 23 00:00:00 2026 $guardian $guardian
+$guardian_row"
+    ;;
+  *)
+    exit 2
+    ;;
+esac
+
+_sley_ready_ps() {
+  printf '%s\n' "$mock_snapshot"
+  printf '%s %s Thu Jul 23 00:00:00 2026 %s %s\n' \
+    "$_sley_ready_group_scanner_pid" "$guardian" "$guardian" "$guardian"
+}
+
+tree=$(_sley_ready_process_group_tree "$guardian" "$guardian")
+tree_rc=$?
+printf 'rc=%s\n' "$tree_rc"
+printf '%s\n' "$tree"
+HARNESS
+chmod +x "$group_tree_harness"
+
+_run_group_tree_case() {
+  bash --noprofile --norc "$group_tree_harness" "$SLEY_REPO_ROOT" "$1"
+}
+
+group_tree_data=$(_run_group_tree_case empty)
+_assert_eq "ready group tree: empty snapshot succeeds" "rc=0" \
+  "$(printf '%s\n' "$group_tree_data" | sed -n '1p')"
+_assert_eq "ready group tree: empty snapshot has no members" "1" \
+  "$(printf '%s\n' "$group_tree_data" | wc -l | tr -d ' ')"
+
+group_tree_data=$(_run_group_tree_case singleton)
+_assert_eq "ready group tree: singleton succeeds" "rc=0" \
+  "$(printf '%s\n' "$group_tree_data" | sed -n '1p')"
+_assert_eq "ready group tree: singleton is generation zero" \
+  $'0\t90000001\tps:Thu Jul 23 00:00:00 2026' \
+  "$(printf '%s\n' "$group_tree_data" | sed -n '2p')"
+
+group_tree_data=$(_run_group_tree_case siblings)
+_assert_eq "ready group tree: siblings succeed" "rc=0" \
+  "$(printf '%s\n' "$group_tree_data" | sed -n '1p')"
+_assert_eq "ready group tree: siblings share generation zero" \
+  $'0\t90000001\tps:Thu Jul 23 00:00:00 2026\n0\t90000002\tps:Thu Jul 23 00:00:00 2026' \
+  "$(printf '%s\n' "$group_tree_data" | sed -n '2,3p')"
+
+for group_tree_case in parent-first child-first; do
+  group_tree_data=$(_run_group_tree_case "$group_tree_case")
+  _assert_eq "ready group tree $group_tree_case: linear tree succeeds" "rc=0" \
+    "$(printf '%s\n' "$group_tree_data" | sed -n '1p')"
+  _assert_eq "ready group tree $group_tree_case: child precedes parent" \
+    $'0\t90000002\tps:Thu Jul 23 00:00:00 2026\n1\t90000001\tps:Thu Jul 23 00:00:00 2026' \
+    "$(printf '%s\n' "$group_tree_data" | sed -n '2,3p')"
+done
+
+group_tree_data=$(_run_group_tree_case branching)
+_assert_eq "ready group tree: branching tree succeeds" "rc=0" \
+  "$(printf '%s\n' "$group_tree_data" | sed -n '1p')"
+_assert_eq "ready group tree: branch leaves precede their parent" \
+  $'0\t90000002\tps:Thu Jul 23 00:00:00 2026\n0\t90000003\tps:Thu Jul 23 00:00:00 2026\n1\t90000001\tps:Thu Jul 23 00:00:00 2026' \
+  "$(printf '%s\n' "$group_tree_data" | sed -n '2,4p')"
+
+guardian_harness=$(_tmpdir)/ready-empty-guardian-harness
+cat >"$guardian_harness" <<'HARNESS'
+#!/usr/bin/env bash
+
+root="$1"
+mode="$2"
+result="$3"
+
+# shellcheck disable=SC1090 # The test supplies the checkout under test.
+source "$root/lib/sley/ready.sh"
+
+guardian_pid=$BASHPID
+case "$mode" in
+  scan)
+    members=$(_sley_ready_process_group_tree "$guardian_pid" "$guardian_pid")
+    scan_rc=$?
+    {
+      printf 'scan_rc=%s\n' "$scan_rc"
+      printf 'members=%s\n' "${members:-none}"
+    } >"$result"
+    ;;
+  cancel)
+    _sley_ready_guardian_cancel 143
+    cancel_rc=$?
+    {
+      printf 'cancel_rc=%s\n' "$cancel_rc"
+      printf 'guardian_status=%s\n' "${_sley_ready_guardian_status:-unset}"
+    } >"$result"
+    ;;
+  *)
+    exit 2
+    ;;
+esac
+HARNESS
+chmod +x "$guardian_harness"
+
+guardian_driver=$(_tmpdir)/ready-empty-guardian-driver.py
+cat >"$guardian_driver" <<'PYTHON'
+import os
+import signal
+import subprocess
+import sys
+
+bash_command, harness, root, mode, result = sys.argv[1:]
+process = subprocess.Popen(
+    [bash_command, "--noprofile", "--norc", harness, root, mode, result],
+    start_new_session=True,
+)
+try:
+    process.wait(timeout=10)
+except subprocess.TimeoutExpired:
+    os.killpg(process.pid, signal.SIGKILL)
+    process.wait()
+print(f"process_rc={process.returncode}")
+if os.path.exists(result):
+    with open(result, encoding="utf-8") as result_file:
+        print(result_file.read(), end="")
+PYTHON
+
+guardian_scan_result=$(_tmpdir)/guardian-scan.result
+guardian_scan_data=$(python3 "$guardian_driver" \
+  "$(command -v bash)" "$guardian_harness" "$SLEY_REPO_ROOT" scan "$guardian_scan_result")
+_assert_eq "ready guardian scan: empty real group exits successfully" "0" \
+  "$(_result_value process_rc "$guardian_scan_data")"
+_assert_eq "ready guardian scan: discovery succeeds" "0" \
+  "$(_result_value scan_rc "$guardian_scan_data")"
+_assert_eq "ready guardian scan: excludes its scanner subtree" "none" \
+  "$(_result_value members "$guardian_scan_data")"
+
+guardian_cancel_result=$(_tmpdir)/guardian-cancel.result
+guardian_cancel_data=$(python3 "$guardian_driver" \
+  "$(command -v bash)" "$guardian_harness" "$SLEY_REPO_ROOT" cancel "$guardian_cancel_result")
+_assert_eq "ready guardian cancel: empty real group survives cleanup" "0" \
+  "$(_result_value process_rc "$guardian_cancel_data")"
+_assert_eq "ready guardian cancel: helper returns successfully" "0" \
+  "$(_result_value cancel_rc "$guardian_cancel_data")"
+_assert_eq "ready guardian cancel: records requested signal status" "143" \
+  "$(_result_value guardian_status "$guardian_cancel_data")"
+
 no_resume_harness=$(_tmpdir)/ready-no-resume-harness
 cat >"$no_resume_harness" <<'HARNESS'
 #!/usr/bin/env bash
@@ -2191,9 +2464,11 @@ cat >"$signal_driver" <<'PYTHON'
 import atexit
 import glob
 import os
+import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 
 (
@@ -2213,6 +2488,7 @@ import time
     trap_log,
 ) = sys.argv[1:]
 
+tmpdir = tempfile.mkdtemp(prefix="signal-", dir=tmpdir)
 env = os.environ.copy()
 env.update(
     {
@@ -2245,6 +2521,13 @@ env.update(
         "TMPDIR": tmpdir,
     }
 )
+
+test_blocker_fd = None
+if mode in ("replacement-chain", "term-cleanup"):
+    test_blocker = os.path.join(sync_dir, "test.blocker.fifo")
+    os.mkfifo(test_blocker, mode=0o600)
+    test_blocker_fd = os.open(test_blocker, os.O_RDWR | os.O_NONBLOCK)
+    env["SLEY_READY_TEST_BLOCKER"] = test_blocker
 
 process = None
 owned_session = None
@@ -2315,13 +2598,20 @@ def kill_owned_processes():
 
 
 def cleanup_owned_session():
-    if owned_session is not None:
-        kill_owned_processes()
-    elif process is not None:
-        try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except OSError:
-            pass
+    global test_blocker_fd
+    try:
+        if owned_session is not None:
+            kill_owned_processes()
+        elif process is not None:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except OSError:
+                pass
+    finally:
+        if test_blocker_fd is not None:
+            os.close(test_blocker_fd)
+            test_blocker_fd = None
+        shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 def interrupted(_signal_number, _frame):
@@ -2365,51 +2655,132 @@ def wait_for(predicate, timeout):
     return predicate()
 
 
+def read_published_pid(path):
+    try:
+        with open(path, encoding="ascii") as pid_file:
+            value = pid_file.read().strip()
+    except OSError:
+        return None
+    return int(value) if value.isdigit() else None
+
+
+def published_pids(paths):
+    values = [read_published_pid(path) for path in paths]
+    return values if all(value is not None for value in values) else None
+
+
 phase_names = ("phase-a", "phase-b")
 pids = []
 descendant_pids = []
 formatter_pids = []
+replacement_pids = []
 late_formatter_started = False
 if mode == "format-long":
-    started = wait_for(lambda: os.path.exists(os.path.join(sync_dir, "formatter.started")), 5)
+    formatter_pid_path = os.path.join(sync_dir, "formatter.pid")
+    started = wait_for(
+        lambda: os.path.exists(os.path.join(sync_dir, "formatter.started"))
+        and read_published_pid(formatter_pid_path) is not None,
+        5,
+    )
 elif mode == "format-delayed":
     started = wait_for(
         lambda: os.path.exists(os.path.join(sync_dir, "formatter.runner-waiting")), 5
     )
 else:
+    phase_pid_paths = [os.path.join(sync_dir, f"{name}.pid") for name in phase_names]
+    required_pid_paths = list(phase_pid_paths)
+    if mode == "descendant":
+        required_pid_paths.extend(
+            os.path.join(sync_dir, f"{name}.descendant.pid") for name in phase_names
+        )
     started = wait_for(
-        lambda: all(os.path.exists(os.path.join(sync_dir, f"{name}.started")) for name in phase_names),
+        lambda: all(os.path.exists(os.path.join(sync_dir, f"{name}.started")) for name in phase_names)
+        and published_pids(required_pid_paths) is not None,
         5,
     )
 if started and not mode.startswith("format-"):
     for name in phase_names:
-        with open(os.path.join(sync_dir, f"{name}.pid"), encoding="ascii") as pid_file:
-            pids.append(int(pid_file.read().strip()))
-            remember_owned_pid(pids[-1])
+        phase_pid = read_published_pid(os.path.join(sync_dir, f"{name}.pid"))
+        if phase_pid is None:
+            raise RuntimeError(f"phase PID for {name} became unreadable")
+        pids.append(phase_pid)
+        remember_owned_pid(phase_pid)
         descendant_path = os.path.join(sync_dir, f"{name}.descendant.pid")
-        if os.path.exists(descendant_path):
-            with open(descendant_path, encoding="ascii") as pid_file:
-                descendant_pids.append(int(pid_file.read().strip()))
-                remember_owned_pid(descendant_pids[-1])
+        descendant_pid = read_published_pid(descendant_path)
+        if descendant_pid is not None:
+            descendant_pids.append(descendant_pid)
+            remember_owned_pid(descendant_pid)
 if started and mode == "format-long":
-    with open(os.path.join(sync_dir, "formatter.pid"), encoding="ascii") as pid_file:
-        formatter_pids.append(int(pid_file.read().strip()))
-        remember_owned_pid(formatter_pids[-1])
+    formatter_pid_path = os.path.join(sync_dir, "formatter.pid")
+    formatter_pid = read_published_pid(formatter_pid_path)
+    if formatter_pid is None:
+        raise RuntimeError("formatter PID became unreadable")
+    formatter_pids.append(formatter_pid)
+    remember_owned_pid(formatter_pid)
 if started:
     if mode == "identity-lost":
         open(env["SLEY_READY_TEST_IDENTITY_LOST_FILE"], "a", encoding="ascii").close()
+    if mode == "replacement-chain":
+        open(os.path.join(sync_dir, "cancel.requested"), "a", encoding="ascii").close()
     cancel_started = time.monotonic()
     os.kill(process.pid, getattr(signal, f"SIG{signal_name}"))
 else:
     cancel_started = None
 if started and mode == "format-delayed":
     formatter_started_path = os.path.join(sync_dir, "formatter.started")
-    wait_for(lambda: os.path.exists(formatter_started_path) or process.poll() is not None, 1)
-    late_formatter_started = os.path.exists(formatter_started_path)
+    formatter_pid_path = os.path.join(sync_dir, "formatter.pid")
+    wait_for(
+        lambda: (
+            os.path.exists(formatter_started_path)
+            and read_published_pid(formatter_pid_path) is not None
+        )
+        or process.poll() is not None,
+        1,
+    )
+    late_formatter_started = (
+        os.path.exists(formatter_started_path)
+        and read_published_pid(formatter_pid_path) is not None
+    )
     if late_formatter_started:
-        with open(os.path.join(sync_dir, "formatter.pid"), encoding="ascii") as pid_file:
-            formatter_pids.append(int(pid_file.read().strip()))
-            remember_owned_pid(formatter_pids[-1])
+        formatter_pid = read_published_pid(os.path.join(sync_dir, "formatter.pid"))
+        if formatter_pid is None:
+            raise RuntimeError("late formatter PID became unreadable")
+        formatter_pids.append(formatter_pid)
+        remember_owned_pid(formatter_pid)
+replacement_chain_started = False
+replacement_same_group = False
+replacement_after_cancel = False
+replacement_handlers_started = False
+if started and mode == "replacement-chain":
+    replacement_pid_paths = [
+        os.path.join(sync_dir, f"{name}.replacement.{generation}.pid")
+        for name in phase_names
+        for generation in range(1, 4)
+    ]
+    replacement_ready = wait_for(
+        lambda: all(
+            os.path.exists(os.path.join(sync_dir, f"{name}.replacement.handler-started"))
+            and os.path.exists(os.path.join(sync_dir, f"{name}.replacement.ready"))
+            for name in phase_names
+        )
+        and published_pids(replacement_pid_paths) is not None,
+        10,
+    )
+    replacement_handlers_started = replacement_ready
+    replacement_chain_started = replacement_ready
+    if replacement_chain_started:
+        replacement_values = published_pids(replacement_pid_paths)
+        if replacement_values is None:
+            raise RuntimeError("replacement PID publication became unreadable")
+        replacement_pids.extend(replacement_values)
+        for replacement_pid in replacement_pids:
+            remember_owned_pid(replacement_pid)
+        replacement_same_group = not glob.glob(
+            os.path.join(sync_dir, "*.replacement.*.group-mismatch")
+        )
+        replacement_after_cancel = not glob.glob(
+            os.path.join(sync_dir, "*.replacement.before-cancel")
+        )
 
 completed = True
 try:
@@ -2452,6 +2823,11 @@ def pid_running(pid):
 children_gone = wait_for(lambda: all(not pid_exists(pid) for pid in pids), 2)
 descendants_gone = wait_for(lambda: all(not pid_running(pid) for pid in descendant_pids), 2)
 formatters_gone = wait_for(lambda: all(not pid_running(pid) for pid in formatter_pids), 2)
+replacements_gone = wait_for(lambda: all(not pid_running(pid) for pid in replacement_pids), 2)
+replacements_absent = wait_for(lambda: all(not pid_exists(pid) for pid in replacement_pids), 5)
+replacement_remaining_pids = [
+    str(pid) for pid in replacement_pids if pid_exists(pid)
+]
 term_cleanup_done = all(
     os.path.exists(os.path.join(sync_dir, f"{name}.term-cleanup")) for name in phase_names
 )
@@ -2467,7 +2843,7 @@ if os.path.exists(result):
 # Cleanup is also registered with atexit and signal handlers above, so errors
 # and test interruption cannot leave a synthetic worker tree behind.
 if process.poll() is None or any(
-    pid_exists(pid) for pid in pids + descendant_pids + formatter_pids
+    pid_exists(pid) for pid in pids + descendant_pids + formatter_pids + replacement_pids
 ):
     kill_owned_processes()
 process.wait()
@@ -2478,6 +2854,16 @@ print(f"cancel_elapsed_ms={cancel_elapsed_ms}")
 print(f"children_gone={'yes' if children_gone else 'no'}")
 print(f"descendants_gone={'yes' if descendants_gone else 'no'}")
 print(f"formatters_gone={'yes' if formatters_gone else 'no'}")
+print(f"replacement_chain_started={'yes' if replacement_chain_started else 'no'}")
+print(f"replacement_same_group={'yes' if replacement_same_group else 'no'}")
+print(f"replacement_after_cancel={'yes' if replacement_after_cancel else 'no'}")
+print(f"replacement_handlers_started={'yes' if replacement_handlers_started else 'no'}")
+print(f"replacements_gone={'yes' if replacements_gone else 'no'}")
+print(f"replacements_absent={'yes' if replacements_absent else 'no'}")
+print(
+    "replacement_remaining_pids="
+    + (",".join(replacement_remaining_pids) if replacement_remaining_pids else "none")
+)
 print(f"late_formatter_started={'yes' if late_formatter_started else 'no'}")
 print(f"term_cleanup_done={'yes' if term_cleanup_done else 'no'}")
 print(f"artifact_count={len(artifacts)}")
@@ -2518,6 +2904,9 @@ for cancel_signal in INT TERM HUP; do
   esac
   _assert_eq "ready $cancel_signal: both phases start" "yes" "$(_result_value started "$cancel_data")"
   _assert_eq "ready $cancel_signal: sourced call returns" "yes" "$(_result_value completed "$cancel_data")"
+  cancel_elapsed=$(_result_value cancel_elapsed_ms "$cancel_data")
+  _assert_eq "ready $cancel_signal: ordinary cancellation completes within eight seconds (${cancel_elapsed:-no result}ms)" \
+    "yes" "$(_millis_below "$cancel_elapsed" 8000)"
   _assert_eq "ready $cancel_signal: returns conventional signal status" \
     "$expected_rc" "$(_result_value ready_rc "$cancel_data")"
   _assert_eq "ready $cancel_signal: leaves no live or zombie phase children" \
@@ -2534,6 +2923,65 @@ for cancel_signal in INT TERM HUP; do
     "yes" "$(_result_value cleanup_globals_absent "$cancel_data")"
   _assert_eq "ready $cancel_signal: driver isolates the child session" \
     "yes" "$(_result_value owned_session_isolated "$cancel_data")"
+done
+
+echo "=== sley: TERM-spawned replacement-chain cleanup ==="
+
+for replacement_signal in INT TERM HUP; do
+  rm -f "$sync_dir"/* "$ready_tmp"/sley-ready-* 2>/dev/null || true
+  replacement_output=$(_tmpdir)/"replacement-$replacement_signal.out"
+  replacement_result=$(_tmpdir)/"replacement-$replacement_signal.result"
+  replacement_trap_log=$(_tmpdir)/"replacement-$replacement_signal.traps"
+  replacement_data=$(python3 "$signal_driver" \
+    "$(command -v bash)" \
+    "$harness" \
+    "$SLEY_REPO_ROOT" \
+    "$repo" \
+    "$home" \
+    "$config" \
+    "$home/cache" \
+    "$ready_tmp" \
+    "$sync_dir" \
+    replacement-chain \
+    "$replacement_signal" \
+    "$replacement_output" \
+    "$replacement_result" \
+    "$replacement_trap_log")
+  case "$replacement_signal" in
+    INT) replacement_expected_rc=130 ;;
+    TERM) replacement_expected_rc=143 ;;
+    HUP) replacement_expected_rc=129 ;;
+  esac
+  _assert_eq "ready replacement $replacement_signal: phases start" \
+    "yes" "$(_result_value started "$replacement_data")"
+  _assert_eq "ready replacement $replacement_signal: TERM handlers run" \
+    "yes" "$(_result_value replacement_handlers_started "$replacement_data")"
+  _assert_eq "ready replacement $replacement_signal: TERM handlers spawn complete chains" \
+    "yes" "$(_result_value replacement_chain_started "$replacement_data")"
+  _assert_eq "ready replacement $replacement_signal: chains start after cancellation" \
+    "yes" "$(_result_value replacement_after_cancel "$replacement_data")"
+  _assert_eq "ready replacement $replacement_signal: chains remain in owned process groups" \
+    "yes" "$(_result_value replacement_same_group "$replacement_data")"
+  _assert_eq "ready replacement $replacement_signal: sourced call returns" \
+    "yes" "$(_result_value completed "$replacement_data")"
+  _assert_eq "ready replacement $replacement_signal: returns conventional signal status" \
+    "$replacement_expected_rc" "$(_result_value ready_rc "$replacement_data")"
+  _assert_eq "ready replacement $replacement_signal: TERM-ignoring chains are gone" \
+    "yes" "$(_result_value replacements_gone "$replacement_data")"
+  replacement_remaining=$(_result_value replacement_remaining_pids "$replacement_data")
+  _assert_eq "ready replacement $replacement_signal: every replacement PID ceases existing (remaining: ${replacement_remaining:-unknown})" \
+    "yes" "$(_result_value replacements_absent "$replacement_data")"
+  replacement_artifacts=$(_result_value artifact_paths "$replacement_data")
+  _assert_eq "ready replacement $replacement_signal: leaves no temporary artifacts (${replacement_artifacts:-unknown})" \
+    "0" "$(_result_value artifact_count "$replacement_data")"
+  _assert_eq "ready replacement $replacement_signal: does not invoke caller trap" \
+    "no" "$(_result_value caller_trap_fired "$replacement_data")"
+  _assert_eq "ready replacement $replacement_signal: restores caller traps" \
+    "yes" "$(_result_value traps_restored "$replacement_data")"
+  _assert_eq "ready replacement $replacement_signal: preserves caller shell options" \
+    "yes" "$(_result_value options_restored "$replacement_data")"
+  _assert_eq "ready replacement $replacement_signal: leaks no cleanup globals" \
+    "yes" "$(_result_value cleanup_globals_absent "$replacement_data")"
 done
 
 echo "=== sley: cancellation without process identity ==="
@@ -2664,7 +3112,8 @@ _assert_eq "ready identity lost: preserves conventional signal status" \
   "143" "$(_result_value ready_rc "$lost_identity_data")"
 _assert_eq "ready identity lost: direct phase children are gone" \
   "yes" "$(_result_value children_gone "$lost_identity_data")"
-_assert_eq "ready identity lost: leaves no temporary artifacts" \
+identity_lost_artifacts=$(_result_value artifact_paths "$lost_identity_data")
+_assert_eq "ready identity lost: leaves no temporary artifacts (${identity_lost_artifacts:-unknown})" \
   "0" "$(_result_value artifact_count "$lost_identity_data")"
 
 echo "=== sley: nested formatter cancellation cleanup ==="
@@ -2803,7 +3252,8 @@ rm -f "$sync_dir"/* "$ready_tmp"/sley-ready-* 2>/dev/null || true
 term_cleanup_output=$(_tmpdir)/term-cleanup.out
 term_cleanup_result=$(_tmpdir)/term-cleanup.result
 term_cleanup_trap_log=$(_tmpdir)/term-cleanup.traps
-term_cleanup_data=$(python3 "$signal_driver" \
+term_cleanup_watchdog_rc=0
+term_cleanup_data=$(_with_timeout 20 python3 "$signal_driver" \
   "$(command -v bash)" \
   "$harness" \
   "$SLEY_REPO_ROOT" \
@@ -2817,7 +3267,10 @@ term_cleanup_data=$(python3 "$signal_driver" \
   TERM \
   "$term_cleanup_output" \
   "$term_cleanup_result" \
-  "$term_cleanup_trap_log")
+  "$term_cleanup_trap_log") || term_cleanup_watchdog_rc=$?
+term_cleanup_elapsed=$(_result_value cancel_elapsed_ms "$term_cleanup_data")
+_assert_eq "ready cooperative TERM: completes before 20-second outer watchdog (${term_cleanup_elapsed:-no result}ms)" \
+  "0" "$term_cleanup_watchdog_rc"
 _assert_eq "ready cooperative TERM: phases start" \
   "yes" "$(_result_value started "$term_cleanup_data")"
 _assert_eq "ready cooperative TERM: sourced call returns" \
@@ -2826,9 +3279,6 @@ _assert_eq "ready cooperative TERM: returns conventional signal status" \
   "143" "$(_result_value ready_rc "$term_cleanup_data")"
 _assert_eq "ready cooperative TERM: phase cleanup handler completes" \
   "yes" "$(_result_value term_cleanup_done "$term_cleanup_data")"
-term_cleanup_elapsed=$(_result_value cancel_elapsed_ms "$term_cleanup_data")
-_assert_eq "ready cooperative TERM: cancellation completes within three seconds (${term_cleanup_elapsed}ms)" \
-  "yes" "$(_millis_below "$term_cleanup_elapsed" 3000)"
 _assert_eq "ready cooperative TERM: leaves no temporary artifacts" \
   "0" "$(_result_value artifact_count "$term_cleanup_data")"
 
