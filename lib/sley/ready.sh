@@ -691,7 +691,7 @@ _sley_ready_process_group_tree() {
       [[ "$member_group" == "$process_group" ]] || continue
       started="$day_name $month $day $process_time $year"
       if [[ -r "/proc/$process_pid/stat" ]]; then
-        stat_line=$(<"/proc/$process_pid/stat") || continue
+        { stat_line=$(<"/proc/$process_pid/stat"); } 2>/dev/null || continue
         _sley_ready_parse_proc_stat "$process_pid" "$stat_line" || continue
         [[ "$_sley_ready_proc_group" == "$process_group" ]] || continue
         process_identity=$_sley_ready_proc_identity
@@ -712,7 +712,7 @@ _sley_ready_process_group_tree() {
   elif [[ -d /proc ]]; then
     for stat_file in /proc/[0-9]*/stat; do
       [[ -r "$stat_file" ]] || continue
-      stat_line=$(<"$stat_file") || continue
+      { stat_line=$(<"$stat_file"); } 2>/dev/null || continue
       process_pid=${stat_file#/proc/}
       process_pid=${process_pid%/stat}
       _sley_ready_parse_proc_stat "$process_pid" "$stat_line" || continue
@@ -908,7 +908,7 @@ _sley_ready_process_is_same_group_member() {
   local _sley_ready_proc_pid="" _sley_ready_proc_parent="" _sley_ready_proc_group=""
   local _sley_ready_proc_identity=""
   if [[ -r "/proc/$process_pid/stat" ]]; then
-    stat_line=$(<"/proc/$process_pid/stat") || return 1
+    { stat_line=$(<"/proc/$process_pid/stat"); } 2>/dev/null || return 1
     _sley_ready_parse_proc_stat "$process_pid" "$stat_line" || return 1
     [[ "$_sley_ready_proc_identity" == "$expected_identity" &&
       "$_sley_ready_proc_group" == "$expected_group" ]]
@@ -1748,14 +1748,14 @@ _sley_ready_impl() {
         _sley_ready_run_guarded_command \
           _sley_ready_run_phase "$phase" "$full" "$force" "${scope_args[@]}"
       ); then
-        phase_rc=0
+        rc=0
       else
-        phase_rc=$?
+        rc=$?
       fi
       if [[ -n "$_sley_ready_guardian_status" ]]; then
         exit "$_sley_ready_guardian_status"
       fi
-      exit "$phase_rc"
+      exit "$rc"
     ) </dev/null >"$stdout_file" 2>"$stderr_file" &
     pid=$!
     [[ "$child_had_monitor" == "1" ]] || set +m

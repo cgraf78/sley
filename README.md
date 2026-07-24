@@ -223,6 +223,12 @@ verification registry commands, including `required`, `tier`, and optional
 `cache` metadata, so `sley ready` can run environment-specific checks without
 base sley knowing about those tools.
 
+Sley runs each readiness phase in a managed process group and contains ordinary
+descendants that remain in that group. Extension hooks and phases must remain in
+that managed process group through completion and cancellation. Code that
+daemonizes, creates a new session, or otherwise leaves the group is unsupported;
+cleanup remains the extension author's responsibility.
+
 The former `repo-check` surface has been removed. New code should not introduce
 `_repo_*` or `_REPO_CHECK_*` hook APIs.
 
