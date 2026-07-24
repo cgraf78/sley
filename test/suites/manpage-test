@@ -26,4 +26,14 @@ done < <(
 
 _assert_contains "manpage documents verify bridge" "Checkrun verify bridge" "$content"
 
+readme_content=$(cat "$SLEY_REPO_ROOT/README.md")
+_assert_contains "README documents ready process-group boundary" \
+  "managed process group through completion" "$readme_content"
+_assert_contains "README assigns detached process cleanup to extension authors" \
+  "cleanup remains the extension author's responsibility" "$readme_content"
+_assert_contains "manpage documents ready process-group boundary" \
+  "managed process group through completion" "$content"
+_assert_contains "manpage assigns detached process cleanup to extension authors" \
+  "cleanup remains the extension author's responsibility" "$content"
+
 _test_summary

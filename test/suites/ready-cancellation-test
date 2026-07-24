@@ -156,7 +156,7 @@ sley_hook_format_file() {
 sley_ext_ready_phase() {
   local phase="$1"
   case "${SLEY_READY_TEST_MODE:-normal}" in
-    normal)
+    normal | readonly-collision)
       printf '%s complete\n' "$phase"
       ;;
     failure)
@@ -292,6 +292,10 @@ before_term=$(trap -p TERM)
 before_hup=$(trap -p HUP)
 before_options=$-
 
+if [[ "${SLEY_READY_TEST_MODE:-}" == "readonly-collision" ]]; then
+  readonly phase_rc=caller
+fi
+
 ready_args=(
   --exclude status
   --exclude check
@@ -357,6 +361,7 @@ done
   printf 'traps_restored=%s\n' "$traps_restored"
   printf 'options_restored=%s\n' "$options_restored"
   printf 'cleanup_globals_absent=%s\n' "$cleanup_globals_absent"
+  printf 'caller_phase_rc=%s\n' "${phase_rc:-unset}"
   printf 'artifact_count=%s\n' "$artifact_count"
   printf 'artifact_paths=%s\n' "${artifact_paths:-none}"
   printf 'fix_backup_count=%s\n' "$fix_backup_count"
@@ -420,6 +425,19 @@ if [[ -n "$normal_phase_a_line" && -n "$normal_phase_b_line" &&
 else
   _fail "ready normal: phase report order changed"
 fi
+
+readonly_output=$(_tmpdir)/readonly.out
+readonly_result=$(_tmpdir)/readonly.result
+readonly_trap_log=$(_tmpdir)/readonly.traps
+_run_sourced_ready readonly-collision \
+  "$readonly_output" "$readonly_result" "$readonly_trap_log"
+readonly_data=$(cat "$readonly_result")
+_assert_eq "ready phase locals: readonly caller name does not fail phases" \
+  "0" "$(_result_value ready_rc "$readonly_data")"
+_assert_eq "ready phase locals: readonly caller value remains unchanged" \
+  "caller" "$(_result_value caller_phase_rc "$readonly_data")"
+_assert_not_contains "ready phase locals: emits no readonly diagnostic" \
+  "readonly variable" "$(cat "$readonly_output")"
 if grep -Eq '^\[[0-9]+\].*(Done|Terminated|Exit)' "$normal_output"; then
   _fail "ready normal: isolated implementation leaked a job-status notification"
 else

@@ -47,6 +47,12 @@ Run the aggregate pre-submit readiness report. With
 and
 .BR --commit ,
 this is the commit-gate path used by native hooks.
+.PP
+Sley runs each readiness phase in a managed process group and contains ordinary
+descendants that remain in that group. Extension hooks and phases must remain in
+that managed process group through completion and cancellation. Code that
+daemonizes, creates a new session, or otherwise leaves the group is unsupported;
+cleanup remains the extension author's responsibility.
 .TP
 .B hook
 Run narrow editor and agent hook entry points such as formatting or linting one
