@@ -13,6 +13,21 @@ echo "=== portable timeout fallback ==="
 
 python=$(command -v python3)
 host_ps=$(command -v ps || true)
+busybox_bin="$(_tmpdir)/busybox-bin"
+mkdir -p "$busybox_bin"
+cat >"$busybox_bin/timeout" <<'EOF'
+#!/bin/sh
+[ "$1" = -k ] || exit 64
+[ "$2" = 5 ] || exit 64
+shift 2
+shift
+exec "$@"
+EOF
+chmod 755 "$busybox_bin/timeout"
+
+PATH="$busybox_bin" _with_timeout 1 /bin/sh -c 'exit 7'
+_assert_exit "BusyBox timeout: uses portable short kill-after option" 7 "$?"
+
 fallback_bin="$(_tmpdir)/bin"
 mkdir -p "$fallback_bin"
 ln -s "$python" "$fallback_bin/python3"
