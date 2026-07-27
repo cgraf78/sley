@@ -1943,6 +1943,11 @@ if ! process_tree=$(_sley_ready_process_tree "$worker_pid" "$worker_identity"); 
   process_tree="$worker_pid"$'\t'"$worker_identity"
 fi
 printf 'proc_tree_without_ps=%s\n' "$proc_tree_without_ps"
+if [[ -r "/proc/$worker_pid/comm" ]]; then
+  launch_command=$(<"/proc/$worker_pid/comm")
+else
+  launch_command=$("$system_ps" -p "$worker_pid" -o comm= 2>/dev/null || true)
+fi
 : >"$sync_dir/identity.exec"
 exec_observed=no
 for _ in 1 2 3 4 5 6 7 8 9 10; do
@@ -1951,7 +1956,7 @@ for _ in 1 2 3 4 5 6 7 8 9 10; do
   else
     worker_command=$("$system_ps" -p "$worker_pid" -o comm= 2>/dev/null || true)
   fi
-  if [[ "$worker_command" == *sleep* ]]; then
+  if [[ -n "$worker_command" && "$worker_command" != "$launch_command" ]]; then
     exec_observed=yes
     break
   fi
