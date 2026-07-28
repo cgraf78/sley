@@ -415,6 +415,51 @@ if command -v jq >/dev/null 2>&1 || command -v python3 >/dev/null 2>&1; then
   else
     _fail "changes --json: quotes/backslash/control-byte emit valid JSON"
   fi
+
+  if command -v jq >/dev/null 2>&1; then
+    repo=$(_new_repo)
+    real_jq=$(command -v jq)
+    encoder_bin=$(_mock_bin)
+    encoder_log="$repo/encoder.log"
+    export REAL_JQ="$real_jq" SLEY_ENCODER_LOG="$encoder_log"
+    cat >"$encoder_bin/jq" <<'MOCK'
+#!/usr/bin/env bash
+printf 'jq\n' >>"$SLEY_ENCODER_LOG"
+if [[ "${SLEY_ENCODER_UNDERCOUNT:-}" == "1" && "$*" == "-R ." ]]; then
+  printf '"only-one-path"\n'
+  exit 0
+fi
+exec "$REAL_JQ" "$@"
+MOCK
+    chmod +x "$encoder_bin/jq"
+    for ((file_index = 0; file_index < 300; file_index++)); do
+      printf 'x = %d\n' "$file_index" >"$repo/file-$file_index.py"
+    done
+    (cd "$repo" && git add -- file-*.py)
+    : >"$encoder_log"
+
+    PATH="$encoder_bin:$PATH" _run_sley "$repo" changes --json --commit
+    encoder_count=$(wc -l <"$encoder_log" | tr -d ' ')
+    if ((encoder_count <= 2)); then
+      _pass "changes --json: large file lists use at most two encoder processes"
+    else
+      _fail "changes --json: large file list launched $encoder_count encoder processes"
+    fi
+    if printf '%s' "$__SLEY_OUT" | "$real_jq" -e \
+      '([.files[].path] | sort) == ([range(0; 300) | "file-\(.).py"] | sort)' \
+      >/dev/null; then
+      _pass "changes --json: batch encoder preserves every path"
+    else
+      _fail "changes --json: batch encoder preserves every path"
+    fi
+
+    export SLEY_ENCODER_UNDERCOUNT=1
+    PATH="$encoder_bin:$PATH" _run_sley "$repo" changes --json --commit
+    _assert_exit "changes --json: encoder count mismatch exits 2" 2 "$__SLEY_RC"
+    _assert_not_contains "changes --json: encoder count mismatch emits no partial object" \
+      '"repo_type"' "$__SLEY_OUT"
+    unset REAL_JQ SLEY_ENCODER_LOG SLEY_ENCODER_UNDERCOUNT
+  fi
 fi
 
 mockbin=$(_mock_bin)
@@ -3540,8 +3585,10 @@ echo "=== sley: JSON escape python3 fallback does not trail with newline ==="
 # encodes. Verify the JSON value matches the input bytes exactly.
 if command -v python3 >/dev/null 2>&1; then
   no_jq_path=$(_mock_bin)
+  ln -s "$(command -v python3)" "$no_jq_path/python3"
+  # shellcheck disable=SC2016 # The nested Bash expands SLEY_REPO_ROOT.
   out=$(
-    HOME="$HOME" PATH="$no_jq_path:/usr/bin:/bin" bash -c '
+    HOME="$HOME" PATH="$no_jq_path" "$BASH" -c '
       source "$SLEY_REPO_ROOT/lib/sley/repo.sh"
       _repo_json_escape "abc"
     '
@@ -3550,6 +3597,62 @@ if command -v python3 >/dev/null 2>&1; then
     _pass "json escape: python3 fallback preserves value bytes"
   else
     _fail "json escape: python3 fallback added trailing characters (got: $(printf '%q' "$out"))"
+  fi
+
+  # shellcheck disable=SC2016 # The nested Bash expands SLEY_REPO_ROOT.
+  out=$(
+    printf '%s\n' $'abc\nx\tvalue' |
+      HOME="$HOME" PATH="$no_jq_path" "$BASH" -c '
+      source "$SLEY_REPO_ROOT/lib/sley/repo.sh"
+      _repo_json_escape_lines
+    '
+  )
+  expected=$'"abc"\n"x\\tvalue"'
+  if [[ "$out" == "$expected" ]]; then
+    _pass "json escape: python3 fallback batch-encodes one record per line"
+  else
+    _fail "json escape: python3 fallback batch output differs (got: $(printf '%q' "$out"))"
+  fi
+
+  # shellcheck disable=SC2016 # The nested Bash expands SLEY_REPO_ROOT.
+  out=$(
+    printf '%s\n' $'alpha.py\nmid\rname.py\ngamma.py' |
+      HOME="$HOME" PATH="$no_jq_path" "$BASH" -c '
+        source "$SLEY_REPO_ROOT/lib/sley/repo.sh"
+        _repo_json_escape_lines
+      '
+  )
+  expected=$'"alpha.py"\n"mid\\rname.py"\n"gamma.py"'
+  if [[ "$out" == "$expected" ]]; then
+    _pass "json escape: python3 fallback preserves carriage returns within records"
+  else
+    _fail "json escape: python3 fallback split a carriage-return path (got: $(printf '%q' "$out"))"
+  fi
+
+  python_json_dir=$(_tmpdir)
+  printf 'a\n' >"$python_json_dir/alpha.py"
+  printf 'b\n' >"$python_json_dir/"$'mid\rname.py'
+  printf 'c\n' >"$python_json_dir/gamma.py"
+  # shellcheck disable=SC2016 # The nested Bash expands Sley fixture variables.
+  out=$(
+    cd "$python_json_dir" || exit
+    export SLEY_PYTHON_FILES=$'alpha.py\nmid\rname.py\ngamma.py'
+    HOME="$HOME" PATH="$no_jq_path" "$BASH" -c '
+      source "$SLEY_REPO_ROOT/lib/sley/repo.sh"
+      source "$SLEY_REPO_ROOT/lib/sley/scope.sh"
+      _sley_json_files "$SLEY_PYTHON_FILES"
+    '
+  )
+  if printf '%s' "$out" | "$(command -v python3)" -c '
+import json
+import sys
+
+paths = [item["path"] for item in json.load(sys.stdin)]
+raise SystemExit(0 if paths == ["alpha.py", "mid\rname.py", "gamma.py"] else 1)
+'; then
+    _pass "json escape: python3 fallback keeps encoded paths aligned"
+  else
+    _fail "json escape: python3 fallback misaligned encoded paths"
   fi
 fi
 

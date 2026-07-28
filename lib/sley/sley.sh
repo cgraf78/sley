@@ -292,7 +292,7 @@ _sley_changes() {
   _sley_init_repo || return $?
   _sley_parse_scope "$@" || return $?
 
-  local files untracked_set=""
+  local files files_json untracked_set=""
   files=$(_sley_selected_files) || return 2
   if [[ "$_SLEY_SCOPE_JSON" == "1" ]]; then
     _repo_require_json_encoder || return 2
@@ -310,10 +310,10 @@ _sley_changes() {
         sl) untracked_set=$(_repo_sl_machine status --no-status -u 2>/dev/null) ;;
       esac
     fi
-    printf '{"repo_type":"%s","root":"%s","scope":"%s","files":' \
-      "$_REPO_TYPE" "$(_repo_json_escape "$_REPO_ROOT")" "$_SLEY_SCOPE_CHANGE"
-    _sley_json_files "$files" "$untracked_set"
-    printf '}\n'
+    files_json=$(_sley_json_files "$files" "$untracked_set") || return $?
+    printf '{"repo_type":"%s","root":"%s","scope":"%s","files":%s}\n' \
+      "$_REPO_TYPE" "$(_repo_json_escape "$_REPO_ROOT")" \
+      "$_SLEY_SCOPE_CHANGE" "$files_json"
   elif [[ -n "$files" ]]; then
     printf '%s\n' "$files"
   fi
