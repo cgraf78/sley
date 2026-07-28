@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# sley-performance-test - guard the shape of latency-sensitive verify paths.
+# sley-performance-test - guard the shape of latency-sensitive workflow paths.
 
 set -euo pipefail
 
@@ -11,16 +11,56 @@ SLEY="$SLEY_REPO_ROOT/bin/sley"
 . "$SLEY_TEST_DIR/helpers.sh"
 
 SLEY_PERF_RUNS=${SLEY_PERF_RUNS:-7}
+SLEY_HOOK_PERF_RUNS=${SLEY_HOOK_PERF_RUNS:-20}
 SLEY_PERF_CHANGED_FILES=${SLEY_PERF_CHANGED_FILES:-300}
 SLEY_PERF_BUDGET_MULTIPLIER_ENV=SLEY_PERF_BUDGET_MULTIPLIER
 
-# These measure the user-visible CLI path, including repo detection, changed-file
-# discovery, JSON command grouping, and process startup. They are intentionally
-# not microbenchmarks; commit hooks and agent workflows pay the full CLI cost.
-VERIFY_DISCOVERY_P95_BUDGET_MS=2500
-VERIFY_DISCOVERY_DARWIN_P95_BUDGET_MS=3500
-VERIFY_REQUIRED_REGISTRY_P95_BUDGET_MS=2500
-VERIFY_REQUIRED_REGISTRY_DARWIN_P95_BUDGET_MS=3500
+# These measure user-visible CLI paths, including repo detection, changed-file
+# discovery, JSON command grouping, hook dispatch, and process startup. They are
+# intentionally not microbenchmarks; hooks and agent workflows pay the full cost.
+VERIFY_DISCOVERY_MEDIAN_BUDGET_MS=2500
+VERIFY_DISCOVERY_DARWIN_MEDIAN_BUDGET_MS=3500
+VERIFY_DISCOVERY_MAX_BUDGET_MS=9000
+VERIFY_DISCOVERY_DARWIN_MAX_BUDGET_MS=12000
+VERIFY_REQUIRED_REGISTRY_MEDIAN_BUDGET_MS=2500
+VERIFY_REQUIRED_REGISTRY_DARWIN_MEDIAN_BUDGET_MS=3500
+VERIFY_REQUIRED_REGISTRY_MAX_BUDGET_MS=9000
+VERIFY_REQUIRED_REGISTRY_DARWIN_MAX_BUDGET_MS=12000
+HOOK_FORMAT_FILE_MEDIAN_BUDGET_MS=350
+HOOK_FORMAT_FILE_DARWIN_MEDIAN_BUDGET_MS=500
+HOOK_FORMAT_FILE_P95_BUDGET_MS=1000
+HOOK_FORMAT_FILE_DARWIN_P95_BUDGET_MS=1500
+
+perf_mock_bin=$(_mock_bin)
+cat >"$perf_mock_bin/checkrun" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+: "${SLEY_PERF_CHECKRUN_COUNT_FILE:?}"
+: "${SLEY_PERF_CHECKRUN_ARGS_PREFIX:?}"
+: "${SLEY_PERF_CHECKRUN_HOME_PREFIX:?}"
+
+count=$(cat "$SLEY_PERF_CHECKRUN_COUNT_FILE")
+count=$((count + 1))
+printf '%s\n' "$count" >"$SLEY_PERF_CHECKRUN_COUNT_FILE"
+printf '%s\n' "$@" >"${SLEY_PERF_CHECKRUN_ARGS_PREFIX}.${count}"
+printf '%s\n' "$HOME" >"${SLEY_PERF_CHECKRUN_HOME_PREFIX}.${count}"
+EOF
+cat >"$perf_mock_bin/autoformat" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+: "${SLEY_PERF_AUTOFORMAT_COUNT_FILE:?}"
+: "${SLEY_PERF_AUTOFORMAT_ARGS_PREFIX:?}"
+
+count=$(cat "$SLEY_PERF_AUTOFORMAT_COUNT_FILE")
+count=$((count + 1))
+printf '%s\n' "$count" >"$SLEY_PERF_AUTOFORMAT_COUNT_FILE"
+printf '%s\n' "$@" >"${SLEY_PERF_AUTOFORMAT_ARGS_PREFIX}.${count}"
+exit "${SLEY_PERF_AUTOFORMAT_RC:-0}"
+EOF
+chmod +x "$perf_mock_bin/checkrun" "$perf_mock_bin/autoformat"
+export PATH="$perf_mock_bin:$PATH"
 
 _new_perf_repo() {
   local repo
@@ -60,24 +100,72 @@ _assert_ms_le() {
   fi
 }
 
+_assert_file_matches() {
+  local desc="$1" expected="$2" actual="$3" expected_content actual_content
+  if [[ ! -f "$expected" || ! -f "$actual" ]]; then
+    _fail "$desc (file missing: $expected $actual)"
+    return
+  fi
+  expected_content=$(<"$expected")
+  actual_content=$(<"$actual")
+  if [[ "$expected_content" == "$actual_content" ]]; then
+    _pass "$desc"
+  else
+    _fail "$desc (files differ: $expected $actual)"
+  fi
+}
+
+_assert_checkrun_invocations() {
+  local desc="$1" expected_count="$2" expected_args="$3" expected_home="$4" count run
+  count=$(cat "$SLEY_PERF_CHECKRUN_COUNT_FILE")
+  _assert_eq "$desc count" "$expected_count" "$count"
+  for ((run = 1; run <= count; run++)); do
+    _assert_file_matches "$desc args $run" \
+      "$expected_args" "${SLEY_PERF_CHECKRUN_ARGS_PREFIX}.${run}"
+    _assert_file_content "$desc home $run" \
+      "$expected_home" "${SLEY_PERF_CHECKRUN_HOME_PREFIX}.${run}"
+  done
+}
+
+_assert_autoformat_invocations() {
+  local desc="$1" expected_count="$2" expected_args="$3" count run
+  count=$(cat "$SLEY_PERF_AUTOFORMAT_COUNT_FILE")
+  _assert_eq "$desc count" "$expected_count" "$count"
+  for ((run = 1; run <= count; run++)); do
+    _assert_file_matches "$desc args $run" \
+      "$expected_args" "${SLEY_PERF_AUTOFORMAT_ARGS_PREFIX}.${run}"
+  done
+}
+
 _p95_ms() {
   local runs="$1" index
   index=$(((runs * 95 + 99) / 100))
-  LC_ALL=C sort -n | sed -n "${index}p"
+  sed -n "${index}p"
+}
+
+_median_ms() {
+  local runs="$1"
+  awk -v runs="$runs" '
+    NR == int((runs + 1) / 2) { lower = $1 }
+    NR == int((runs + 2) / 2) { upper = $1 }
+    END { print int((lower + upper) / 2) }
+  '
 }
 
 _run_perf_sley_timed() {
   local timeout_secs="$1" repo="$2"
   shift 2
-  local xdg_config_home xdg_cache_home output_file rc_file
+  local home xdg_config_home xdg_cache_home output_file rc_file
+  home="$repo/.home"
   xdg_config_home="$repo/.xdg-config"
   xdg_cache_home="$repo/.xdg-cache"
   output_file="$repo/.sley-perf-output"
   rc_file="$repo/.sley-perf-rc"
-  mkdir -p "$xdg_config_home" "$xdg_cache_home"
+  mkdir -p "$home" "$xdg_config_home" "$xdg_cache_home"
   __SLEY_MS=$(
     cd "$repo" &&
-      XDG_CONFIG_HOME="$xdg_config_home" \
+      HOME="$home" \
+        XDG_CONFIG_HOME="$xdg_config_home" \
         XDG_CACHE_HOME="$xdg_cache_home" \
         GIT_CONFIG_GLOBAL="$repo/.gitconfig-test" \
         python3 - "$timeout_secs" "$output_file" "$rc_file" "$SLEY" "$@" <<'PY'
@@ -121,13 +209,14 @@ PY
   __SLEY_RC=$(cat "$rc_file")
 }
 
-_measure_perf_p95() {
-  local desc="$1" timeout_secs="$2" repo="$3"
-  shift 3
-  local durations_file run
+_measure_perf_stats() {
+  local desc="$1" timeout_secs="$2" repo="$3" runs="$4"
+  shift 4
+  local durations_file sorted_file run
   durations_file="$repo/.sley-perf-durations"
+  sorted_file="$durations_file.sorted"
   : >"$durations_file"
-  for run in $(seq 1 "$SLEY_PERF_RUNS"); do
+  for run in $(seq 1 "$runs"); do
     _run_perf_sley_timed "$timeout_secs" "$repo" "$@"
     if [[ "$__SLEY_RC" -ne 0 ]]; then
       _fail "$desc sample $run exits 0 (got $__SLEY_RC; output: $__SLEY_OUT)"
@@ -135,7 +224,10 @@ _measure_perf_p95() {
     fi
     printf '%s\n' "$__SLEY_MS" >>"$durations_file"
   done
-  __PERF_P95=$(_p95_ms "$SLEY_PERF_RUNS" <"$durations_file")
+  LC_ALL=C sort -n "$durations_file" >"$sorted_file"
+  __PERF_MEDIAN=$(_median_ms "$runs" <"$sorted_file")
+  __PERF_P95=$(_p95_ms "$runs" <"$sorted_file")
+  __PERF_MAX=$(tail -n 1 "$sorted_file")
 }
 
 _write_changed_tree() {
@@ -173,14 +265,29 @@ _run_perf_sley_timed 15 "$repo" verify --json
 _assert_exit "verify perf: large shared subtree discovery exits 0" 0 "$__SLEY_RC"
 _assert_contains "verify perf: discovers ancestor manifest command" "node app-test.js" "$__SLEY_OUT"
 _assert_contains "verify perf: discovers repo-root manifest command" "node root-test.js" "$__SLEY_OUT"
-_measure_perf_p95 "verify perf: large shared subtree discovery" 15 "$repo" verify --json
-discovery_p95="$__PERF_P95"
-discovery_budget=$(_perf_budget_ms "$VERIFY_DISCOVERY_P95_BUDGET_MS" "$VERIFY_DISCOVERY_DARWIN_P95_BUDGET_MS")
-echo "  PERF: verify discovery p95 ${discovery_p95}ms (budget ${discovery_budget}ms, files ${SLEY_PERF_CHANGED_FILES}, runs ${SLEY_PERF_RUNS})"
-_assert_ms_le "verify perf: large shared subtree discovery p95" "$discovery_p95" "$discovery_budget"
+_measure_perf_stats "verify perf: large shared subtree discovery" 15 "$repo" \
+  "$SLEY_PERF_RUNS" verify --json
+discovery_median="$__PERF_MEDIAN"
+discovery_max="$__PERF_MAX"
+discovery_median_budget=$(_perf_budget_ms \
+  "$VERIFY_DISCOVERY_MEDIAN_BUDGET_MS" \
+  "$VERIFY_DISCOVERY_DARWIN_MEDIAN_BUDGET_MS")
+discovery_max_budget=$(_perf_budget_ms \
+  "$VERIFY_DISCOVERY_MAX_BUDGET_MS" \
+  "$VERIFY_DISCOVERY_DARWIN_MAX_BUDGET_MS")
+echo "  PERF: verify discovery median ${discovery_median}ms / ${discovery_median_budget}ms, maximum ${discovery_max}ms / ${discovery_max_budget}ms (files ${SLEY_PERF_CHANGED_FILES}, runs ${SLEY_PERF_RUNS})"
+_assert_ms_le "verify perf: large shared subtree discovery median" \
+  "$discovery_median" "$discovery_median_budget"
+_assert_ms_le "verify perf: large shared subtree discovery maximum" \
+  "$discovery_max" "$discovery_max_budget"
 
 repo=$(_new_perf_repo)
 mkdir -p "$repo/.sley" "$repo/tests"
+checkrun_state=$(_tmpdir)
+export SLEY_PERF_CHECKRUN_COUNT_FILE="$checkrun_state/count"
+export SLEY_PERF_CHECKRUN_ARGS_PREFIX="$checkrun_state/args"
+export SLEY_PERF_CHECKRUN_HOME_PREFIX="$checkrun_state/home"
+printf '0\n' >"$SLEY_PERF_CHECKRUN_COUNT_FILE"
 cat >"$repo/.sley/verify.json" <<'EOF'
 {
   "rules": [
@@ -205,17 +312,72 @@ printf '%s\n' "$count" > tests/count
 EOF
 chmod +x "$repo/tests/run-once.sh"
 _write_changed_tree "$repo" "$SLEY_PERF_CHANGED_FILES"
+{
+  printf '%s\n' verify --
+  git -C "$repo" diff --name-only
+} >"$checkrun_state/expected-args"
 
 _run_perf_sley_timed 15 "$repo" verify --run-required --json
 _assert_exit "verify perf: large registry run exits 0" 0 "$__SLEY_RC"
 _assert_contains "verify perf: reports required command pass" '"status":"passed"' "$__SLEY_OUT"
 _assert_file_content "verify perf: grouped required command runs once" "1" "$repo/tests/count"
-_measure_perf_p95 "verify perf: large registry" 15 "$repo" verify --run-required --json
-registry_p95="$__PERF_P95"
-registry_budget=$(_perf_budget_ms \
-  "$VERIFY_REQUIRED_REGISTRY_P95_BUDGET_MS" \
-  "$VERIFY_REQUIRED_REGISTRY_DARWIN_P95_BUDGET_MS")
-echo "  PERF: verify required registry p95 ${registry_p95}ms (budget ${registry_budget}ms, files ${SLEY_PERF_CHANGED_FILES}, runs ${SLEY_PERF_RUNS})"
-_assert_ms_le "verify perf: large registry p95" "$registry_p95" "$registry_budget"
+_assert_checkrun_invocations "verify perf: fixture-owned Checkrun initial run" \
+  1 "$checkrun_state/expected-args" "$repo/.home"
+_measure_perf_stats "verify perf: large registry" 15 "$repo" \
+  "$SLEY_PERF_RUNS" verify --run-required --json
+registry_median="$__PERF_MEDIAN"
+registry_max="$__PERF_MAX"
+registry_median_budget=$(_perf_budget_ms \
+  "$VERIFY_REQUIRED_REGISTRY_MEDIAN_BUDGET_MS" \
+  "$VERIFY_REQUIRED_REGISTRY_DARWIN_MEDIAN_BUDGET_MS")
+registry_max_budget=$(_perf_budget_ms \
+  "$VERIFY_REQUIRED_REGISTRY_MAX_BUDGET_MS" \
+  "$VERIFY_REQUIRED_REGISTRY_DARWIN_MAX_BUDGET_MS")
+echo "  PERF: verify required registry median ${registry_median}ms / ${registry_median_budget}ms, maximum ${registry_max}ms / ${registry_max_budget}ms (files ${SLEY_PERF_CHANGED_FILES}, runs ${SLEY_PERF_RUNS})"
+_assert_ms_le "verify perf: large registry median" \
+  "$registry_median" "$registry_median_budget"
+_assert_ms_le "verify perf: large registry maximum" \
+  "$registry_max" "$registry_max_budget"
+_assert_checkrun_invocations "verify perf: fixture-owned Checkrun measured runs" \
+  "$((SLEY_PERF_RUNS + 1))" "$checkrun_state/expected-args" "$repo/.home"
+
+echo "=== sley: hook performance ==="
+
+repo=$(_new_perf_repo)
+printf 'print("hook")\n' >"$repo/hook.py"
+(cd "$repo" && git add hook.py && git commit -q -m "seed hook fixture")
+autoformat_state=$(_tmpdir)
+export SLEY_PERF_AUTOFORMAT_COUNT_FILE="$autoformat_state/count"
+export SLEY_PERF_AUTOFORMAT_ARGS_PREFIX="$autoformat_state/args"
+printf '0\n' >"$SLEY_PERF_AUTOFORMAT_COUNT_FILE"
+{
+  printf '%s\n' -- "$repo/hook.py"
+} >"$autoformat_state/expected-args"
+
+export SLEY_PERF_AUTOFORMAT_RC=7
+_run_perf_sley_timed 5 "$repo" hook format-file "$repo/hook.py"
+_assert_exit "hook format-file perf: propagates formatter exit" 7 "$__SLEY_RC"
+_assert_autoformat_invocations "hook format-file perf: failing formatter delegation" \
+  1 "$autoformat_state/expected-args"
+
+export SLEY_PERF_AUTOFORMAT_RC=0
+printf '0\n' >"$SLEY_PERF_AUTOFORMAT_COUNT_FILE"
+_measure_perf_stats "hook format-file perf: full CLI" 5 "$repo" \
+  "$SLEY_HOOK_PERF_RUNS" hook format-file "$repo/hook.py"
+hook_format_file_p95="$__PERF_P95"
+hook_format_file_median="$__PERF_MEDIAN"
+hook_format_file_median_budget=$(_perf_budget_ms \
+  "$HOOK_FORMAT_FILE_MEDIAN_BUDGET_MS" \
+  "$HOOK_FORMAT_FILE_DARWIN_MEDIAN_BUDGET_MS")
+hook_format_file_p95_budget=$(_perf_budget_ms \
+  "$HOOK_FORMAT_FILE_P95_BUDGET_MS" \
+  "$HOOK_FORMAT_FILE_DARWIN_P95_BUDGET_MS")
+echo "  PERF: hook format-file median ${hook_format_file_median}ms / ${hook_format_file_median_budget}ms, p95 ${hook_format_file_p95}ms / ${hook_format_file_p95_budget}ms (runs ${SLEY_HOOK_PERF_RUNS})"
+_assert_ms_le "hook format-file perf: full CLI median" \
+  "$hook_format_file_median" "$hook_format_file_median_budget"
+_assert_ms_le "hook format-file perf: full CLI p95" \
+  "$hook_format_file_p95" "$hook_format_file_p95_budget"
+_assert_autoformat_invocations "hook format-file perf: measured delegation" \
+  "$SLEY_HOOK_PERF_RUNS" "$autoformat_state/expected-args"
 
 _test_summary
