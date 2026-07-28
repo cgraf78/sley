@@ -962,7 +962,11 @@ _assert_contains "check --path: successful run summarizes checked files" "sley c
 _assert_eq "check --path: validate hook not called" "" "$(cat "$MOCK_LOG")"
 
 repo=$(_new_repo)
-no_sley_tools_path="/usr/local/bin:/usr/bin:/bin"
+no_sley_tools_path=$(_no_sley_tools_path)
+no_sley_tools_bash_version=$(PATH="$no_sley_tools_path" \
+  bash --noprofile --norc -c 'printf %s "$BASH_VERSION"')
+_assert_eq "missing-tools path: preserves the active Bash" \
+  "$BASH_VERSION" "$no_sley_tools_bash_version"
 home=$(_tmpdir)
 _copy_sley_libs "$home"
 cat >"$repo/needs-lint.py" <<'EOF'
@@ -1119,6 +1123,365 @@ _assert_exit "ready --fix: fully-staged clean file exits 1 (re-stage)" 1 "$__SLE
 _assert_contains "ready --fix: fully-staged clean file is formatted" "autoformat:" "$(cat "$MOCK_LOG")"
 _assert_contains "ready --fix: fully-staged clean file reports re-stage" "formatter modified staged files" "$__SLEY_OUT"
 _assert_file_content "ready --fix: fully-staged clean file gets formatter output" "$(printf 'y = 2\n\n# formatted')" "$repo/clean.py"
+
+echo "=== sley: ready --fix --commit batches fully staged files ==="
+
+repo=$(_new_repo)
+mockbin=$(_mock_bin)
+export MOCK_LOG="$repo/autoformat.log"
+: >"$MOCK_LOG"
+cat >"$mockbin/autoformat" <<'MOCK'
+#!/usr/bin/env bash
+printf 'call:%s:' "$#" >>"$MOCK_LOG"
+printf '<%s>' "$@" >>"$MOCK_LOG"
+printf '\n' >>"$MOCK_LOG"
+for file in "$@"; do
+  [[ "$file" == "batch-b.py" ]] || continue
+  printf '\n# formatted\n' >>"$file"
+done
+MOCK
+chmod +x "$mockbin/autoformat"
+
+for file in batch-a.py batch-b.py batch-c.py; do
+  printf '%s = 1\n' "${file#batch-}" >"$repo/$file"
+done
+(cd "$repo" && git add batch-a.py batch-b.py batch-c.py && git commit -q -m "seed")
+for file in batch-a.py batch-b.py batch-c.py; do
+  printf '%s = 2\n' "${file#batch-}" >"$repo/$file"
+done
+(cd "$repo" && git add batch-a.py batch-b.py batch-c.py)
+
+PATH="$mockbin:$PATH" _run_sley "$repo" ready --fix --commit --quiet \
+  --exclude status --exclude check --exclude secrets --exclude verify
+_assert_exit "ready --fix batch: formatter mutation exits 1" 1 "$__SLEY_RC"
+_assert_eq "ready --fix batch: base formatter runs once" "1" \
+  "$(wc -l <"$MOCK_LOG" | tr -d '[:space:]')"
+_assert_contains "ready --fix batch: one invocation receives every file" \
+  "call:4:<--><batch-a.py><batch-b.py><batch-c.py>" "$(cat "$MOCK_LOG")"
+_assert_contains "ready --fix batch: reports the modified file" "batch-b.py" "$__SLEY_OUT"
+_assert_not_contains "ready --fix batch: does not report unchanged first file" \
+  "batch-a.py" "$__SLEY_OUT"
+_assert_not_contains "ready --fix batch: does not report unchanged last file" \
+  "batch-c.py" "$__SLEY_OUT"
+
+echo "=== sley: ready --fix chunks the base formatter within an argv budget ==="
+
+repo=$(_new_repo)
+mockbin=$(_mock_bin)
+export MOCK_LOG="$repo/autoformat.log"
+export MOCK_LOCALE_LOG="$repo/autoformat-locale.log"
+: >"$MOCK_LOG"
+: >"$MOCK_LOCALE_LOG"
+cat >"$mockbin/autoformat" <<'MOCK'
+#!/usr/bin/env bash
+printf 'call:' >>"$MOCK_LOG"
+printf '<%s>' "$@" >>"$MOCK_LOG"
+printf '\n' >>"$MOCK_LOG"
+printf '%s\n' "${LC_ALL-<unset>}" >>"$MOCK_LOCALE_LOG"
+for file in "$@"; do
+  [[ "$file" == "chunk-d.py" ]] || continue
+  printf '\n# formatted\n' >>"$file"
+done
+MOCK
+chmod +x "$mockbin/autoformat"
+for file in chunk-a.py chunk-b.py chunk-c.py chunk-d.py chunk-e.py; do
+  printf '%s = 1\n' "${file#chunk-}" >"$repo/$file"
+done
+(cd "$repo" && git add chunk-*.py && git commit -q -m "seed")
+for file in chunk-a.py chunk-b.py chunk-c.py chunk-d.py chunk-e.py; do
+  printf '%s = 2\n' "${file#chunk-}" >"$repo/$file"
+done
+(cd "$repo" && git add chunk-*.py)
+
+utf8_locale=$(locale -a 2>/dev/null | awk \
+  'tolower($0) ~ /utf-?8/ { print; exit }') || true
+saved_lc_all=${LC_ALL-}
+had_lc_all=0
+[[ -z "${LC_ALL+x}" ]] || had_lc_all=1
+if [[ -n "$utf8_locale" ]]; then
+  export LC_ALL="$utf8_locale"
+fi
+export _SLEY_READY_FORMAT_CHUNK_MAX_BYTES=25
+PATH="$mockbin:$PATH" _run_sley "$repo" ready --fix --commit --quiet \
+  --exclude status --exclude check --exclude secrets --exclude verify
+unset _SLEY_READY_FORMAT_CHUNK_MAX_BYTES
+if [[ "$had_lc_all" == "1" ]]; then
+  export LC_ALL="$saved_lc_all"
+else
+  unset LC_ALL
+fi
+_assert_exit "ready --fix chunks: formatter mutation exits 1" 1 "$__SLEY_RC"
+_assert_eq "ready --fix chunks: preserves ordered formatter batches" \
+  "$(printf '%s\n' \
+    'call:<--><chunk-a.py><chunk-b.py>' \
+    'call:<--><chunk-c.py><chunk-d.py>' \
+    'call:<--><chunk-e.py>')" "$(cat "$MOCK_LOG")"
+_assert_contains "ready --fix chunks: reports mutation from a later chunk" \
+  "chunk-d.py" "$__SLEY_OUT"
+_assert_not_contains "ready --fix chunks: omits unchanged first chunk" \
+  "chunk-a.py" "$__SLEY_OUT"
+_assert_not_contains "ready --fix chunks: omits unchanged final chunk" \
+  "chunk-e.py" "$__SLEY_OUT"
+if [[ -n "$utf8_locale" ]]; then
+  _assert_eq "ready --fix chunks: formatter preserves caller locale" \
+    "$(printf '%s\n' "$utf8_locale" "$utf8_locale" "$utf8_locale")" \
+    "$(cat "$MOCK_LOCALE_LOG")"
+else
+  _pass "ready --fix chunks: locale propagation skipped (no installed UTF-8 locale)"
+fi
+
+echo "=== sley: ready --fix stops base formatter chunks on fatal status ==="
+
+repo=$(_new_repo)
+mockbin=$(_mock_bin)
+export MOCK_LOG="$repo/autoformat.log"
+: >"$MOCK_LOG"
+cat >"$mockbin/autoformat" <<'MOCK'
+#!/usr/bin/env bash
+printf 'call:' >>"$MOCK_LOG"
+printf '<%s>' "$@" >>"$MOCK_LOG"
+printf '\n' >>"$MOCK_LOG"
+count=$(wc -l <"$MOCK_LOG")
+[[ "$count" -ne 2 ]] || exit "${MOCK_FATAL_RC:-2}"
+MOCK
+chmod +x "$mockbin/autoformat"
+for file in fatal-a.py fatal-b.py fatal-c.py fatal-d.py fatal-e.py; do
+  printf '%s = 1\n' "${file#fatal-}" >"$repo/$file"
+done
+(cd "$repo" && git add fatal-*.py && git commit -q -m "seed")
+for file in fatal-a.py fatal-b.py fatal-c.py fatal-d.py fatal-e.py; do
+  printf '%s = 2\n' "${file#fatal-}" >"$repo/$file"
+done
+(cd "$repo" && git add fatal-*.py)
+
+export _SLEY_READY_FORMAT_CHUNK_MAX_BYTES=25
+export MOCK_FATAL_RC=2
+PATH="$mockbin:$PATH" _run_sley "$repo" ready --fix --commit --quiet \
+  --exclude status --exclude check --exclude secrets --exclude verify
+_assert_exit "ready --fix chunks fatal: exits 2" 2 "$__SLEY_RC"
+_assert_eq "ready --fix chunks fatal: stops after fatal second chunk" "2" \
+  "$(wc -l <"$MOCK_LOG" | tr -d '[:space:]')"
+: >"$MOCK_LOG"
+export MOCK_FATAL_RC=126
+PATH="$mockbin:$PATH" _run_sley "$repo" ready --fix --commit --quiet \
+  --exclude status --exclude check --exclude secrets --exclude verify
+unset MOCK_FATAL_RC _SLEY_READY_FORMAT_CHUNK_MAX_BYTES
+_assert_exit "ready --fix chunks exec failure: exits 2" 2 "$__SLEY_RC"
+_assert_eq "ready --fix chunks exec failure: stops after reserved status" "2" \
+  "$(wc -l <"$MOCK_LOG" | tr -d '[:space:]')"
+
+echo "=== sley: ready --fix batch reports formatter-deleted files ==="
+
+repo=$(_new_repo)
+mockbin=$(_mock_bin)
+cat >"$mockbin/autoformat" <<'MOCK'
+#!/usr/bin/env bash
+for file in "$@"; do
+  [[ "$file" == "delete-b.py" ]] || continue
+  rm -f -- "$file"
+done
+MOCK
+chmod +x "$mockbin/autoformat"
+for file in delete-a.py delete-b.py delete-c.py; do
+  printf '%s = 1\n' "${file#delete-}" >"$repo/$file"
+done
+(cd "$repo" && git add delete-a.py delete-b.py delete-c.py && git commit -q -m "seed")
+for file in delete-a.py delete-b.py delete-c.py; do
+  printf '%s = 2\n' "${file#delete-}" >"$repo/$file"
+done
+(cd "$repo" && git add delete-a.py delete-b.py delete-c.py)
+
+PATH="$mockbin:$PATH" _run_sley "$repo" ready --fix --commit --quiet \
+  --exclude status --exclude check --exclude secrets --exclude verify
+_assert_exit "ready --fix deleted file: formatter mutation exits 1" 1 "$__SLEY_RC"
+_assert_contains "ready --fix deleted file: reports deleted file" "delete-b.py" "$__SLEY_OUT"
+_assert_not_contains "ready --fix deleted file: does not report unchanged first file" \
+  "delete-a.py" "$__SLEY_OUT"
+_assert_not_contains "ready --fix deleted file: does not report unchanged last file" \
+  "delete-c.py" "$__SLEY_OUT"
+_assert_file_missing "ready --fix deleted file: formatter deletion remains visible" \
+  "$repo/delete-b.py"
+
+echo "=== sley: ready --fix preserves formatter-unavailable status ==="
+
+repo=$(_new_repo)
+printf 'x = 1\n' >"$repo/unavailable.py"
+(cd "$repo" && git add unavailable.py && git commit -q -m "seed")
+printf 'x = 2\n' >"$repo/unavailable.py"
+(cd "$repo" && git add unavailable.py)
+
+PATH="$no_sley_tools_path" _run_sley "$repo" ready --fix --commit --quiet \
+  --exclude status --exclude check --exclude secrets --exclude verify
+_assert_exit "ready --fix missing formatter: exits 2" 2 "$__SLEY_RC"
+_assert_contains "ready --fix missing formatter: reports formatter failure" \
+  "cannot supervise formatter" "$__SLEY_OUT"
+
+echo "=== sley: ready --fix honors an explicit batch override ==="
+
+repo=$(_new_repo)
+home=$(_tmpdir)
+_copy_sley_libs "$home"
+mkdir -p "$home/.config/sley/extensions.d"
+cat >"$home/.config/sley/extensions.d/80-batch-format.sh" <<'WORK'
+sley_hook_format_file() {
+  printf 'single:%s:%s\n' "$BASHPID" "$1" >>"$MOCK_LOG"
+}
+sley_hook_format() {
+  printf 'batch:%s:' "$BASHPID" >>"$MOCK_LOG"
+  printf '<%s>' "$1" >>"$MOCK_LOG"
+  printf '\n' >>"$MOCK_LOG"
+}
+WORK
+export MOCK_LOG="$repo/format-override.log"
+: >"$MOCK_LOG"
+for file in explicit-a.py explicit-b.py explicit-c.py; do
+  printf '%s = 1\n' "${file#explicit-}" >"$repo/$file"
+done
+(cd "$repo" && git add explicit-a.py explicit-b.py explicit-c.py && git commit -q -m "seed")
+for file in explicit-a.py explicit-b.py explicit-c.py; do
+  printf '%s = 2\n' "${file#explicit-}" >"$repo/$file"
+done
+(cd "$repo" && git add explicit-a.py explicit-b.py explicit-c.py)
+
+HOME="$home" PATH="$no_sley_tools_path" _run_sley "$repo" ready --fix --commit --quiet \
+  --exclude status --exclude check --exclude secrets --exclude verify
+_assert_exit "ready --fix explicit batch: exits 0" 0 "$__SLEY_RC"
+_assert_contains "ready --fix explicit batch: batch override runs" \
+  "batch:" "$(cat "$MOCK_LOG")"
+_assert_contains "ready --fix explicit batch: override receives every file" \
+  "<explicit-a.py" "$(cat "$MOCK_LOG")"
+_assert_contains "ready --fix explicit batch: override receives middle file" \
+  "explicit-b.py" "$(cat "$MOCK_LOG")"
+_assert_contains "ready --fix explicit batch: override receives last file" \
+  "explicit-c.py>" "$(cat "$MOCK_LOG")"
+_assert_not_contains "ready --fix explicit batch: single-file override is bypassed" \
+  "single:" "$(cat "$MOCK_LOG")"
+
+echo "=== sley: ready --fix keeps a legacy file override in one guardian ==="
+
+repo=$(_new_repo)
+home=$(_tmpdir)
+_copy_sley_libs "$home"
+mkdir -p "$home/.config/sley/extensions.d"
+cat >"$home/.config/sley/extensions.d/80-file-format.sh" <<'WORK'
+sley_hook_format_file() {
+  local format_group
+  format_group=$(ps -o pgid= -p "$BASHPID" | tr -d '[:space:]')
+  printf '%s:%s:%s:%s\n' \
+    "$format_group" "$BASHPID" "$PWD" "$1" >>"$MOCK_LOG"
+  case "$1" in
+    legacy-a.py)
+      sleep 300 &
+      printf '%s\n' "$!" >"$MOCK_BG_PID"
+      cd /
+      set +u
+      trap ':' TERM
+      ;;
+    legacy-b.py) exit 1 ;;
+  esac
+}
+WORK
+export MOCK_LOG="$repo/format-override.log"
+export MOCK_BG_PID="$repo/format-background.pid"
+: >"$MOCK_LOG"
+for file in legacy-a.py legacy-b.py legacy-c.py; do
+  printf '%s = 1\n' "${file#legacy-}" >"$repo/$file"
+done
+(cd "$repo" && git add legacy-a.py legacy-b.py legacy-c.py && git commit -q -m "seed")
+for file in legacy-a.py legacy-b.py legacy-c.py; do
+  printf '%s = 2\n' "${file#legacy-}" >"$repo/$file"
+done
+(cd "$repo" && git add legacy-a.py legacy-b.py legacy-c.py)
+
+HOME="$home" PATH="$no_sley_tools_path" _run_sley "$repo" ready --fix --commit --quiet \
+  --exclude status --exclude check --exclude secrets --exclude verify
+_assert_exit "ready --fix legacy override: exits 0" 0 "$__SLEY_RC"
+_assert_eq "ready --fix legacy override: formats every file" "3" \
+  "$(wc -l <"$MOCK_LOG" | tr -d '[:space:]')"
+_assert_eq "ready --fix legacy override: all calls share one guardian" "1" \
+  "$(cut -d: -f1 "$MOCK_LOG" | sort -u | wc -l | tr -d '[:space:]')"
+_assert_eq "ready --fix legacy override: each hook gets shell isolation" "3" \
+  "$(cut -d: -f2 "$MOCK_LOG" | sort -u | wc -l | tr -d '[:space:]')"
+_assert_contains "ready --fix legacy override: cwd resets after first hook" \
+  ":$repo:legacy-b.py" "$(cat "$MOCK_LOG")"
+_assert_contains "ready --fix legacy override: exit 1 does not skip later files" \
+  ":$repo:legacy-c.py" "$(cat "$MOCK_LOG")"
+_assert_contains "ready --fix legacy override: formats first file" \
+  "legacy-a.py" "$(cat "$MOCK_LOG")"
+_assert_contains "ready --fix legacy override: formats middle file" \
+  "legacy-b.py" "$(cat "$MOCK_LOG")"
+_assert_contains "ready --fix legacy override: formats last file" \
+  "legacy-c.py" "$(cat "$MOCK_LOG")"
+legacy_background_gone=yes
+legacy_background_pid=$(cat "$MOCK_BG_PID")
+if kill -0 "$legacy_background_pid" 2>/dev/null; then
+  legacy_background_gone=no
+  kill -KILL "$legacy_background_pid" 2>/dev/null || true
+fi
+_assert_eq "ready --fix legacy override: background work is reaped" \
+  "yes" "$legacy_background_gone"
+
+echo "=== sley: repeated hook init restores base definitions ==="
+
+repo=$(_new_repo)
+mockbin=$(_mock_bin)
+extension_dir=$(_tmpdir)
+replacement_dir=$(_tmpdir)
+export MOCK_LOG="$repo/hook-reload.log"
+: >"$MOCK_LOG"
+cat >"$mockbin/autoformat" <<'MOCK'
+#!/usr/bin/env bash
+printf 'autoformat:' >>"$MOCK_LOG"
+printf '<%s>' "$@" >>"$MOCK_LOG"
+printf '\n' >>"$MOCK_LOG"
+MOCK
+chmod +x "$mockbin/autoformat"
+cat >"$extension_dir/80-format.sh" <<'WORK'
+sley_hook_format() {
+  printf 'batch:%s\n' "$1" >>"$MOCK_LOG"
+}
+WORK
+cat >"$replacement_dir/file-only.sh" <<'WORK'
+sley_hook_format_file() {
+  printf 'file:%s\n' "$1" >>"$MOCK_LOG"
+}
+WORK
+
+reload_out=$(
+  cd "$repo" &&
+    PATH="$mockbin:$PATH" \
+      SLEY_EXTENSION_DIR="$extension_dir" \
+      REPLACEMENT_EXTENSION="$replacement_dir/file-only.sh" \
+      bash --noprofile --norc -s "$SLEY_REPO_ROOT" <<'HARNESS'
+set -u
+source "$1/lib/sley/sley.sh"
+sley_hook_init
+printf 'flags:%s:%s\n' \
+  "$_SLEY_HOOK_FORMAT_OVERRIDDEN" "$_SLEY_HOOK_FORMAT_FILE_OVERRIDDEN"
+sley_hook_format 'repeat.py'
+cp "$REPLACEMENT_EXTENSION" "$SLEY_EXTENSION_DIR/80-format.sh"
+sley_hook_init
+printf 'flags:%s:%s\n' \
+  "$_SLEY_HOOK_FORMAT_OVERRIDDEN" "$_SLEY_HOOK_FORMAT_FILE_OVERRIDDEN"
+sley_hook_format 'repeat.py'
+sley_hook_format_file 'repeat.py'
+rm "$SLEY_EXTENSION_DIR/80-format.sh"
+sley_hook_init
+printf 'flags:%s:%s\n' \
+  "$_SLEY_HOOK_FORMAT_OVERRIDDEN" "$_SLEY_HOOK_FORMAT_FILE_OVERRIDDEN"
+sley_hook_format 'repeat.py'
+sley_hook_format_file 'repeat.py'
+HARNESS
+)
+_assert_eq "hook reload: flags follow batch, file-only, then base" \
+  "$(printf '%s\n' 'flags:1:0' 'flags:0:1' 'flags:0:0')" "$reload_out"
+_assert_eq "hook reload: stale extension functions never execute" \
+  "$(printf '%s\n' \
+    'batch:repeat.py' \
+    'autoformat:<--><repeat.py>' \
+    'file:repeat.py' \
+    'autoformat:<--><repeat.py>' \
+    'autoformat:<--><repeat.py>')" "$(cat "$MOCK_LOG")"
 
 echo "=== sley: ready --fix --commit allows a clean partial-staged file ==="
 
