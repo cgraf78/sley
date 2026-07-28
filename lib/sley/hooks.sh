@@ -140,7 +140,8 @@ _sley_extension_dir() {
 }
 
 _sley_hook_init() {
-  local extension_dir
+  local extension_dir extension has_extensions=0
+  local current_format_file_definition current_format_definition
   _sley_extension_dir extension_dir || return $?
 
   # Native hooks only speak the SLEY_* extension contract. Deprecated
@@ -157,5 +158,35 @@ _sley_hook_init() {
   # prefixes without the base implementation knowing anything about the
   # environment that provided them. This keeps base sley generic while still
   # allowing local repo policy to override `sley_hook_*` functions directly.
+  for extension in "$extension_dir"/*.sh; do
+    if [[ -f "$extension" ]]; then
+      has_extensions=1
+      break
+    fi
+  done
+  if [[ -n "${_SLEY_BASE_FORMAT_FILE_DEFINITION+x}" ]]; then
+    # Each reload starts from the original public hooks. Without this, removing
+    # or replacing an extension leaves its old function definition resident in
+    # a long-lived shell and can make a stale batch override win indefinitely.
+    eval "$_SLEY_BASE_FORMAT_FILE_DEFINITION"
+    eval "$_SLEY_BASE_FORMAT_DEFINITION"
+  elif [[ "$has_extensions" == "1" ]]; then
+    # Capture the base definitions only when extensions exist. Comparing Bash's
+    # own function serialization detects overrides without parsing extension
+    # source. The common no-extension hook path pays no detection subprocesses.
+    _SLEY_BASE_FORMAT_FILE_DEFINITION=$(declare -f sley_hook_format_file)
+    _SLEY_BASE_FORMAT_DEFINITION=$(declare -f sley_hook_format)
+  fi
   _sley_source_extensions_from "$extension_dir"
+
+  _SLEY_HOOK_FORMAT_FILE_OVERRIDDEN=0
+  _SLEY_HOOK_FORMAT_OVERRIDDEN=0
+  if [[ -n "${_SLEY_BASE_FORMAT_FILE_DEFINITION+x}" ]]; then
+    current_format_file_definition=$(declare -f sley_hook_format_file)
+    current_format_definition=$(declare -f sley_hook_format)
+    [[ "$current_format_file_definition" == "$_SLEY_BASE_FORMAT_FILE_DEFINITION" ]] ||
+      _SLEY_HOOK_FORMAT_FILE_OVERRIDDEN=1
+    [[ "$current_format_definition" == "$_SLEY_BASE_FORMAT_DEFINITION" ]] ||
+      _SLEY_HOOK_FORMAT_OVERRIDDEN=1
+  fi
 }

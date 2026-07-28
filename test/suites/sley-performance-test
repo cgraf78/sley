@@ -12,6 +12,7 @@ SLEY="$SLEY_REPO_ROOT/bin/sley"
 
 SLEY_PERF_RUNS=${SLEY_PERF_RUNS:-7}
 SLEY_HOOK_PERF_RUNS=${SLEY_HOOK_PERF_RUNS:-20}
+SLEY_READY_FIX_PERF_RUNS=${SLEY_READY_FIX_PERF_RUNS:-3}
 SLEY_PERF_CHANGED_FILES=${SLEY_PERF_CHANGED_FILES:-300}
 SLEY_PERF_BUDGET_MULTIPLIER_ENV=SLEY_PERF_BUDGET_MULTIPLIER
 
@@ -30,6 +31,9 @@ HOOK_FORMAT_FILE_MEDIAN_BUDGET_MS=350
 HOOK_FORMAT_FILE_DARWIN_MEDIAN_BUDGET_MS=500
 HOOK_FORMAT_FILE_P95_BUDGET_MS=1000
 HOOK_FORMAT_FILE_DARWIN_P95_BUDGET_MS=1500
+READY_FIX_300_MEDIAN_BUDGET_MS=5000
+READY_FIX_300_DARWIN_MEDIAN_BUDGET_MS=7000
+READY_FIX_FORMAT_CHUNK_FILES=256
 
 perf_mock_bin=$(_mock_bin)
 cat >"$perf_mock_bin/checkrun" <<'EOF'
@@ -134,6 +138,22 @@ _assert_autoformat_invocations() {
   for ((run = 1; run <= count; run++)); do
     _assert_file_matches "$desc args $run" \
       "$expected_args" "${SLEY_PERF_AUTOFORMAT_ARGS_PREFIX}.${run}"
+  done
+}
+
+_assert_autoformat_chunked_invocations() {
+  local desc="$1" expected_runs="$2" chunks_per_run="$3" expected_prefix="$4"
+  local count run chunk invocation expected_count
+  count=$(cat "$SLEY_PERF_AUTOFORMAT_COUNT_FILE")
+  expected_count=$((expected_runs * chunks_per_run))
+  _assert_eq "$desc count" "$expected_count" "$count"
+  for ((run = 1; run <= expected_runs; run++)); do
+    for ((chunk = 1; chunk <= chunks_per_run; chunk++)); do
+      invocation=$(((run - 1) * chunks_per_run + chunk))
+      _assert_file_matches "$desc run $run chunk $chunk" \
+        "$expected_prefix.$chunk" \
+        "${SLEY_PERF_AUTOFORMAT_ARGS_PREFIX}.${invocation}"
+    done
   done
 }
 
@@ -247,6 +267,26 @@ _write_changed_tree() {
     file="$dir/file-$i.js"
     printf 'export const changed%s = %s;\n' "$i" "$i" >>"$file"
   done
+}
+
+_write_staged_changed_tree() {
+  local repo="$1" count="$2" i dir file
+  dir="$repo/staged"
+  mkdir -p "$dir"
+  for i in $(seq 1 "$count"); do
+    file="$dir/file-$i.txt"
+    printf 'base %s\n' "$i" >"$file"
+  done
+  (
+    cd "$repo" || exit 1
+    git add staged
+    git commit -q -m "seed staged ready fixture"
+  )
+  for i in $(seq 1 "$count"); do
+    file="$dir/file-$i.txt"
+    printf 'changed %s\n' "$i" >>"$file"
+  done
+  (cd "$repo" && git add staged)
 }
 
 echo "=== sley: verify performance ==="
@@ -379,5 +419,45 @@ _assert_ms_le "hook format-file perf: full CLI p95" \
   "$hook_format_file_p95" "$hook_format_file_p95_budget"
 _assert_autoformat_invocations "hook format-file perf: measured delegation" \
   "$SLEY_HOOK_PERF_RUNS" "$autoformat_state/expected-args"
+
+echo "=== sley: ready --fix --commit performance ==="
+
+for changed_count in 1 10 50 300; do
+  repo=$(_new_perf_repo)
+  _write_staged_changed_tree "$repo" "$changed_count"
+  autoformat_state=$(_tmpdir)
+  ready_fix_chunks=$(((changed_count + READY_FIX_FORMAT_CHUNK_FILES - 1) / \
+    READY_FIX_FORMAT_CHUNK_FILES))
+  export SLEY_PERF_AUTOFORMAT_COUNT_FILE="$autoformat_state/count"
+  export SLEY_PERF_AUTOFORMAT_ARGS_PREFIX="$autoformat_state/args"
+  export SLEY_PERF_AUTOFORMAT_RC=0
+  printf '0\n' >"$SLEY_PERF_AUTOFORMAT_COUNT_FILE"
+  git -C "$repo" diff --cached --name-only -- staged >"$autoformat_state/files"
+  for ((chunk = 1; chunk <= ready_fix_chunks; chunk++)); do
+    chunk_start=$(((chunk - 1) * READY_FIX_FORMAT_CHUNK_FILES + 1))
+    chunk_end=$((chunk * READY_FIX_FORMAT_CHUNK_FILES))
+    {
+      printf '%s\n' --
+      sed -n "${chunk_start},${chunk_end}p" "$autoformat_state/files"
+    } >"$autoformat_state/expected-args.$chunk"
+  done
+
+  _measure_perf_stats "ready --fix perf: ${changed_count}-file staged commit" 30 "$repo" \
+    "$SLEY_READY_FIX_PERF_RUNS" ready --fix --commit --quiet \
+    --exclude status --exclude check --exclude secrets --exclude verify
+  echo "  PERF: ready --fix median ${__PERF_MEDIAN}ms (files ${changed_count}, runs ${SLEY_READY_FIX_PERF_RUNS})"
+  _assert_autoformat_chunked_invocations \
+    "ready --fix perf: ${changed_count}-file batch formatter" \
+    "$SLEY_READY_FIX_PERF_RUNS" "$ready_fix_chunks" \
+    "$autoformat_state/expected-args"
+
+  if [[ "$changed_count" -eq 300 ]]; then
+    ready_fix_median_budget=$(_perf_budget_ms \
+      "$READY_FIX_300_MEDIAN_BUDGET_MS" \
+      "$READY_FIX_300_DARWIN_MEDIAN_BUDGET_MS")
+    _assert_ms_le "ready --fix perf: 300-file median" \
+      "$__PERF_MEDIAN" "$ready_fix_median_budget"
+  fi
+done
 
 _test_summary
