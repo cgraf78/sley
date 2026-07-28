@@ -147,6 +147,32 @@ _repo_json_escape() {
   return 2
 }
 
+_repo_json_escape_lines() {
+  if command -v jq >/dev/null 2>&1; then
+    # Changed-file names are newline-delimited by contract. Encode the entire
+    # list in one process so large changes do not pay one jq startup per file.
+    jq -R .
+    return
+  fi
+  if command -v python3 >/dev/null 2>&1; then
+    python3 -c '
+import json
+import sys
+
+data = sys.stdin.buffer.read()
+if data.endswith(b"\n"):
+    data = data[:-1]
+encoding = sys.stdin.encoding or "utf-8"
+errors = sys.stdin.errors or "strict"
+for line in data.split(b"\n"):
+    print(json.dumps(line.decode(encoding, errors)))
+'
+    return
+  fi
+  _repo_require_json_encoder
+  return 2
+}
+
 _repo_require_json_encoder() {
   command -v jq >/dev/null 2>&1 || command -v python3 >/dev/null 2>&1 || {
     echo "sley: jq or python3 is required for JSON output" >&2

@@ -215,7 +215,8 @@ _sley_warn_out_of_scope() {
 
 _sley_json_files() {
   local files_text="$1" untracked_set="${2:-}"
-  local first=1 file esc status tracked exists f
+  local file esc status tracked exists f encoded encoded_index
+  local -a files=() encoded_files=()
   # Tracked-vs-untracked is derived from the untracked set alone: every file
   # in the change list comes from a VCS-tracked source by construction
   # (`_repo_changed_names` only emits tracked changes for staged/changed/
@@ -229,12 +230,31 @@ _sley_json_files() {
       [[ -n "$f" ]] && _is_untracked["$f"]=1
     done <<<"$untracked_set"
   fi
-  printf '['
   while IFS= read -r file; do
-    [[ -n "$file" ]] || continue
-    [[ "$first" == "1" ]] || printf ','
-    first=0
-    esc=$(_repo_json_escape "$file")
+    [[ -n "$file" ]] && files+=("$file")
+  done <<<"$files_text"
+  if [[ "${#files[@]}" -eq 0 ]]; then
+    printf '[]'
+    return 0
+  fi
+  encoded=$(printf '%s\n' "${files[@]}" | _repo_json_escape_lines) || return 2
+  while IFS= read -r esc; do
+    if [[ -z "$esc" ]]; then
+      printf 'sley: JSON encoder returned an empty path record\n' >&2
+      return 2
+    fi
+    encoded_files+=("$esc")
+  done <<<"$encoded"
+  if [[ "${#encoded_files[@]}" -ne "${#files[@]}" ]]; then
+    printf 'sley: JSON encoder returned %d paths for %d changed files\n' \
+      "${#encoded_files[@]}" "${#files[@]}" >&2
+    return 2
+  fi
+  printf '['
+  for encoded_index in "${!files[@]}"; do
+    [[ "$encoded_index" -eq 0 ]] || printf ','
+    file="${files[$encoded_index]}"
+    esc="${encoded_files[$encoded_index]}"
     # Status is intentionally coarse in v1. The stable part of the JSON
     # contract is path/tracked/exists; callers should not infer exact VCS state
     # from this placeholder until richer statuses are specified.
@@ -242,8 +262,8 @@ _sley_json_files() {
     tracked=true
     [[ -n "${_is_untracked[$file]:-}" ]] && tracked=false
     [[ -e "$file" ]] && exists=true || exists=false
-    printf '{"path":"%s","status":"%s","tracked":%s,"exists":%s}' \
+    printf '{"path":%s,"status":"%s","tracked":%s,"exists":%s}' \
       "$esc" "$status" "$tracked" "$exists"
-  done <<<"$files_text"
+  done
   printf ']'
 }
