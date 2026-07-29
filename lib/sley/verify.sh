@@ -218,9 +218,22 @@ _sley_verify_user_config_files() {
   _sley_verify_config_dir_files "$config_home/sley/verify.d"
 }
 
+_sley_verify_repo_config_dir_files() {
+  local dir="$1" source
+
+  for source in "$dir/.sley/verify.json" "$dir/.sley/verify.d"/*.json; do
+    [[ -f "$source" ]] || continue
+    if [[ "$source" == ./* ]]; then
+      printf 'repo\0%s/%s\0' "$_REPO_ROOT" "${source#./}"
+    else
+      printf 'repo\0%s/%s\0' "$_REPO_ROOT" "$source"
+    fi
+  done
+}
+
 _sley_verify_repo_config_files() {
-  local files="$1" file dir source
-  declare -A _seen_configs
+  local files="$1" file dir
+  declare -A _seen_dirs
 
   while IFS= read -r file; do
     [[ -n "$file" ]] || continue
@@ -229,16 +242,12 @@ _sley_verify_repo_config_files() {
       *) dir="." ;;
     esac
     while :; do
-      for source in "$dir/.sley/verify.json" "$dir/.sley/verify.d"/*.json; do
-        [[ -f "$source" ]] || continue
-        [[ -n "${_seen_configs[$source]:-}" ]] && continue
-        _seen_configs[$source]=1
-        if [[ "$source" == ./* ]]; then
-          printf 'repo\0%s/%s\0' "$_REPO_ROOT" "${source#./}"
-        else
-          printf 'repo\0%s/%s\0' "$_REPO_ROOT" "$source"
-        fi
-      done
+      # Every walk that reaches a previously visited directory would repeat
+      # that directory and the same ancestor chain. Stop there so a large
+      # changed set in one subtree probes each config directory only once.
+      [[ -z "${_seen_dirs[$dir]:-}" ]] || break
+      _seen_dirs[$dir]=1
+      _sley_verify_repo_config_dir_files "$dir"
       [[ "$dir" == "." ]] && break
       case "$dir" in
         */*) dir="${dir%/*}" ;;

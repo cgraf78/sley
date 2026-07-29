@@ -292,6 +292,38 @@ _write_staged_changed_tree() {
 echo "=== sley: verify performance ==="
 
 repo=$(_new_perf_repo)
+config_scan_state=$(_tmpdir)
+config_scan_log="$config_scan_state/scanned-dirs"
+config_scan_expected="$config_scan_state/expected-dirs"
+: >"$config_scan_log"
+printf '%s\n' \
+  packages/app/src/generated/deep/nested \
+  packages/app/src/generated/deep \
+  packages/app/src/generated \
+  packages/app/src \
+  packages/app \
+  packages \
+  . >"$config_scan_expected"
+config_scan_files=""
+for i in $(seq 1 "$SLEY_PERF_CHANGED_FILES"); do
+  config_scan_files+="packages/app/src/generated/deep/nested/file-$i.js"$'\n'
+done
+(
+  cd "$repo" || exit 1
+  # shellcheck source=../../lib/sley/verify.sh
+  source "$SLEY_REPO_ROOT/lib/sley/verify.sh"
+  _REPO_ROOT="$repo"
+  # shellcheck disable=SC2329 # Invoked indirectly by the sourced config walker.
+  _sley_verify_repo_config_dir_files() {
+    printf '%s\n' "$1" >>"$config_scan_log"
+  }
+  _sley_verify_repo_config_files "$config_scan_files" >/dev/null
+)
+_assert_file_matches \
+  "verify perf: shared subtree scans each config directory once" \
+  "$config_scan_expected" "$config_scan_log"
+
+repo=$(_new_perf_repo)
 mkdir -p "$repo/packages/app"
 cat >"$repo/package.json" <<'EOF'
 {"scripts":{"test":"node root-test.js","lint":"node root-lint.js"}}
