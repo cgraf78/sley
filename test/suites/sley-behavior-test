@@ -1511,22 +1511,32 @@ printf 'autoformat:%s\n' "$*" >>"$MOCK_LOG"
 MOCK
 chmod +x "$mockbin/autoformat"
 
-cat >"$repo/partial.py" <<'EOF'
+partial_name='partial [*] - exact key.py'
+cat >"$repo/$partial_name" <<'EOF'
 x = 1
 EOF
-(cd "$repo" && git add partial.py && git commit -q -m "seed")
-cat >"$repo/partial.py" <<'EOF'
+cat >"$repo/fully-staged.py" <<'EOF'
+full = 1
+EOF
+(cd "$repo" && git add "$partial_name" fully-staged.py && git commit -q -m "seed")
+cat >"$repo/$partial_name" <<'EOF'
 x = 2
 EOF
-(cd "$repo" && git add partial.py)
-printf 'extra_unstaged = True\n' >>"$repo/partial.py" # partial: staged x=2, unstaged extra line
+(cd "$repo" && git add "$partial_name")
+printf 'extra_unstaged = True\n' >>"$repo/$partial_name" # partial: staged x=2, unstaged extra line
+printf 'full = 2\n' >"$repo/fully-staged.py"
+(cd "$repo" && git add fully-staged.py)
 
 HOME="$home" PATH="$mockbin:$PATH" _run_sley "$repo" ready --fix --commit
 _assert_exit "ready --fix: clean partial-staged file is not refused" 0 "$__SLEY_RC"
 _assert_not_contains "ready --fix: clean partial-staged file has no refusal" \
   "staged and unstaged changes" "$__SLEY_OUT"
 _assert_file_content "ready --fix: clean partial-staged worktree left intact" \
-  "$(printf 'x = 2\nextra_unstaged = True')" "$repo/partial.py"
+  "$(printf 'x = 2\nextra_unstaged = True')" "$repo/$partial_name"
+_assert_eq "ready --fix: hostile partial filename is probed exactly once" \
+  1 "$(grep -Fc -- "$partial_name" "$MOCK_LOG")"
+_assert_eq "ready --fix: fully staged companion is formatted exactly once" \
+  1 "$(grep -Fc -- 'fully-staged.py' "$MOCK_LOG")"
 
 echo "=== sley: fix --commit does not update git index ==="
 
