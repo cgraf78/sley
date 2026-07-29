@@ -460,4 +460,53 @@ for changed_count in 1 10 50 300; do
   fi
 done
 
+echo "=== sley: ready --fix mixed partial performance ==="
+
+repo=$(_new_perf_repo)
+_write_staged_changed_tree "$repo" "$SLEY_PERF_CHANGED_FILES"
+# Keep one staged file partially edited in the worktree. A no-op formatter may
+# probe it safely, but membership checks must not fork once per selected file.
+printf 'unstaged work\n' >>"$repo/staged/file-1.txt"
+
+autoformat_state=$(_tmpdir)
+export SLEY_PERF_AUTOFORMAT_COUNT_FILE="$autoformat_state/count"
+export SLEY_PERF_AUTOFORMAT_ARGS_PREFIX="$autoformat_state/args"
+export SLEY_PERF_AUTOFORMAT_RC=0
+printf '0\n' >"$SLEY_PERF_AUTOFORMAT_COUNT_FILE"
+
+grep_mock_bin=$(_mock_bin)
+real_grep=$(command -v grep)
+export SLEY_PERF_GREP_COUNT_FILE="$autoformat_state/grep-count"
+export SLEY_PERF_REAL_GREP="$real_grep"
+: >"$SLEY_PERF_GREP_COUNT_FILE"
+cat >"$grep_mock_bin/grep" <<'EOF'
+#!/usr/bin/env bash
+printf '1\n' >>"$SLEY_PERF_GREP_COUNT_FILE"
+exec "$SLEY_PERF_REAL_GREP" "$@"
+EOF
+chmod +x "$grep_mock_bin/grep"
+
+saved_path=$PATH
+PATH="$grep_mock_bin:$PATH"
+_run_perf_sley_timed 30 "$repo" ready --fix --commit --quiet \
+  --exclude status --exclude check --exclude secrets --exclude verify
+PATH=$saved_path
+_assert_exit "ready --fix mixed perf: instrumented run exits 0" 0 "$__SLEY_RC"
+grep_count=$(wc -l <"$SLEY_PERF_GREP_COUNT_FILE" | tr -d '[:space:]')
+_assert_eq "ready --fix mixed perf: no membership grep processes" 0 "$grep_count"
+
+printf '0\n' >"$SLEY_PERF_AUTOFORMAT_COUNT_FILE"
+mixed_ready_fix_chunks=$(((SLEY_PERF_CHANGED_FILES - 1 + \
+  READY_FIX_FORMAT_CHUNK_FILES - 1) / READY_FIX_FORMAT_CHUNK_FILES))
+mixed_ready_fix_invocations=$((1 + mixed_ready_fix_chunks))
+_measure_perf_stats "ready --fix mixed perf: ${SLEY_PERF_CHANGED_FILES} staged plus one partial" 30 "$repo" \
+  "$SLEY_READY_FIX_PERF_RUNS" ready --fix --commit --quiet \
+  --exclude status --exclude check --exclude secrets --exclude verify
+echo "  PERF: ready --fix mixed median ${__PERF_MEDIAN}ms (files ${SLEY_PERF_CHANGED_FILES}, partial 1, runs ${SLEY_READY_FIX_PERF_RUNS})"
+_assert_eq "ready --fix mixed perf: formatter invocation count" \
+  "$((SLEY_READY_FIX_PERF_RUNS * mixed_ready_fix_invocations))" \
+  "$(cat "$SLEY_PERF_AUTOFORMAT_COUNT_FILE")"
+_assert_contains "ready --fix mixed perf: partial worktree edit survives" \
+  "unstaged work" "$(cat "$repo/staged/file-1.txt")"
+
 _test_summary

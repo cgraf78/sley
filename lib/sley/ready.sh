@@ -1702,10 +1702,14 @@ _sley_ready_impl() {
         # commits fine. (`sley fix`, the explicit command, still refuses partial
         # files outright; the commit gate is deliberately more permissive.)
         local _fix_partial=""
+        local -A _fix_partial_set=()
         if [[ "$_SLEY_SCOPE_CHANGE" == "staged" ]]; then
           local _fix_runnable
           _fix_runnable=$(printf '%s\n' "$_fix_files" | _repo_existing_regular_files)
           _fix_partial=$(_sley_git_staged_partial_files "$_fix_runnable")
+          while IFS= read -r _fix_f; do
+            [[ -n "$_fix_f" ]] && _fix_partial_set["$_fix_f"]=1
+          done <<<"$_fix_partial"
         fi
         # Pass 1: partially staged files are probed, never mutated. Format a
         # backup-protected copy to learn whether formatting would change the
@@ -1718,7 +1722,7 @@ _sley_ready_impl() {
             [[ -n "$_fix_f" ]] || continue
             [[ -f "$_fix_f" ]] || continue
             [[ ! -L "$_fix_f" ]] || continue
-            printf '%s\n' "$_fix_partial" | grep -qxF -- "$_fix_f" || continue
+            [[ -n "${_fix_partial_set[$_fix_f]+x}" ]] || continue
             # Refuse without formatting if we cannot back up, rather than risk an
             # unrecoverable clobber of the unstaged hunk.
             if ! { _fix_bak=$(mktemp "${TMPDIR:-/tmp}/sley-fix-bak.XXXXXX") &&
@@ -1773,8 +1777,7 @@ _sley_ready_impl() {
             [[ -n "$_fix_f" ]] || continue
             [[ -f "$_fix_f" ]] || continue
             [[ ! -L "$_fix_f" ]] || continue
-            if [[ -n "$_fix_partial" ]] &&
-              printf '%s\n' "$_fix_partial" | grep -qxF -- "$_fix_f"; then
+            if [[ -n "${_fix_partial_set[$_fix_f]+x}" ]]; then
               continue
             fi
             _fix_batch_files+=("$_fix_f")
