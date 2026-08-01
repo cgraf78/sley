@@ -1,0 +1,18 @@
+# type<TAB>repository-relative path
+program	bin/sley
+program	lib/sley/hooks.sh
+program	lib/sley/ready.sh
+program	lib/sley/repo.sh
+program	lib/sley/scope.sh
+program	lib/sley/sley.sh
+program	lib/sley/verify.sh
+program	share/sley/shell.sh
+program	test/helpers.sh
+program	test/sley-test
+program	test/suites/manpage-test
+program	test/suites/nvim-test
+program	test/suites/ready-cancellation-test
+program	test/suites/sley-behavior-test
+program	test/suites/sley-performance-test
+program	test/suites/timeout-test
+program	test/suites/xdg-paths-test
