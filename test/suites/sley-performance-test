@@ -608,7 +608,7 @@ _assert_autolint_invocations "check perf: one 300-file linter batch" \
   1 "$autolint_state/expected-args"
 
 _measure_perf_stats "check perf: 300-file changed tree" 10 "$repo" \
-  "$SLEY_PERF_RUNS" check
+  "$SLEY_HOOK_PERF_RUNS" check
 check_300_p95="$__PERF_P95"
 check_300_median="$__PERF_MEDIAN"
 check_300_median_budget=$(_perf_budget_ms \
@@ -617,13 +617,13 @@ check_300_median_budget=$(_perf_budget_ms \
 check_300_p95_budget=$(_perf_budget_ms \
   "$CHECK_300_P95_BUDGET_MS" \
   "$CHECK_300_DARWIN_P95_BUDGET_MS")
-echo "  PERF: check 300 files median ${check_300_median}ms / ${check_300_median_budget}ms, p95 ${check_300_p95}ms / ${check_300_p95_budget}ms (runs ${SLEY_PERF_RUNS})"
+echo "  PERF: check 300 files median ${check_300_median}ms / ${check_300_median_budget}ms, p95 ${check_300_p95}ms / ${check_300_p95_budget}ms (runs ${SLEY_HOOK_PERF_RUNS})"
 _assert_ms_le "check perf: 300-file median" \
   "$check_300_median" "$check_300_median_budget"
 _assert_ms_le "check perf: 300-file p95" \
   "$check_300_p95" "$check_300_p95_budget"
 _assert_autolint_invocations "check perf: measured 300-file batches" \
-  "$((SLEY_PERF_RUNS + 1))" "$autolint_state/expected-args"
+  "$((SLEY_HOOK_PERF_RUNS + 1))" "$autolint_state/expected-args"
 
 echo "=== sley: fix performance ==="
 
