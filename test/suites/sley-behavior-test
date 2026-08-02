@@ -290,6 +290,17 @@ bare_home_status=$(
 _assert_contains "bare repo fallback: explicit git dir detects repo" "root: $home" "$bare_home_status"
 _assert_contains "bare repo fallback: skips untracked HOME scan" "dirty: false" "$bare_home_status"
 
+bare_home_override_status=$(
+  cd "$home" || exit 1
+  unset SLEY_SKIP_BARE_REPO_FALLBACK
+  HOME="$home" _REPO_TYPE=git \
+    SLEY_BARE_REPO_GIT_DIR="$home/.bare-git" \
+    SLEY_BARE_REPO_WORK_TREE="$home" \
+    "$symlink_bin/sley" status
+)
+_assert_contains "bare repo fallback: explicit repo type still applies configured fallback" \
+  "root: $home" "$bare_home_override_status"
+
 printf 'two\n' >"$home/sub/in-scope.txt"
 printf 'two\n' >"$home/other/out-of-scope.txt"
 
@@ -537,6 +548,59 @@ _assert_contains "status: explicit git env outside sl root stays git" \
   '"repo_type":"git"' "$__SLEY_OUT"
 _assert_contains "status: explicit git env reports git work tree" \
   "\"root\":\"$explicit_git\"" "$__SLEY_OUT"
+
+stale_git=$(_tmpdir)
+mkdir -p "$stale_git/.git"
+hint_sl=$(_tmpdir)
+mkdir -p "$hint_sl/.sl"
+mockbin=$(_mock_bin)
+cat >"$mockbin/git" <<'MOCK'
+#!/usr/bin/env bash
+exit 1
+MOCK
+cat >"$mockbin/sl" <<'MOCK'
+#!/usr/bin/env bash
+if [[ "$1" == "root" ]]; then
+  printf '%s\n' "$SL_REPO"
+fi
+MOCK
+chmod +x "$mockbin/git" "$mockbin/sl"
+hint_rejection=$(
+  cd "$hint_sl" || exit 1
+  PATH="$mockbin:$PATH" SL_REPO="$hint_sl" \
+    STALE_GIT="$stale_git" SLEY_REPO_ROOT="$SLEY_REPO_ROOT" \
+    bash --noprofile --norc -c '
+      source "$SLEY_REPO_ROOT/lib/sley/repo.sh"
+      _REPO_TYPE=git
+      _REPO_ROOT="$STALE_GIT"
+      _SLEY_LAUNCH_REPO_TYPE=git
+      _SLEY_LAUNCH_REPO_ROOT="$STALE_GIT"
+      _SLEY_LAUNCH_REPO_CWD="$STALE_GIT"
+      _repo_detect
+      printf "%s:%s\n" "$_REPO_TYPE" "$_REPO_ROOT"
+    '
+)
+_assert_eq "repo hint: rejected Git hint falls through to Sapling detection" \
+  "sl:$hint_sl" "$hint_rejection"
+
+override_repo=$(_new_repo)
+override_bin=$(_mock_bin)
+cat >"$override_bin/sl" <<'MOCK'
+#!/usr/bin/env bash
+case "$1" in
+  root) printf '%s\n' "$SL_REPO" ;;
+  log) printf 'sl-override' ;;
+  status) : ;;
+esac
+MOCK
+chmod +x "$override_bin/sl"
+override_out=$(
+  cd "$override_repo" || exit 1
+  _REPO_TYPE=sl SL_REPO="$override_repo" PATH="$override_bin:$PATH" \
+    "$SLEY" status --json
+)
+_assert_contains "repo override: CLI preserves explicit Sapling selection" \
+  '"repo_type":"sl"' "$override_out"
 
 repo=$(_tmpdir)
 mkdir -p "$repo/.sl" "$repo/.sley"
@@ -812,6 +876,64 @@ hook_changed_rc=$?
 _assert_exit "hook cli: changed-files outside repo exits unavailable" 2 "$hook_changed_rc"
 _assert_eq "hook cli: changed-files outside repo is quiet" "" "$hook_changed_out"
 
+sl_hook_repo=$(_tmpdir)
+mkdir -p "$sl_hook_repo/.sl"
+printf 'x = 1\n' >"$sl_hook_repo/hook.py"
+sl_hook_bin=$(_mock_bin)
+sl_hook_log="$sl_hook_repo/format.log"
+cat >"$sl_hook_bin/sl" <<'MOCK'
+#!/usr/bin/env bash
+if [[ "$1" == "root" ]]; then
+  printf '%s\n' "$SL_REPO"
+fi
+MOCK
+cat >"$sl_hook_bin/autoformat" <<'MOCK'
+#!/usr/bin/env bash
+printf 'cwd=%s args=%s\n' "$PWD" "$*" >>"$MOCK_LOG"
+MOCK
+chmod +x "$sl_hook_bin/sl" "$sl_hook_bin/autoformat"
+outside_repo=$(_tmpdir)
+(
+  cd "$outside_repo" || exit 1
+  HOME="$home" SL_REPO="$sl_hook_repo" MOCK_LOG="$sl_hook_log" \
+    PATH="$sl_hook_bin:$PATH" "$SLEY" hook format-file "$sl_hook_repo/hook.py"
+)
+_assert_eq "hook cli: absolute Sapling target uses target checkout" \
+  "cwd=$sl_hook_repo args=-- $sl_hook_repo/hook.py" "$(cat "$sl_hook_log")"
+
+bare_hook_home=$(_tmpdir)
+mkdir -p "$bare_hook_home/project" "$bare_hook_home/.hooks"
+git --git-dir="$bare_hook_home/.bare-git" --work-tree="$bare_hook_home" init -q
+git --git-dir="$bare_hook_home/.bare-git" --work-tree="$bare_hook_home" \
+  config user.email test@test.local
+git --git-dir="$bare_hook_home/.bare-git" --work-tree="$bare_hook_home" \
+  config user.name "Test User"
+git --git-dir="$bare_hook_home/.bare-git" --work-tree="$bare_hook_home" \
+  config core.hooksPath "$bare_hook_home/.hooks"
+printf 'x = 1\n' >"$bare_hook_home/project/hook.py"
+git --git-dir="$bare_hook_home/.bare-git" --work-tree="$bare_hook_home" \
+  add project/hook.py
+git --git-dir="$bare_hook_home/.bare-git" --work-tree="$bare_hook_home" \
+  commit -q -m "seed bare hook fixture"
+bare_hook_bin=$(_mock_bin)
+bare_hook_log="$bare_hook_home/format.log"
+cat >"$bare_hook_bin/autoformat" <<'MOCK'
+#!/usr/bin/env bash
+printf 'cwd=%s args=%s\n' "$PWD" "$*" >>"$MOCK_LOG"
+MOCK
+chmod +x "$bare_hook_bin/autoformat"
+(
+  cd "$outside_repo" || exit 1
+  HOME="$bare_hook_home" MOCK_LOG="$bare_hook_log" \
+    SLEY_BARE_REPO_GIT_DIR="$bare_hook_home/.bare-git" \
+    SLEY_BARE_REPO_WORK_TREE="$bare_hook_home" \
+    PATH="$bare_hook_bin:$PATH" \
+    "$SLEY" hook format-file "$bare_hook_home/project/hook.py"
+)
+_assert_eq "hook cli: absolute bare-worktree target keeps fallback context" \
+  "cwd=$bare_hook_home/project args=-- $bare_hook_home/project/hook.py" \
+  "$(cat "$bare_hook_log")"
+
 echo "=== sley: root invocation stays bounded to active changes ==="
 
 repo=$(_new_repo)
@@ -904,6 +1026,277 @@ echo "x = 2" >"$repo/fail.py"
 PATH="$mockbin:$PATH" _run_sley "$repo" fix
 _assert_exit "fix: formatter failure exits 1" 1 "$__SLEY_RC"
 _assert_contains "fix: formatter failure reports file" "fail.py" "$__SLEY_OUT"
+
+repo=$(_new_repo)
+home=$(_tmpdir)
+_copy_sley_libs "$home"
+mkdir -p "$home/.config/sley/extensions.d"
+cat >"$home/.config/sley/extensions.d/80-test.sh" <<'WORK'
+sley_hook_format() {
+  printf 'batch-override:%s\n' "$1" >>"$MOCK_LOG"
+}
+WORK
+mockbin=$(_mock_bin)
+export MOCK_LOG="$repo/format-batch-only.log"
+: >"$MOCK_LOG"
+cat >"$mockbin/autoformat" <<'MOCK'
+#!/usr/bin/env bash
+printf 'autoformat:%s\n' "$*" >>"$MOCK_LOG"
+MOCK
+chmod +x "$mockbin/autoformat"
+for file in first.py middle.py last.py; do
+  printf 'x = 1\n' >"$repo/$file"
+done
+(cd "$repo" && git add . && git commit -q -m "seed batch-only override fixture")
+for file in first.py middle.py last.py; do
+  printf 'x = 2\n' >"$repo/$file"
+done
+
+HOME="$home" PATH="$mockbin:$PATH" _run_sley "$repo" fix
+_assert_exit "fix batch-only override: exits 0" 0 "$__SLEY_RC"
+_assert_eq "fix batch-only override: preserves per-file format-file behavior" \
+  "$(printf '%s\n' \
+    'autoformat:-- first.py' \
+    'autoformat:-- last.py' \
+    'autoformat:-- middle.py')" "$(cat "$MOCK_LOG")"
+_assert_not_contains "fix batch-only override: does not activate batch override" \
+  "batch-override:" "$(cat "$MOCK_LOG")"
+
+repo=$(_new_repo)
+home=$(_tmpdir)
+_copy_sley_libs "$home"
+mkdir -p "$home/.config/sley/extensions.d"
+cat >"$home/.config/sley/extensions.d/80-test.sh" <<'WORK'
+_sley_hook_format_file() {
+  printf 'private-format:%s\n' "$1" >>"$MOCK_LOG"
+}
+WORK
+mockbin=$(_mock_bin)
+export MOCK_LOG="$repo/private-format-override.log"
+: >"$MOCK_LOG"
+cat >"$mockbin/autoformat" <<'MOCK'
+#!/usr/bin/env bash
+printf 'base-autoformat:%s\n' "$*" >>"$MOCK_LOG"
+MOCK
+chmod +x "$mockbin/autoformat"
+for file in first.py second.py; do
+  printf 'x = 1\n' >"$repo/$file"
+done
+(cd "$repo" && git add . && git commit -q -m "seed private override fixture")
+for file in first.py second.py; do
+  printf 'x = 2\n' >"$repo/$file"
+done
+
+HOME="$home" PATH="$mockbin:$PATH" _run_sley "$repo" fix
+_assert_exit "fix private override: exits 0" 0 "$__SLEY_RC"
+_assert_eq "fix private override: preserves historical per-file extension behavior" \
+  "$(printf '%s\n' 'private-format:first.py' 'private-format:second.py')" \
+  "$(cat "$MOCK_LOG")"
+
+legacy_reload_out=$(
+  cd "$repo" || exit 1
+  HOME="$home" SLEY_REPO_ROOT="$SLEY_REPO_ROOT" \
+    bash --noprofile --norc -u -c '
+      source "$SLEY_REPO_ROOT/lib/sley/repo.sh"
+      source "$SLEY_REPO_ROOT/lib/sley/hooks.sh"
+      _SLEY_BASE_FORMAT_FILE_DEFINITION=$(declare -f sley_hook_format_file)
+      _SLEY_BASE_FORMAT_DEFINITION=$(declare -f sley_hook_format)
+      unset _SLEY_BASE_PRIVATE_FORMAT_FILE_DEFINITION
+      _sley_hook_init
+      printf "ok\n"
+    '
+)
+_assert_eq "hook reload: older cached state initializes the private formatter baseline" \
+  "ok" "$legacy_reload_out"
+
+repo=$(_new_repo)
+mockbin=$(_mock_bin)
+export MOCK_LOG="$repo/format-batch-failure.log"
+: >"$MOCK_LOG"
+cat >"$mockbin/autoformat" <<'MOCK'
+#!/usr/bin/env bash
+printf 'autoformat:%s\n' "$*" >>"$MOCK_LOG"
+if [[ "$#" -gt 2 ]]; then
+  for file in "$@"; do
+    case "$file" in
+      first.py | last.py) printf '# formatted\n' >>"$file" ;;
+    esac
+  done
+  exit 9
+fi
+file="${*: -1}"
+if [[ "$file" == "bad.py" ]]; then
+  exit 9
+fi
+printf '# formatted\n' >>"$file"
+MOCK
+chmod +x "$mockbin/autoformat"
+for file in bad.py first.py last.py; do
+  printf 'x = 1\n' >"$repo/$file"
+done
+(cd "$repo" && git add . && git commit -q -m "seed batch failure fixture")
+for file in bad.py first.py last.py; do
+  printf 'x = 2\n' >"$repo/$file"
+done
+
+PATH="$mockbin:$PATH" _run_sley "$repo" fix
+_assert_exit "fix batch failure: preserves failure exit" 1 "$__SLEY_RC"
+_assert_contains "fix batch failure: reports failed chunk" \
+  "sley fix: formatter failed for:" "$__SLEY_OUT"
+_assert_contains "fix batch failure: names failed file" "  bad.py" "$__SLEY_OUT"
+_assert_contains "fix batch failure: conservatively names first chunk sibling" \
+  "  first.py" "${__SLEY_OUT#*formatter failed for:}"
+_assert_contains "fix batch failure: conservatively names later chunk sibling" \
+  "  last.py" "${__SLEY_OUT#*formatter failed for:}"
+_assert_contains "fix batch failure: reports successful mutation" \
+  "  first.py" "${__SLEY_OUT%%sley fix: formatter failed for:*}"
+_assert_contains "fix batch failure: reports later successful mutation" \
+  "  last.py" "${__SLEY_OUT%%sley fix: formatter failed for:*}"
+_assert_eq "fix batch failure: never retries a mutating batch" \
+  "1" "$(wc -l <"$MOCK_LOG" | tr -d ' ')"
+_assert_eq "fix batch failure: first file is formatted once" \
+  "1" "$(grep -c '^# formatted$' "$repo/first.py")"
+_assert_eq "fix batch failure: later file is formatted once" \
+  "1" "$(grep -c '^# formatted$' "$repo/last.py")"
+
+repo=$(_new_repo)
+mockbin=$(_mock_bin)
+cat >"$mockbin/autoformat" <<'MOCK'
+#!/usr/bin/env bash
+file="${*: -1}"
+printf '# formatted before failure\n' >>"$file"
+exit 9
+MOCK
+chmod +x "$mockbin/autoformat"
+printf 'x = 1\n' >"$repo/single.py"
+(cd "$repo" && git add single.py && git commit -q -m "seed mutating failure fixture")
+printf 'x = 2\n' >"$repo/single.py"
+
+PATH="$mockbin:$PATH" _run_sley "$repo" fix
+_assert_exit "fix single failure: preserves failure exit" 1 "$__SLEY_RC"
+_assert_contains "fix single failure: reports mutation before failure" \
+  "sley fix: formatted files:" "$__SLEY_OUT"
+_assert_contains "fix single failure: names the modified file" "  single.py" "$__SLEY_OUT"
+_assert_contains "fix single failure: also reports formatter failure" \
+  "sley fix: formatter failed for:" "$__SLEY_OUT"
+
+repo=$(_new_repo)
+mockbin=$(_mock_bin)
+hash_marker="$repo/hash-post-pass"
+real_git=$(command -p -v git)
+export SLEY_HASH_TEST_MARKER="$hash_marker" SLEY_HASH_TEST_REAL_GIT="$real_git"
+cat >"$mockbin/git" <<'MOCK'
+#!/usr/bin/env bash
+if [[ "${1:-}" == "hash-object" && -e "$SLEY_HASH_TEST_MARKER" ]]; then
+  after_separator=0
+  file_count=0
+  for arg in "$@"; do
+    if [[ "$after_separator" == "1" ]]; then
+      file_count=$((file_count + 1))
+    elif [[ "$arg" == "--" ]]; then
+      after_separator=1
+    fi
+  done
+  [[ "$file_count" -le 1 ]] || exit 1
+fi
+exec "$SLEY_HASH_TEST_REAL_GIT" "$@"
+MOCK
+cat >"$mockbin/autoformat" <<'MOCK'
+#!/usr/bin/env bash
+touch "$SLEY_HASH_TEST_MARKER"
+MOCK
+chmod +x "$mockbin/git" "$mockbin/autoformat"
+for file in first.py second.py; do
+  printf 'x = 1\n' >"$repo/$file"
+done
+(cd "$repo" && git add . && git commit -q -m "seed hash fallback fixture")
+for file in first.py second.py; do
+  printf 'x = 2\n' >"$repo/$file"
+done
+
+PATH="$mockbin:$PATH" _run_sley "$repo" fix
+_assert_exit "fix hash fallback: no-op formatter exits 0" 0 "$__SLEY_RC"
+_assert_not_contains "fix hash fallback: hash backend change is not a mutation" \
+  "sley fix: formatted files:" "$__SLEY_OUT"
+
+repo=$(_new_repo)
+mockbin=$(_mock_bin)
+printf '* text=auto\n' >"$repo/.gitattributes"
+cat >"$mockbin/autoformat" <<'MOCK'
+#!/usr/bin/env bash
+shift
+for file in "$@"; do
+  tr -d '\r' <"$file" >"$file.tmp"
+  mv "$file.tmp" "$file"
+done
+MOCK
+chmod +x "$mockbin/autoformat"
+printf 'x = 1\n' >"$repo/first.py"
+printf 'x = 1\n' >"$repo/second.py"
+(cd "$repo" && git add . && git commit -q -m "seed filtered hash fixture")
+printf 'x = 2\r\n' >"$repo/first.py"
+printf 'x = 2\r\n' >"$repo/second.py"
+(cd "$repo" && git add first.py second.py)
+
+PATH="$mockbin:$PATH" _run_sley "$repo" fix --commit
+_assert_exit "fix filtered hash: byte-only mutations exit 0" 0 "$__SLEY_RC"
+_assert_contains "fix filtered hash: reports first byte-only mutation" \
+  "  first.py" "$__SLEY_OUT"
+_assert_contains "fix filtered hash: reports second byte-only mutation" \
+  "  second.py" "$__SLEY_OUT"
+_assert_contains "fix filtered hash: retains restage guidance" "git add" "$__SLEY_OUT"
+
+repo=$(_tmpdir)
+mkdir -p "$repo/.sl"
+mockbin=$(_mock_bin)
+export SLEY_SAPLING_FIX_LOG="$repo/autoformat.log"
+export SLEY_SAPLING_GIT_LOG="$repo/git.log"
+: >"$SLEY_SAPLING_FIX_LOG"
+: >"$SLEY_SAPLING_GIT_LOG"
+cat >"$mockbin/sl" <<'MOCK'
+#!/usr/bin/env bash
+case "${1:-}" in
+  root) printf '%s\n' "$SL_REPO" ;;
+  log)
+    case "$*" in
+      *'{phase}'*) printf 'public' ;;
+    esac
+    ;;
+  status) printf '%s\n' first.py second.py ;;
+esac
+MOCK
+cat >"$mockbin/git" <<'MOCK'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"$SLEY_SAPLING_GIT_LOG"
+exit 98
+MOCK
+cat >"$mockbin/autoformat" <<'MOCK'
+#!/usr/bin/env bash
+printf 'args:' >>"$SLEY_SAPLING_FIX_LOG"
+printf '<%s>' "$@" >>"$SLEY_SAPLING_FIX_LOG"
+printf '\n' >>"$SLEY_SAPLING_FIX_LOG"
+if IFS= read -r _line; then
+  printf 'stdin:open\n' >>"$SLEY_SAPLING_FIX_LOG"
+else
+  printf 'stdin:closed\n' >>"$SLEY_SAPLING_FIX_LOG"
+fi
+printf '# formatted\n' >>first.py
+MOCK
+chmod +x "$mockbin/sl" "$mockbin/git" "$mockbin/autoformat"
+printf 'x = 1\n' >"$repo/first.py"
+printf 'x = 1\n' >"$repo/second.py"
+
+_REPO_TYPE=sl SL_REPO="$repo" PATH="$mockbin:$PATH" _run_sley "$repo" fix
+_assert_exit "fix Sapling batch: exits 0" 0 "$__SLEY_RC"
+_assert_eq "fix Sapling batch: formats ordered paths once with closed stdin" \
+  "$(printf '%s\n' 'args:<--><first.py><second.py>' 'stdin:closed')" \
+  "$(cat "$SLEY_SAPLING_FIX_LOG")"
+_assert_contains "fix Sapling batch: cksum reports the mutated file" \
+  "  first.py" "$__SLEY_OUT"
+_assert_not_contains "fix Sapling batch: unchanged sibling is not reported" \
+  "  second.py" "$__SLEY_OUT"
+_assert_eq "fix Sapling batch: does not invoke Git hashing" "" \
+  "$(cat "$SLEY_SAPLING_GIT_LOG")"
 
 repo=$(_new_repo)
 home=$(_tmpdir)
@@ -1048,6 +1441,34 @@ _assert_contains "ready --fix: partial staging explains refusal" "staged and uns
 _assert_contains "ready --fix: partial staging probes the formatter" "autoformat:" "$(cat "$MOCK_LOG")"
 _assert_file_content "ready --fix: partial staging leaves worktree unchanged (probe reverted)" "x = 3" "$repo/partial.py"
 
+repo=$(_new_repo)
+mockbin=$(_mock_bin)
+printf '* text=auto\n' >"$repo/.gitattributes"
+cat >"$mockbin/autoformat" <<'MOCK'
+#!/usr/bin/env bash
+file="${*: -1}"
+tr -d '\r' <"$file" >"$file.tmp"
+mv "$file.tmp" "$file"
+MOCK
+chmod +x "$mockbin/autoformat"
+printf 'x = 1\n' >"$repo/partial.py"
+(cd "$repo" && git add . && git commit -q -m "seed filtered partial fixture")
+printf 'x = 2\r\n' >"$repo/partial.py"
+(cd "$repo" && git add partial.py)
+printf 'x = 3\r\n' >"$repo/partial.py"
+partial_expected=$(_tmpdir)/partial.expected
+printf 'x = 3\r\n' >"$partial_expected"
+
+PATH="$mockbin:$PATH" _run_sley "$repo" ready --fix --commit
+_assert_exit "ready --fix filtered hash: byte-only partial mutation is refused" 2 "$__SLEY_RC"
+_assert_contains "ready --fix filtered hash: explains partial-staging refusal" \
+  "staged and unstaged changes" "$__SLEY_OUT"
+if [[ "$(cksum <"$partial_expected")" == "$(cksum <"$repo/partial.py")" ]]; then
+  _pass "ready --fix filtered hash: probe restores original CRLF bytes"
+else
+  _fail "ready --fix filtered hash: probe did not restore original CRLF bytes"
+fi
+
 echo "=== sley: ready --fix --commit refuses all when any file is partial ==="
 
 # A partial file that would be reformatted refuses the whole run before the
@@ -1174,6 +1595,9 @@ export MOCK_LOCALE_LOG="$repo/autoformat-locale.log"
 : >"$MOCK_LOCALE_LOG"
 cat >"$mockbin/autoformat" <<'MOCK'
 #!/usr/bin/env bash
+# A formatter may probe or consume stdin. Each chunk must be isolated from the
+# file-list descriptor or the first invocation drains every later chunk.
+cat >/dev/null
 printf 'call:' >>"$MOCK_LOG"
 printf '<%s>' "$@" >>"$MOCK_LOG"
 printf '\n' >>"$MOCK_LOG"
@@ -3933,11 +4357,13 @@ export MOCK_LOG="$repo/stdin-drain.log"
 cat >"$mockbin/autoformat" <<'MOCK'
 #!/usr/bin/env bash
 # Pretend the formatter slurps stdin. Without `</dev/null` in the caller, this
-# would drain the rest of the herestring and orphan the second file. Print
-# the trailing positional arg (the filename) — autoformat is invoked as
-# `autoformat -- <file>` so the last arg is the file path.
+# would drain the rest of the herestring and orphan later files. Log every
+# positional path after the separator so this also covers the base batch path.
 cat >/dev/null
-printf 'autoformat:%s\n' "${@: -1}" >>"$MOCK_LOG"
+shift
+for file in "$@"; do
+  printf 'autoformat:%s\n' "$file" >>"$MOCK_LOG"
+done
 MOCK
 chmod +x "$mockbin/autoformat"
 echo "x = 1" >"$repo/first.py"

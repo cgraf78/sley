@@ -43,9 +43,48 @@ _repo_has_explicit_git_env() {
   [[ -n "${GIT_DIR:-}" || -n "${GIT_WORK_TREE:-}" ]]
 }
 
+_repo_consume_launcher_detection() {
+  local hinted_type="${_SLEY_LAUNCH_REPO_TYPE:-}"
+  local hinted_root="${_SLEY_LAUNCH_REPO_ROOT:-}"
+  local hinted_cwd="${_SLEY_LAUNCH_REPO_CWD:-}"
+  local current_cwd="" hint_present=0 valid=0
+
+  # The executable probes once before dispatch so it can choose normal-repo
+  # versus optional bare-repo behavior. Reuse that result exactly once when no
+  # user code has had a chance to change repositories. Sourced API callers do
+  # not set this hint and retain the usual fresh detection on every call.
+  [[ -n "$hinted_type" || -n "$hinted_root" || -n "$hinted_cwd" ]] && hint_present=1
+  unset _SLEY_LAUNCH_REPO_TYPE _SLEY_LAUNCH_REPO_ROOT _SLEY_LAUNCH_REPO_CWD
+  if [[ -n "$hinted_type" && -n "$hinted_root" && -n "$hinted_cwd" ]]; then
+    current_cwd=$(_repo_physical_dir "$PWD" || true)
+    if [[ -n "$current_cwd" && "$current_cwd" == "$hinted_cwd" ]]; then
+      case "$hinted_type" in
+        git) [[ -e "$hinted_root/.git" ]] && valid=1 ;;
+        sl) _repo_has_real_sl_metadata "$hinted_root" && valid=1 ;;
+      esac
+    fi
+  fi
+
+  if [[ "$valid" != "1" ]]; then
+    # A rejected launcher-owned hint must not masquerade as a caller's
+    # intentional `_REPO_TYPE` override and suppress probing the other VCS.
+    if [[ "$hint_present" == "1" ]]; then
+      _REPO_TYPE=""
+      _REPO_ROOT=""
+    fi
+    return 1
+  fi
+
+  _REPO_TYPE="$hinted_type"
+  _REPO_ROOT="$hinted_root"
+  return 0
+}
+
 _repo_detect() {
   _REPO_TYPE="${_REPO_TYPE:-}"
   _REPO_ROOT="${_REPO_ROOT:-}"
+
+  _repo_consume_launcher_detection && return 0
 
   # Honor a pre-set `_REPO_TYPE` for hook callers that force one VCS to
   # disambiguate dual-managed repos, but always re-probe `_REPO_ROOT`.

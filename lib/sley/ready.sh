@@ -1162,54 +1162,19 @@ _sley_ready_run_guarded_command() {
 _sley_ready_run_base_format_chunk() {
   local format_rc=0
 
-  autoformat -- "$@" 2>/dev/null || format_rc=$?
+  autoformat -- "$@" </dev/null 2>/dev/null || format_rc=$?
   case "$format_rc" in
     2 | 126 | 127) return 2 ;;
     *) return 0 ;;
   esac
 }
 
-_sley_ready_byte_length() {
-  local output_name="$1" value="$2"
-  local LC_ALL=C
-
-  # Bash counts characters under a multibyte locale. Limit C locale to this
-  # expansion so the formatter still inherits the caller's locale unchanged.
-  printf -v "$output_name" '%s' "${#value}"
-}
-
 _sley_ready_run_base_format_file_list() {
-  local file_list="$1" file file_bytes
+  local file_list="$1"
   local max_bytes="${_SLEY_READY_FORMAT_CHUNK_MAX_BYTES:-65536}"
   local max_files="${_SLEY_READY_FORMAT_CHUNK_MAX_FILES:-256}"
-  local chunk_bytes=3
-  local -a chunk=()
-
-  if ! [[ "$max_bytes" =~ ^[1-9][0-9]{0,4}$ ]] ||
-    [[ "$max_bytes" -gt 65536 ]]; then
-    max_bytes=65536
-  fi
-  if ! [[ "$max_files" =~ ^[1-9][0-9]{0,2}$ ]] ||
-    [[ "$max_files" -gt 256 ]]; then
-    max_files=256
-  fi
-  while IFS= read -r file; do
-    [[ -n "$file" ]] || continue
-    _sley_ready_byte_length file_bytes "$file"
-    file_bytes=$((file_bytes + 1))
-    if [[ "${#chunk[@]}" -gt 0 ]] &&
-      { [[ "${#chunk[@]}" -ge "$max_files" ]] ||
-        [[ "$((chunk_bytes + file_bytes))" -gt "$max_bytes" ]]; }; then
-      _sley_ready_run_base_format_chunk "${chunk[@]}" || return $?
-      chunk=()
-      chunk_bytes=3
-    fi
-    chunk+=("$file")
-    chunk_bytes=$((chunk_bytes + file_bytes))
-  done <"$file_list"
-
-  [[ "${#chunk[@]}" -eq 0 ]] ||
-    _sley_ready_run_base_format_chunk "${chunk[@]}"
+  _sley_run_file_chunks _sley_ready_run_base_format_chunk \
+    "$max_bytes" "$max_files" <"$file_list"
 }
 
 _sley_ready_run_format_file_list() {
@@ -1242,47 +1207,6 @@ _sley_ready_run_format_file_list() {
 
   [[ "$format_rc" == "2" ]] && return 2
   return 0
-}
-
-_sley_ready_hash_files() {
-  local files_text="$1" file output="" hash index=0 batch_rc=0
-  local -a files=() existing_files=() existing_indices=() batch_hashes=() hashes=()
-
-  while IFS= read -r file; do
-    [[ -n "$file" ]] || continue
-    files+=("$file")
-    hashes+=("")
-    if [[ -e "$file" || -L "$file" ]]; then
-      existing_files+=("$file")
-      existing_indices+=("$index")
-    fi
-    index=$((index + 1))
-  done <<<"$files_text"
-
-  if [[ "${#existing_files[@]}" -gt 0 ]]; then
-    output=$(git hash-object -- "${existing_files[@]}" 2>/dev/null) || batch_rc=$?
-    while IFS= read -r hash; do
-      [[ -n "$hash" ]] && batch_hashes+=("$hash")
-    done <<<"$output"
-  fi
-
-  if [[ "$batch_rc" == "0" &&
-    "${#batch_hashes[@]}" == "${#existing_files[@]}" ]]; then
-    for index in "${!existing_indices[@]}"; do
-      hashes[${existing_indices[$index]}]=${batch_hashes[$index]}
-    done
-  else
-    # A concurrent deletion or unexpected Git error can make a multi-path hash
-    # stop early. Fall back to the previous per-file behavior so one bad path
-    # cannot shift hashes onto later files or hide their mutations.
-    for index in "${!files[@]}"; do
-      hashes[index]=$(git hash-object -- "${files[$index]}" 2>/dev/null || true)
-    done
-  fi
-
-  for index in "${!files[@]}"; do
-    printf '%s\t%s\n' "$index" "${hashes[$index]}"
-  done
 }
 
 _sley_ready_run_owned() {
@@ -1706,7 +1630,7 @@ _sley_ready_impl() {
         if [[ "$_SLEY_SCOPE_CHANGE" == "staged" ]]; then
           local _fix_runnable
           _fix_runnable=$(printf '%s\n' "$_fix_files" | _repo_existing_regular_files)
-          _fix_partial=$(_sley_git_staged_partial_files "$_fix_runnable")
+          _fix_partial=$(_sley_git_unstaged_among "$_fix_runnable")
           while IFS= read -r _fix_f; do
             [[ -n "$_fix_f" ]] && _fix_partial_set["$_fix_f"]=1
           done <<<"$_fix_partial"
@@ -1733,7 +1657,7 @@ _sley_ready_impl() {
               continue
             fi
             _fix_active_file=$_fix_f
-            _fix_pre=$(git hash-object -- "$_fix_f" 2>/dev/null || true)
+            _fix_pre=$(git hash-object --no-filters -- "$_fix_f" 2>/dev/null || true)
             # Redirect stdin from /dev/null so a formatter that reads stdin can't
             # drain the herestring driving this loop (parity with `_sley_fix`).
             if _sley_ready_run_owned sley_hook_format_file "$_fix_f" </dev/null >/dev/null 2>&1; then
@@ -1747,7 +1671,7 @@ _sley_ready_impl() {
               _sley_ready_cleanup
               return 2
             fi
-            _fix_post=$(git hash-object -- "$_fix_f" 2>/dev/null || true)
+            _fix_post=$(git hash-object --no-filters -- "$_fix_f" 2>/dev/null || true)
             # Always restore: formatting a partial file is only a probe. If the
             # restore itself fails after the formatter mutated the file, keep the
             # backup and refuse loudly — deleting the only copy that can recover
@@ -1794,7 +1718,7 @@ _sley_ready_impl() {
               _sley_ready_cleanup
               return 2
             fi
-            _fix_hash_records=$(_sley_ready_hash_files "$_fix_batch_files_text")
+            _fix_hash_records=$(_sley_hash_files "$_fix_batch_files_text")
             while IFS=$'\t' read -r _fix_hash_index _fix_pre; do
               [[ -n "$_fix_hash_index" ]] || continue
               _fix_batch_pre[_fix_hash_index]=$_fix_pre
@@ -1816,7 +1740,7 @@ _sley_ready_impl() {
               return 2
             fi
 
-            _fix_hash_records=$(_sley_ready_hash_files "$_fix_batch_files_text")
+            _fix_hash_records=$(_sley_hash_files "$_fix_batch_files_text")
             while IFS=$'\t' read -r _fix_hash_index _fix_post; do
               [[ -n "$_fix_hash_index" ]] || continue
               _fix_batch_post[_fix_hash_index]=$_fix_post
