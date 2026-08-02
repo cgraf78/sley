@@ -1463,7 +1463,7 @@ PATH="$mockbin:$PATH" _run_sley "$repo" ready --fix --commit
 _assert_exit "ready --fix filtered hash: byte-only partial mutation is refused" 2 "$__SLEY_RC"
 _assert_contains "ready --fix filtered hash: explains partial-staging refusal" \
   "staged and unstaged changes" "$__SLEY_OUT"
-if cmp -s "$partial_expected" "$repo/partial.py"; then
+if [[ "$(cksum <"$partial_expected")" == "$(cksum <"$repo/partial.py")" ]]; then
   _pass "ready --fix filtered hash: probe restores original CRLF bytes"
 else
   _fail "ready --fix filtered hash: probe did not restore original CRLF bytes"
