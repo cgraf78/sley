@@ -31,6 +31,14 @@ HOOK_FORMAT_FILE_MEDIAN_BUDGET_MS=350
 HOOK_FORMAT_FILE_DARWIN_MEDIAN_BUDGET_MS=500
 HOOK_FORMAT_FILE_P95_BUDGET_MS=1000
 HOOK_FORMAT_FILE_DARWIN_P95_BUDGET_MS=1500
+HOOK_LINT_FILE_MEDIAN_BUDGET_MS=350
+HOOK_LINT_FILE_DARWIN_MEDIAN_BUDGET_MS=500
+HOOK_LINT_FILE_P95_BUDGET_MS=1000
+HOOK_LINT_FILE_DARWIN_P95_BUDGET_MS=1500
+CHECK_300_MEDIAN_BUDGET_MS=1200
+CHECK_300_DARWIN_MEDIAN_BUDGET_MS=1800
+CHECK_300_P95_BUDGET_MS=3500
+CHECK_300_DARWIN_P95_BUDGET_MS=5000
 READY_FIX_300_MEDIAN_BUDGET_MS=5000
 READY_FIX_300_DARWIN_MEDIAN_BUDGET_MS=7000
 READY_FIX_FORMAT_CHUNK_FILES=256
@@ -64,7 +72,20 @@ printf '%s\n' "$count" >"$SLEY_PERF_AUTOFORMAT_COUNT_FILE"
 printf '%s\n' "$@" >"${SLEY_PERF_AUTOFORMAT_ARGS_PREFIX}.${count}"
 exit "${SLEY_PERF_AUTOFORMAT_RC:-0}"
 EOF
-chmod +x "$perf_mock_bin/checkrun" "$perf_mock_bin/autoformat"
+cat >"$perf_mock_bin/autolint" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+: "${SLEY_PERF_AUTOLINT_COUNT_FILE:?}"
+: "${SLEY_PERF_AUTOLINT_ARGS_PREFIX:?}"
+
+count=$(cat "$SLEY_PERF_AUTOLINT_COUNT_FILE")
+count=$((count + 1))
+printf '%s\n' "$count" >"$SLEY_PERF_AUTOLINT_COUNT_FILE"
+printf '%s\n' "$@" >"${SLEY_PERF_AUTOLINT_ARGS_PREFIX}.${count}"
+exit "${SLEY_PERF_AUTOLINT_RC:-0}"
+EOF
+chmod +x "$perf_mock_bin/checkrun" "$perf_mock_bin/autoformat" "$perf_mock_bin/autolint"
 export PATH="$perf_mock_bin:$PATH"
 
 _new_perf_repo() {
@@ -139,6 +160,16 @@ _assert_autoformat_invocations() {
   for ((run = 1; run <= count; run++)); do
     _assert_file_matches "$desc args $run" \
       "$expected_args" "${SLEY_PERF_AUTOFORMAT_ARGS_PREFIX}.${run}"
+  done
+}
+
+_assert_autolint_invocations() {
+  local desc="$1" expected_count="$2" expected_args="$3" count run
+  count=$(cat "$SLEY_PERF_AUTOLINT_COUNT_FILE")
+  _assert_eq "$desc count" "$expected_count" "$count"
+  for ((run = 1; run <= count; run++)); do
+    _assert_file_matches "$desc args $run" \
+      "$expected_args" "${SLEY_PERF_AUTOLINT_ARGS_PREFIX}.${run}"
   done
 }
 
@@ -508,6 +539,91 @@ _assert_ms_le "hook format-file perf: full CLI p95" \
   "$hook_format_file_p95" "$hook_format_file_p95_budget"
 _assert_autoformat_invocations "hook format-file perf: measured delegation" \
   "$SLEY_HOOK_PERF_RUNS" "$autoformat_state/expected-args"
+
+autolint_state=$(_tmpdir)
+export SLEY_PERF_AUTOLINT_COUNT_FILE="$autolint_state/count"
+export SLEY_PERF_AUTOLINT_ARGS_PREFIX="$autolint_state/args"
+printf '0\n' >"$SLEY_PERF_AUTOLINT_COUNT_FILE"
+{
+  printf '%s\n' --json "$repo/hook.py"
+} >"$autolint_state/expected-args"
+
+export SLEY_PERF_AUTOLINT_RC=0
+printf '0\n' >"$SLEY_PERF_GIT_PROBE_COUNT_FILE"
+printf '0\n' >"$SLEY_PERF_SL_PROBE_COUNT_FILE"
+PATH="$probe_bin:$PATH" _run_perf_sley_timed 5 "$outside_repo" \
+  hook lint-file --json "$repo/hook.py"
+_assert_exit "hook lint-file perf: absolute target exits 0" 0 "$__SLEY_RC"
+_assert_file_content "hook lint-file perf: discovers target Git repo once" \
+  "1" "$SLEY_PERF_GIT_PROBE_COUNT_FILE"
+_assert_file_content "hook lint-file perf: checks Sapling precedence once" \
+  "1" "$SLEY_PERF_SL_PROBE_COUNT_FILE"
+_assert_autolint_invocations "hook lint-file perf: absolute target delegation" \
+  1 "$autolint_state/expected-args"
+
+export SLEY_PERF_AUTOLINT_RC=7
+printf '0\n' >"$SLEY_PERF_AUTOLINT_COUNT_FILE"
+_run_perf_sley_timed 5 "$repo" hook lint-file --json "$repo/hook.py"
+_assert_exit "hook lint-file perf: propagates linter exit" 7 "$__SLEY_RC"
+_assert_autolint_invocations "hook lint-file perf: failing linter delegation" \
+  1 "$autolint_state/expected-args"
+
+export SLEY_PERF_AUTOLINT_RC=0
+printf '0\n' >"$SLEY_PERF_AUTOLINT_COUNT_FILE"
+_measure_perf_stats "hook lint-file perf: full CLI" 5 "$repo" \
+  "$SLEY_HOOK_PERF_RUNS" hook lint-file --json "$repo/hook.py"
+hook_lint_file_p95="$__PERF_P95"
+hook_lint_file_median="$__PERF_MEDIAN"
+hook_lint_file_median_budget=$(_perf_budget_ms \
+  "$HOOK_LINT_FILE_MEDIAN_BUDGET_MS" \
+  "$HOOK_LINT_FILE_DARWIN_MEDIAN_BUDGET_MS")
+hook_lint_file_p95_budget=$(_perf_budget_ms \
+  "$HOOK_LINT_FILE_P95_BUDGET_MS" \
+  "$HOOK_LINT_FILE_DARWIN_P95_BUDGET_MS")
+echo "  PERF: hook lint-file median ${hook_lint_file_median}ms / ${hook_lint_file_median_budget}ms, p95 ${hook_lint_file_p95}ms / ${hook_lint_file_p95_budget}ms (runs ${SLEY_HOOK_PERF_RUNS})"
+_assert_ms_le "hook lint-file perf: full CLI median" \
+  "$hook_lint_file_median" "$hook_lint_file_median_budget"
+_assert_ms_le "hook lint-file perf: full CLI p95" \
+  "$hook_lint_file_p95" "$hook_lint_file_p95_budget"
+_assert_autolint_invocations "hook lint-file perf: measured delegation" \
+  "$SLEY_HOOK_PERF_RUNS" "$autolint_state/expected-args"
+
+echo "=== sley: check performance ==="
+
+repo=$(_new_perf_repo)
+_write_changed_tree "$repo" "$SLEY_PERF_CHANGED_FILES"
+autolint_state=$(_tmpdir)
+export SLEY_PERF_AUTOLINT_COUNT_FILE="$autolint_state/count"
+export SLEY_PERF_AUTOLINT_ARGS_PREFIX="$autolint_state/args"
+export SLEY_PERF_AUTOLINT_RC=0
+printf '0\n' >"$SLEY_PERF_AUTOLINT_COUNT_FILE"
+{
+  printf '%s\n' --
+  git -C "$repo" diff --name-only
+} >"$autolint_state/expected-args"
+
+_run_perf_sley_timed 10 "$repo" check
+_assert_exit "check perf: 300-file changed tree exits 0" 0 "$__SLEY_RC"
+_assert_autolint_invocations "check perf: one 300-file linter batch" \
+  1 "$autolint_state/expected-args"
+
+_measure_perf_stats "check perf: 300-file changed tree" 10 "$repo" \
+  "$SLEY_PERF_RUNS" check
+check_300_p95="$__PERF_P95"
+check_300_median="$__PERF_MEDIAN"
+check_300_median_budget=$(_perf_budget_ms \
+  "$CHECK_300_MEDIAN_BUDGET_MS" \
+  "$CHECK_300_DARWIN_MEDIAN_BUDGET_MS")
+check_300_p95_budget=$(_perf_budget_ms \
+  "$CHECK_300_P95_BUDGET_MS" \
+  "$CHECK_300_DARWIN_P95_BUDGET_MS")
+echo "  PERF: check 300 files median ${check_300_median}ms / ${check_300_median_budget}ms, p95 ${check_300_p95}ms / ${check_300_p95_budget}ms (runs ${SLEY_PERF_RUNS})"
+_assert_ms_le "check perf: 300-file median" \
+  "$check_300_median" "$check_300_median_budget"
+_assert_ms_le "check perf: 300-file p95" \
+  "$check_300_p95" "$check_300_p95_budget"
+_assert_autolint_invocations "check perf: measured 300-file batches" \
+  "$((SLEY_PERF_RUNS + 1))" "$autolint_state/expected-args"
 
 echo "=== sley: fix performance ==="
 
