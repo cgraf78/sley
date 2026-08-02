@@ -443,36 +443,23 @@ _sley_status() {
   fi
 }
 
-_sley_git_staged_partial_files() {
-  local files_text="$1" staged unstaged f
-  # Route both git invocations through the NUL-safe filter (`-z` +
-  # `_repo_emit_safe_paths`) so a filename with an embedded newline can't
-  # phantom-split into multiple bogus entries and silently misattribute
-  # partial-staging state. See `_repo_emit_safe_paths` in repo.sh.
-  staged=$(
-    set -o pipefail
-    git diff -z --cached --name-only --diff-filter=ACM 2>/dev/null | _repo_emit_safe_paths
-  ) || staged=""
+_sley_git_unstaged_among() {
+  local files_text="$1" unstaged f
+  # Callers pass the already-selected staged files, so enumerating the index a
+  # second time only repeats the scope query. Intersect that trusted selection
+  # with the NUL-safe unstaged list to identify partially staged paths.
   unstaged=$(
     set -o pipefail
     git diff -z --name-only --diff-filter=ACM 2>/dev/null | _repo_emit_safe_paths
   ) || unstaged=""
-  # Build O(1) membership sets so the loop is O(N) instead of O(N) `grep -Fxq`
-  # invocations per row. A 100-file partial-staging audit drops from thousands
-  # of grep spawns to one pass over each list.
-  declare -A _in_unstaged _in_files
+  declare -A _in_unstaged
   while IFS= read -r f; do
     [[ -n "$f" ]] && _in_unstaged["$f"]=1
   done <<<"$unstaged"
   while IFS= read -r f; do
-    [[ -n "$f" ]] && _in_files["$f"]=1
-  done <<<"$files_text"
-  while IFS= read -r f; do
     [[ -n "$f" ]] || continue
-    [[ -n "${_in_unstaged[$f]:-}" ]] || continue
-    [[ -n "${_in_files[$f]:-}" ]] || continue
-    printf '%s\n' "$f"
-  done <<<"$staged"
+    [[ -n "${_in_unstaged[$f]:-}" ]] && printf '%s\n' "$f"
+  done <<<"$files_text"
 }
 
 _sley_git_staged_selected_files() {
@@ -497,16 +484,160 @@ _sley_git_staged_selected_files() {
 
 _sley_file_hash() {
   local file="$1"
-  # Use a VCS-independent file hash because `sley fix` must report formatter
-  # mutations consistently in Git and Sapling repos.
-  cksum <"$file" 2>/dev/null || true
+  # Individual fixes and Sapling batches use this raw-byte hash. Git batches
+  # use `hash-object --no-filters` below, so every path detects formatter-only
+  # byte changes without attributes or EOL normalization hiding them.
+  { cksum <"$file"; } 2>/dev/null || true
+}
+
+_sley_hash_git_chunk() {
+  local output hash
+
+  output=$(git hash-object --no-filters -- "$@" 2>/dev/null) || {
+    _SLEY_HASH_BATCH_FAILED=1
+    return 1
+  }
+  while IFS= read -r hash; do
+    [[ -n "$hash" ]] && _SLEY_HASH_BATCH_HASHES+=("$hash")
+  done <<<"$output"
+}
+
+_sley_hash_files() {
+  local files_text="$1" file index=0 existing_text=""
+  local _SLEY_HASH_BATCH_FAILED=0
+  local -a files=() existing_files=() existing_indices=() hashes=()
+  local -a _SLEY_HASH_BATCH_HASHES=()
+
+  while IFS= read -r file; do
+    [[ -n "$file" ]] || continue
+    files+=("$file")
+    hashes+=("")
+    if [[ -e "$file" || -L "$file" ]]; then
+      existing_files+=("$file")
+      existing_indices+=("$index")
+      existing_text+="$file"$'\n'
+    fi
+    index=$((index + 1))
+  done <<<"$files_text"
+
+  if [[ "${#existing_files[@]}" -gt 0 && "${_REPO_TYPE:-}" == "git" ]]; then
+    _sley_run_file_chunks _sley_hash_git_chunk 65536 256 \
+      <<<"$existing_text" || true
+  else
+    _SLEY_HASH_BATCH_FAILED=1
+  fi
+
+  if [[ "$_SLEY_HASH_BATCH_FAILED" == "0" &&
+    "${#_SLEY_HASH_BATCH_HASHES[@]}" == "${#existing_files[@]}" ]]; then
+    for index in "${!existing_indices[@]}"; do
+      hashes[${existing_indices[$index]}]=${_SLEY_HASH_BATCH_HASHES[$index]}
+    done
+  else
+    # Keep one hash scheme across pre/post passes. A Git batch failure retries
+    # with Git per file; Sapling consistently uses the VCS-independent hash.
+    # Mixing Git object ids with cksum output would report every file modified.
+    for index in "${!files[@]}"; do
+      if [[ "${_REPO_TYPE:-}" == "git" ]]; then
+        hashes[index]=$(git hash-object --no-filters -- "${files[$index]}" 2>/dev/null || true)
+      else
+        hashes[index]=$(_sley_file_hash "${files[$index]}")
+      fi
+    done
+  fi
+
+  for index in "${!files[@]}"; do
+    printf '%s\t%s\n' "$index" "${hashes[$index]}"
+  done
+}
+
+_sley_byte_length() {
+  local output_name="$1" value="$2"
+  local LC_ALL=C
+
+  # Bash counts characters under a multibyte locale. Limit C locale to this
+  # expansion so formatters still inherit the caller's locale unchanged.
+  printf -v "$output_name" '%s' "${#value}"
+}
+
+_sley_run_file_chunks() {
+  local callback="$1" max_bytes="$2" max_files="$3" file file_bytes
+  local chunk_bytes=3
+  local -a chunk=()
+
+  if ! [[ "$max_bytes" =~ ^[1-9][0-9]{0,4}$ ]] ||
+    [[ "$max_bytes" -gt 65536 ]]; then
+    max_bytes=65536
+  fi
+  if ! [[ "$max_files" =~ ^[1-9][0-9]{0,2}$ ]] ||
+    [[ "$max_files" -gt 256 ]]; then
+    max_files=256
+  fi
+  while IFS= read -r file; do
+    [[ -n "$file" ]] || continue
+    _sley_byte_length file_bytes "$file"
+    file_bytes=$((file_bytes + 1))
+    if [[ "${#chunk[@]}" -gt 0 ]] &&
+      { [[ "${#chunk[@]}" -ge "$max_files" ]] ||
+        [[ "$((chunk_bytes + file_bytes))" -gt "$max_bytes" ]]; }; then
+      "$callback" "${chunk[@]}" || return $?
+      chunk=()
+      chunk_bytes=3
+    fi
+    chunk+=("$file")
+    chunk_bytes=$((chunk_bytes + file_bytes))
+  done
+
+  [[ "${#chunk[@]}" -eq 0 ]] || "$callback" "${chunk[@]}"
+}
+
+_sley_fix_run_base_format_chunk() {
+  local format_rc=0
+
+  autoformat -- "$@" </dev/null >/dev/null 2>/dev/null || format_rc=$?
+  case "$format_rc" in
+    0) ;;
+    2) _SLEY_FIX_SKIPPED+=("$@") ;;
+    *) _SLEY_FIX_FAILED+=("$@") ;;
+  esac
+  # Never retry a mutating batch: formatters are expected to be idempotent but
+  # that is not an enforceable contract. Continue so later bounded chunks still
+  # get an attempt, and report the whole failed chunk conservatively.
+  return 0
+}
+
+_sley_fix_run_individual_files() {
+  local f pre post format_rc
+
+  for f in "$@"; do
+    pre=$(_sley_file_hash "$f")
+    # Redirect stdin so an interactive or probing formatter cannot consume the
+    # caller's file-list stream and silently skip later paths.
+    format_rc=0
+    sley_hook_format_file "$f" </dev/null >/dev/null || format_rc=$?
+    post=$(_sley_file_hash "$f")
+    [[ -n "$pre" && "$pre" != "$post" ]] && _SLEY_FIX_MODIFIED+=("$f")
+    case "$format_rc" in
+      0) ;;
+      2)
+        _SLEY_FIX_SKIPPED+=("$f")
+        continue
+        ;;
+      *)
+        _SLEY_FIX_FAILED+=("$f")
+        continue
+        ;;
+    esac
+  done
 }
 
 _sley_fix() {
   _sley_init_repo || return $?
   _sley_parse_scope "$@" || return $?
 
-  local files partial runnable modified=() failed=() f pre post format_rc unavailable=0
+  local files partial runnable f unavailable=0 hash_records index hash
+  local use_batch=0
+  local -a runnable_files=() _SLEY_FIX_MODIFIED=() _SLEY_FIX_FAILED=() _SLEY_FIX_SKIPPED=()
+  local -a pre_hashes=() post_hashes=()
   files=$(_sley_selected_files) || return 2
   _sley_warn_out_of_scope "$files"
   runnable=$(printf '%s\n' "$files" | _repo_existing_regular_files)
@@ -527,7 +658,7 @@ _sley_fix() {
     # Formatting a partially staged file rewrites the whole worktree file,
     # mixing unstaged hunks with formatter output. Refuse all files instead of
     # producing a half-helpful, half-dangerous result.
-    partial=$(_sley_git_staged_partial_files "$runnable")
+    partial=$(_sley_git_unstaged_among "$runnable")
     if [[ -n "$partial" ]]; then
       echo "sley fix: refusing files with staged and unstaged changes:" >&2
       printf '%s\n' "$partial" | sed 's/^/  /' >&2
@@ -536,31 +667,46 @@ _sley_fix() {
   fi
 
   while IFS= read -r f; do
-    [[ -n "$f" ]] || continue
-    pre=$(_sley_file_hash "$f")
-    # Redirect formatter stdin from /dev/null. Without this, hook formatters
-    # inherit the loop's stdin (the `<<<"$runnable"` herestring) — if a
-    # formatter ever reads stdin (interactive prompt, tty probe), it drains
-    # the rest of the herestring and silently skips every remaining file.
-    format_rc=0
-    sley_hook_format_file "$f" </dev/null >/dev/null || format_rc=$?
-    if [[ "$format_rc" -eq 2 ]]; then
-      unavailable=1
-      continue
-    fi
-    if [[ "$format_rc" -ne 0 ]]; then
-      failed+=("$f")
-      continue
-    fi
-    post=$(_sley_file_hash "$f")
-    if [[ -n "$pre" && "$pre" != "$post" ]]; then
-      modified+=("$f")
-    fi
+    [[ -n "$f" ]] && runnable_files+=("$f")
   done <<<"$runnable"
 
-  if [[ "${#modified[@]}" -gt 0 ]]; then
+  if [[ "${#runnable_files[@]}" -gt 1 &&
+    "${_SLEY_HOOK_FORMAT_OVERRIDDEN:-0}" == "0" &&
+    "${_SLEY_HOOK_FORMAT_FILE_OVERRIDDEN:-0}" == "0" &&
+    "${_SLEY_HOOK_PRIVATE_FORMAT_FILE_OVERRIDDEN:-0}" == "0" ]]; then
+    command -v autoformat >/dev/null 2>&1 && use_batch=1
+  fi
+
+  if [[ "$use_batch" == "0" ]]; then
+    # Single-file fixes and extension-owned hooks retain their exact historical
+    # per-file execution and failure attribution. Only the unextended
+    # multi-file base path speculates with a batch.
+    _sley_fix_run_individual_files "${runnable_files[@]}"
+  else
+    hash_records=$(_sley_hash_files "$runnable")
+    while IFS=$'\t' read -r index hash; do
+      [[ -n "$index" ]] && pre_hashes[index]="$hash"
+    done <<<"$hash_records"
+
+    _sley_run_file_chunks _sley_fix_run_base_format_chunk 65536 256 <<<"$runnable"
+
+    hash_records=$(_sley_hash_files "$runnable")
+    while IFS=$'\t' read -r index hash; do
+      [[ -n "$index" ]] && post_hashes[index]="$hash"
+    done <<<"$hash_records"
+    for index in "${!runnable_files[@]}"; do
+      f=${runnable_files[$index]}
+      if [[ -n "${pre_hashes[$index]:-}" &&
+        "${pre_hashes[$index]:-}" != "${post_hashes[$index]:-}" ]]; then
+        _SLEY_FIX_MODIFIED+=("$f")
+      fi
+    done
+  fi
+  [[ "${#_SLEY_FIX_SKIPPED[@]}" -eq 0 ]] || unavailable=1
+
+  if [[ "${#_SLEY_FIX_MODIFIED[@]}" -gt 0 ]]; then
     echo "sley fix: formatted files:" >&2
-    printf '  %s\n' "${modified[@]}" >&2
+    printf '  %s\n' "${_SLEY_FIX_MODIFIED[@]}" >&2
     if [[ "$_REPO_TYPE" == "git" && "$_SLEY_SCOPE_CHANGE" == "staged" ]]; then
       # Unlike the automatic pre-commit hook, the interactive CLI does not
       # update the index. Humans and agents should make the staging decision
@@ -570,9 +716,9 @@ _sley_fix() {
       echo "sley fix: run 'git add <one-of-the-listed-files>' to stage formatting changes." >&2
     fi
   fi
-  if [[ "${#failed[@]}" -gt 0 ]]; then
+  if [[ "${#_SLEY_FIX_FAILED[@]}" -gt 0 ]]; then
     echo "sley fix: formatter failed for:" >&2
-    printf '  %s\n' "${failed[@]}" >&2
+    printf '  %s\n' "${_SLEY_FIX_FAILED[@]}" >&2
     return 1
   fi
   if [[ "$unavailable" -eq 1 ]]; then

@@ -37,23 +37,6 @@ _sley_physical_dir() {
   cd -- "$1" 2>/dev/null && pwd -P
 }
 
-_sley_inside_git_worktree() {
-  command -v git >/dev/null 2>&1 || return 1
-  local root
-  root=$(git rev-parse --show-toplevel 2>/dev/null) || return 1
-  # Without explicit Git env, Sley only treats real worktrees as normal repos.
-  # Optional bare worktree handling belongs to the SLEY_BARE_REPO_* contract
-  # below, which keeps launcher-specific conventions out of default detection.
-  [[ -e "$root/.git" ]]
-}
-
-_sley_inside_real_sl_worktree() {
-  command -v sl >/dev/null 2>&1 || return 1
-  local root
-  root=$(sl root --config ui.color=never 2>/dev/null) || return 1
-  [[ -d "$root/.sl" || -d "$root/.hg" ]]
-}
-
 _sley_auto_path_ok() {
   [[ $# -gt 0 ]] || return 1
   case "$1" in
@@ -105,6 +88,29 @@ _sley_apply_bare_repo_fallback() {
   _sley_run "$@"
 }
 
+# Absolute editor buffer paths own their repository context. Position the
+# launcher before its normal-vs-bare decision so the canonical detector and the
+# hook body inspect the same repository and can share one detection result.
+if [[ "${1:-}" == "hook" && $# -ge 3 ]]; then
+  case "$2" in
+    format-file | lint-file)
+      _sley_hook_cd_for_absolute_file_arg "${@:3}" || true
+      ;;
+  esac
+fi
+
+# Never trust a same-named environment variable as a repository-selection
+# shortcut. Only this process may publish the one-use detection hint below.
+unset _SLEY_LAUNCH_REPO_TYPE _SLEY_LAUNCH_REPO_ROOT _SLEY_LAUNCH_REPO_CWD
+
+# `_REPO_TYPE` is an established hook-caller override for dual-managed repos.
+# Preserve it across the launcher's normal-repo probe, but do not turn it into
+# a launcher hint: the canonical library should consume caller intent directly.
+_sley_caller_repo_type=""
+case "${_REPO_TYPE:-}" in
+  git | sl) _sley_caller_repo_type="$_REPO_TYPE" ;;
+esac
+
 # Honor explicit Git context. Callers that set either variable are already
 # choosing a repository, including bare Git worktrees.
 if [[ -n "${GIT_DIR:-}" || -n "${GIT_WORK_TREE:-}" ]]; then
@@ -112,9 +118,25 @@ if [[ -n "${GIT_DIR:-}" || -n "${GIT_WORK_TREE:-}" ]]; then
 fi
 
 # Normal repositories should win over any optional bare-repo fallback. The
-# generic library still owns the actual VCS operations.
-if _sley_inside_git_worktree || _sley_inside_real_sl_worktree; then
+# generic library owns detection precedence; the hook/command consumes this
+# result once instead of launching the same VCS probes again.
+_repo_detect
+if [[ -n "${_REPO_TYPE:-}" && -n "${_REPO_ROOT:-}" ]]; then
+  if [[ -n "$_sley_caller_repo_type" ]]; then
+    _REPO_TYPE="$_sley_caller_repo_type"
+  else
+    _SLEY_LAUNCH_REPO_TYPE="$_REPO_TYPE"
+    _SLEY_LAUNCH_REPO_ROOT="$_REPO_ROOT"
+    _SLEY_LAUNCH_REPO_CWD=$(pwd -P)
+  fi
   _sley_run "$@"
+fi
+
+# A failed normal-repo probe clears the override. Restore it before the
+# configured bare-worktree fallback adds the explicit Git environment.
+if [[ -n "$_sley_caller_repo_type" ]]; then
+  _REPO_TYPE="$_sley_caller_repo_type"
+  _REPO_ROOT=""
 fi
 
 _sley_apply_bare_repo_fallback "$@"

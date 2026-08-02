@@ -34,6 +34,7 @@ HOOK_FORMAT_FILE_DARWIN_P95_BUDGET_MS=1500
 READY_FIX_300_MEDIAN_BUDGET_MS=5000
 READY_FIX_300_DARWIN_MEDIAN_BUDGET_MS=7000
 READY_FIX_FORMAT_CHUNK_FILES=256
+FIX_FORMAT_CHUNK_FILES=256
 
 perf_mock_bin=$(_mock_bin)
 cat >"$perf_mock_bin/checkrun" <<'EOF'
@@ -426,7 +427,63 @@ printf '0\n' >"$SLEY_PERF_AUTOFORMAT_COUNT_FILE"
   printf '%s\n' -- "$repo/hook.py"
 } >"$autoformat_state/expected-args"
 
+# Editor integrations invoke the hook with an absolute buffer path, often from
+# a process whose cwd is outside that buffer's repository. Count only root
+# discovery calls so this guard stays deterministic while protecting the
+# user-visible startup path from duplicate VCS process launches.
+probe_bin=$(_mock_bin)
+probe_state=$(_tmpdir)
+export SLEY_PERF_REAL_GIT
+if [[ -x /usr/bin/git ]]; then
+  SLEY_PERF_REAL_GIT=/usr/bin/git
+else
+  SLEY_PERF_REAL_GIT=$(command -p -v git)
+fi
+export SLEY_PERF_GIT_PROBE_COUNT_FILE="$probe_state/git-count"
+export SLEY_PERF_SL_PROBE_COUNT_FILE="$probe_state/sl-count"
+printf '0\n' >"$SLEY_PERF_GIT_PROBE_COUNT_FILE"
+printf '0\n' >"$SLEY_PERF_SL_PROBE_COUNT_FILE"
+cat >"$probe_bin/git" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "$*" == "rev-parse --show-toplevel" ]]; then
+  count=$(<"$SLEY_PERF_GIT_PROBE_COUNT_FILE")
+  printf '%s\n' "$((count + 1))" >"$SLEY_PERF_GIT_PROBE_COUNT_FILE"
+fi
+if [[ "${1:-}" == "hash-object" && -n "${SLEY_PERF_HASH_OBJECT_COUNT_FILE:-}" ]]; then
+  count=$(<"$SLEY_PERF_HASH_OBJECT_COUNT_FILE")
+  printf '%s\n' "$((count + 1))" >"$SLEY_PERF_HASH_OBJECT_COUNT_FILE"
+fi
+if [[ "$*" == "diff -z --cached --name-only --diff-filter=ACM" &&
+  -n "${SLEY_PERF_STAGED_NAME_COUNT_FILE:-}" ]]; then
+  count=$(<"$SLEY_PERF_STAGED_NAME_COUNT_FILE")
+  printf '%s\n' "$((count + 1))" >"$SLEY_PERF_STAGED_NAME_COUNT_FILE"
+fi
+exec "$SLEY_PERF_REAL_GIT" "$@"
+EOF
+cat >"$probe_bin/sl" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+count=$(<"$SLEY_PERF_SL_PROBE_COUNT_FILE")
+printf '%s\n' "$((count + 1))" >"$SLEY_PERF_SL_PROBE_COUNT_FILE"
+exit 1
+EOF
+chmod +x "$probe_bin/git" "$probe_bin/sl"
+
+export SLEY_PERF_AUTOFORMAT_RC=0
+outside_repo=$(_tmpdir)
+PATH="$probe_bin:$PATH" _run_perf_sley_timed 5 "$outside_repo" \
+  hook format-file "$repo/hook.py"
+_assert_exit "hook format-file perf: absolute target exits 0" 0 "$__SLEY_RC"
+_assert_file_content "hook format-file perf: discovers target Git repo once" \
+  "1" "$SLEY_PERF_GIT_PROBE_COUNT_FILE"
+_assert_file_content "hook format-file perf: checks Sapling precedence once" \
+  "1" "$SLEY_PERF_SL_PROBE_COUNT_FILE"
+_assert_autoformat_invocations "hook format-file perf: absolute target delegation" \
+  1 "$autoformat_state/expected-args"
+
 export SLEY_PERF_AUTOFORMAT_RC=7
+printf '0\n' >"$SLEY_PERF_AUTOFORMAT_COUNT_FILE"
 _run_perf_sley_timed 5 "$repo" hook format-file "$repo/hook.py"
 _assert_exit "hook format-file perf: propagates formatter exit" 7 "$__SLEY_RC"
 _assert_autoformat_invocations "hook format-file perf: failing formatter delegation" \
@@ -451,6 +508,38 @@ _assert_ms_le "hook format-file perf: full CLI p95" \
   "$hook_format_file_p95" "$hook_format_file_p95_budget"
 _assert_autoformat_invocations "hook format-file perf: measured delegation" \
   "$SLEY_HOOK_PERF_RUNS" "$autoformat_state/expected-args"
+
+echo "=== sley: fix performance ==="
+
+repo=$(_new_perf_repo)
+_write_changed_tree "$repo" "$SLEY_PERF_CHANGED_FILES"
+autoformat_state=$(_tmpdir)
+fix_chunks=$(((SLEY_PERF_CHANGED_FILES + FIX_FORMAT_CHUNK_FILES - 1) / \
+  FIX_FORMAT_CHUNK_FILES))
+export SLEY_PERF_AUTOFORMAT_COUNT_FILE="$autoformat_state/count"
+export SLEY_PERF_AUTOFORMAT_ARGS_PREFIX="$autoformat_state/args"
+export SLEY_PERF_AUTOFORMAT_RC=0
+export SLEY_PERF_HASH_OBJECT_COUNT_FILE="$autoformat_state/hash-object-count"
+printf '0\n' >"$SLEY_PERF_AUTOFORMAT_COUNT_FILE"
+printf '0\n' >"$SLEY_PERF_HASH_OBJECT_COUNT_FILE"
+git -C "$repo" diff --name-only >"$autoformat_state/files"
+for ((chunk = 1; chunk <= fix_chunks; chunk++)); do
+  chunk_start=$(((chunk - 1) * FIX_FORMAT_CHUNK_FILES + 1))
+  chunk_end=$((chunk * FIX_FORMAT_CHUNK_FILES))
+  {
+    printf '%s\n' --
+    sed -n "${chunk_start},${chunk_end}p" "$autoformat_state/files"
+  } >"$autoformat_state/expected-args.$chunk"
+done
+
+PATH="$probe_bin:$PATH" _run_perf_sley_timed 30 "$repo" fix
+_assert_exit "fix perf: large changed tree exits 0" 0 "$__SLEY_RC"
+_assert_autoformat_chunked_invocations \
+  "fix perf: bounded batch formatter" 1 "$fix_chunks" \
+  "$autoformat_state/expected-args"
+_assert_file_content "fix perf: hashes bounded chunks before and after formatting" \
+  "$((fix_chunks * 2))" "$SLEY_PERF_HASH_OBJECT_COUNT_FILE"
+unset SLEY_PERF_HASH_OBJECT_COUNT_FILE
 
 echo "=== sley: ready --fix --commit performance ==="
 
@@ -510,7 +599,9 @@ grep_mock_bin=$(_mock_bin)
 real_grep=$(command -v grep)
 export SLEY_PERF_GREP_COUNT_FILE="$autoformat_state/grep-count"
 export SLEY_PERF_REAL_GREP="$real_grep"
+export SLEY_PERF_STAGED_NAME_COUNT_FILE="$autoformat_state/staged-name-count"
 : >"$SLEY_PERF_GREP_COUNT_FILE"
+printf '0\n' >"$SLEY_PERF_STAGED_NAME_COUNT_FILE"
 cat >"$grep_mock_bin/grep" <<'EOF'
 #!/usr/bin/env bash
 printf '1\n' >>"$SLEY_PERF_GREP_COUNT_FILE"
@@ -519,13 +610,16 @@ EOF
 chmod +x "$grep_mock_bin/grep"
 
 saved_path=$PATH
-PATH="$grep_mock_bin:$PATH"
+PATH="$grep_mock_bin:$probe_bin:$PATH"
 _run_perf_sley_timed 30 "$repo" ready --fix --commit --quiet \
   --exclude status --exclude check --exclude secrets --exclude verify
 PATH=$saved_path
 _assert_exit "ready --fix mixed perf: instrumented run exits 0" 0 "$__SLEY_RC"
 grep_count=$(wc -l <"$SLEY_PERF_GREP_COUNT_FILE" | tr -d '[:space:]')
 _assert_eq "ready --fix mixed perf: no membership grep processes" 0 "$grep_count"
+_assert_file_content "ready --fix mixed perf: enumerates staged names once" \
+  "1" "$SLEY_PERF_STAGED_NAME_COUNT_FILE"
+unset SLEY_PERF_STAGED_NAME_COUNT_FILE
 
 printf '0\n' >"$SLEY_PERF_AUTOFORMAT_COUNT_FILE"
 mixed_ready_fix_chunks=$(((SLEY_PERF_CHANGED_FILES - 1 + \
