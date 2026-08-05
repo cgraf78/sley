@@ -992,18 +992,13 @@ _sley_secrets_parallel_remove_output() {
 
 _sley_secrets_parallel_allocate_output() {
   local output_name="$1" stem="$2" path="" allocation_rc=0 valid=0
-  # Shield the tiny allocator child so a terminal-group signal cannot land
-  # between creating and returning the file. The parent still latches that
-  # signal, then cleans the registered file before returning to its caller.
-  path=$(
-    trap '' HUP INT TERM
-    mktemp "$stem.XXXXXX"
-  ) || allocation_rc=$?
+  path=$(mktemp "$stem.XXXXXX") || allocation_rc=$?
 
-  # A failed allocator has not transferred ownership, even if it printed the
-  # name of a pre-existing lookalike. Only successful output is ours to remove.
-  if [[ "$allocation_rc" -eq 0 && -n "$path" && "$path" == "$stem."* &&
-    -f "$path" && ! -L "$path" ]]; then
+  # A terminal-group signal can kill mktemp after it created and printed the
+  # file. Adopt that exact empty regular file so cancellation cleanup owns it;
+  # a non-empty lookalike is not ours and remains untouched.
+  if [[ -n "$path" && "$path" == "$stem."* && -f "$path" && ! -L "$path" &&
+    ! -s "$path" ]]; then
     _sley_secrets_parallel_output_files+=("$path")
     printf -v "$output_name" '%s' "$path"
     valid=1
@@ -1011,7 +1006,7 @@ _sley_secrets_parallel_allocate_output() {
     printf -v "$output_name" '%s' ""
   fi
 
-  [[ "$valid" -eq 1 ]]
+  [[ "$allocation_rc" -eq 0 && "$valid" -eq 1 ]]
 }
 
 _sley_secrets_scan_batch() {
