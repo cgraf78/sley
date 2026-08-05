@@ -919,11 +919,14 @@ _sley_secrets_print_failed_scan_output() {
   [[ -s "$stderr_file" ]] && cat "$stderr_file" >&2
 }
 
-_sley_secrets_parallel_job_is_owned() {
+_sley_secrets_parallel_job_is_active() {
   local expected_pid="$1" job_pid
   while IFS= read -r job_pid; do
     [[ "$job_pid" == "$expected_pid" ]] && return 0
-  done < <(jobs -p)
+  done < <(
+    jobs -pr
+    jobs -ps
+  )
   return 1
 }
 
@@ -936,7 +939,9 @@ _sley_secrets_parallel_stop_children() {
   for index in "${!_sley_secrets_parallel_pids[@]}"; do
     pid=${_sley_secrets_parallel_pids[$index]}
     [[ -n "$pid" ]] || continue
-    kill -TERM "$pid" 2>/dev/null || true
+    if _sley_secrets_parallel_job_is_active "$pid"; then
+      kill -TERM "$pid" 2>/dev/null || true
+    fi
   done
 
   for ((attempt = 0; attempt < 25; attempt++)); do
@@ -944,7 +949,7 @@ _sley_secrets_parallel_stop_children() {
     for index in "${!_sley_secrets_parallel_pids[@]}"; do
       pid=${_sley_secrets_parallel_pids[$index]}
       [[ -n "$pid" ]] || continue
-      if _sley_secrets_parallel_job_is_owned "$pid"; then
+      if _sley_secrets_parallel_job_is_active "$pid"; then
         any_running=1
         break
       fi
@@ -956,7 +961,7 @@ _sley_secrets_parallel_stop_children() {
   for index in "${!_sley_secrets_parallel_pids[@]}"; do
     pid=${_sley_secrets_parallel_pids[$index]}
     [[ -n "$pid" ]] || continue
-    if _sley_secrets_parallel_job_is_owned "$pid"; then
+    if _sley_secrets_parallel_job_is_active "$pid"; then
       kill -KILL "$pid" 2>/dev/null || true
     fi
     wait "$pid" 2>/dev/null || true
@@ -1020,7 +1025,7 @@ _sley_secrets_scan_batch() {
       scan_rc=$?
     fi
     if [[ "$_sley_secrets_parallel_signal_status" -ne 0 ]]; then
-      if ! _sley_secrets_parallel_job_is_owned "$pid"; then
+      if ! _sley_secrets_parallel_job_is_active "$pid"; then
         _sley_secrets_parallel_pids[index]=""
       fi
       return 0
@@ -1254,6 +1259,12 @@ _sley_secrets() {
   scan_rc=0
   _sley_secrets_scan_worktree_files "${worktree_files[@]}" || scan_rc=$?
   [[ "$scan_rc" -gt "$rc" ]] && rc=$scan_rc
+  # A parallel scan restores the caller's traps before returning its latched
+  # signal status. Treat that status as control flow, not scanner severity: no
+  # extension pass may start after the user has cancelled the base scan.
+  case "$scan_rc" in
+    129 | 130 | 143) return "$scan_rc" ;;
+  esac
   # Extra secrets configs: independent gitleaks passes (e.g. an overlay's
   # forbidden-vocabulary rules) over the same staged + worktree inputs. Base
   # sley returns none, so this is a no-op unless an extension opts in.
