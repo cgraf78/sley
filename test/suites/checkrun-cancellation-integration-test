@@ -1,0 +1,381 @@
+#!/usr/bin/env bash
+# Opt-in lifecycle coverage for Sley ready -> real Checkrun autolint nesting.
+
+set -uo pipefail
+
+test_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
+root="${test_dir%/test}"
+
+# shellcheck source=../helpers.sh
+source "$test_dir/helpers.sh"
+
+checkrun_root=${SLEY_TEST_CHECKRUN_ROOT:-}
+if [[ -z "$checkrun_root" ]]; then
+  echo "SKIP: checkrun-cancellation-integration-test (set SLEY_TEST_CHECKRUN_ROOT)"
+  exit 0
+fi
+if [[ "$checkrun_root" != /* || ! -x "$checkrun_root/bin/autolint" ]]; then
+  echo "checkrun integration: SLEY_TEST_CHECKRUN_ROOT must name an absolute Checkrun checkout" >&2
+  exit 1
+fi
+for dependency in git ps python3; do
+  command -v "$dependency" >/dev/null 2>&1 || {
+    echo "checkrun integration: missing dependency: $dependency" >&2
+    exit 1
+  }
+done
+
+fixture=$(_tmpdir)
+orchestrator="$fixture/orchestrator.py"
+
+cat >"$orchestrator" <<'PY'
+from __future__ import annotations
+
+import os
+from pathlib import Path
+import signal
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+
+
+SLEY_ROOT = Path(sys.argv[1])
+CHECKRUN_ROOT = Path(sys.argv[2])
+BASE = Path(sys.argv[3])
+PYTHON = sys.executable
+SYSTEM_PS = shutil.which("ps")
+
+
+def wait_for(predicate, description: str, timeout: float = 10.0) -> None:
+    deadline = time.monotonic() + timeout
+    while not predicate():
+        if time.monotonic() >= deadline:
+            raise AssertionError(f"timed out waiting for {description}")
+        time.sleep(0.01)
+
+
+def write_executable(path: Path, body: str) -> None:
+    path.write_text(body, encoding="utf-8")
+    path.chmod(0o755)
+
+
+def make_repo(case_dir: Path) -> Path:
+    repo = case_dir / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.email", "test@example.invalid"], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.name", "Sley Test"], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "core.hooksPath", "/dev/null"], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "commit.gpgsign", "false"], check=True)
+    for index in range(2):
+        (repo / f"case-{index}.sh").write_text("#!/usr/bin/env bash\nprintf '%s\\n' before\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "--", "case-0.sh", "case-1.sh"], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", "seed"], check=True)
+    for index in range(2):
+        with (repo / f"case-{index}.sh").open("a", encoding="utf-8") as handle:
+            handle.write("printf '%s\\n' after\n")
+    return repo
+
+
+def process_state(pid: int) -> str:
+    result = subprocess.run(
+        [SYSTEM_PS, "-o", "stat=", "-p", str(pid)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    return result.stdout.strip()
+
+
+def session_pids(session_id: int) -> list[int]:
+    result = subprocess.run(
+        [SYSTEM_PS, "-eo", "pid=,sid="],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    members = []
+    for row in result.stdout.splitlines():
+        fields = row.split()
+        if len(fields) == 2 and int(fields[1]) == session_id:
+            members.append(int(fields[0]))
+    return members
+
+
+def read_pair(path: Path) -> tuple[int, int]:
+    pid, group = path.read_text(encoding="ascii").split()
+    return int(pid), int(group)
+
+
+AUTOLINT_WRAPPER = r'''#!/usr/bin/env python3
+import os
+from pathlib import Path
+import sys
+
+root = Path(os.environ["SLEY_CHECKRUN_INTEGRATION_ROOT"])
+(root / "autolint.process").write_text(
+    f"{os.getpid()} {os.getpgrp()}\n", encoding="ascii"
+)
+candidate = os.environ["SLEY_CHECKRUN_AUTOLINT"]
+os.execve(candidate, [candidate, *sys.argv[1:]], os.environ)
+'''
+
+
+SHELLCHECK = r'''#!/usr/bin/env python3
+import os
+from pathlib import Path
+import signal
+import sys
+import time
+
+root = Path(os.environ["SLEY_CHECKRUN_INTEGRATION_ROOT"])
+source = Path(sys.argv[-1])
+index = source.stem.rsplit("-", 1)[-1]
+(root / f"backend-{index}.process").write_text(
+    f"{os.getpid()} {os.getpgrp()}\n", encoding="ascii"
+)
+(root / f"worker-{index}.pid").write_text(str(os.getppid()), encoding="ascii")
+
+
+def terminate(_signum, _frame):
+    (root / f"backend-{index}.term").touch(exist_ok=True)
+    raise SystemExit(143)
+
+
+signal.signal(signal.SIGTERM, terminate)
+(root / f"backend-{index}.ready").touch(exist_ok=False)
+signal.pause()
+'''
+
+
+DRIVER = r'''#!/usr/bin/env bash
+set +e
+set -o pipefail
+set +m
+
+cd "$SLEY_CHECKRUN_INTEGRATION_REPO" || exit 90
+# shellcheck source=/dev/null
+source "$SLEY_CHECKRUN_INTEGRATION_SLEY"
+
+"$SLEY_CHECKRUN_INTEGRATION_PYTHON" -c 'import signal; signal.pause()' &
+unrelated_pid=$!
+printf '%s\n' "$unrelated_pid" >"$SLEY_CHECKRUN_INTEGRATION_ROOT/unrelated.pid"
+
+trap 'printf "HUP\n" >>"$SLEY_CHECKRUN_INTEGRATION_ROOT/caller-traps"' HUP
+trap 'printf "INT\n" >>"$SLEY_CHECKRUN_INTEGRATION_ROOT/caller-traps"' INT
+trap 'printf "TERM\n" >>"$SLEY_CHECKRUN_INTEGRATION_ROOT/caller-traps"' TERM
+before_hup=$(trap -p HUP)
+before_int=$(trap -p INT)
+before_term=$(trap -p TERM)
+before_options=$(set +o)
+before_shopt=$(shopt -p || true)
+before_pwd=$PWD
+
+sley_ready --quiet --repo-wide \
+  --exclude status --exclude secrets --exclude verify
+operation_rc=$?
+
+after_hup=$(trap -p HUP)
+after_int=$(trap -p INT)
+after_term=$(trap -p TERM)
+after_options=$(set +o)
+after_shopt=$(shopt -p || true)
+after_pwd=$PWD
+
+traps_restored=no
+[[ "$before_hup" == "$after_hup" && "$before_int" == "$after_int" &&
+  "$before_term" == "$after_term" ]] && traps_restored=yes
+options_restored=no
+[[ "$before_options" == "$after_options" ]] && options_restored=yes
+shopt_restored=no
+[[ "$before_shopt" == "$after_shopt" ]] && shopt_restored=yes
+cwd_restored=no
+[[ "$before_pwd" == "$after_pwd" ]] && cwd_restored=yes
+unrelated_alive=no
+kill -0 "$unrelated_pid" 2>/dev/null && unrelated_alive=yes
+
+kill -TERM "$unrelated_pid" 2>/dev/null || true
+wait "$unrelated_pid" 2>/dev/null || true
+
+trap_count=0
+[[ ! -f "$SLEY_CHECKRUN_INTEGRATION_ROOT/caller-traps" ]] ||
+  trap_count=$(wc -l <"$SLEY_CHECKRUN_INTEGRATION_ROOT/caller-traps" | tr -d '[:space:]')
+
+result_tmp="$SLEY_CHECKRUN_INTEGRATION_ROOT/result.tmp"
+{
+  printf 'rc=%s\n' "$operation_rc"
+  printf 'traps_restored=%s\n' "$traps_restored"
+  printf 'options_restored=%s\n' "$options_restored"
+  printf 'shopt_restored=%s\n' "$shopt_restored"
+  printf 'cwd_restored=%s\n' "$cwd_restored"
+  printf 'unrelated_alive=%s\n' "$unrelated_alive"
+  printf 'caller_trap_count=%s\n' "$trap_count"
+} >"$result_tmp"
+mv "$result_tmp" "$SLEY_CHECKRUN_INTEGRATION_ROOT/result"
+'''
+
+
+def run() -> None:
+    case_dir = Path(tempfile.mkdtemp(prefix="checkrun-integration.", dir=BASE))
+    sync = case_dir / "sync"
+    scratch = case_dir / "scratch"
+    tool_bin = case_dir / "bin"
+    home = case_dir / "home"
+    extensions = case_dir / "extensions"
+    for directory in (sync, scratch, tool_bin, home, extensions):
+        directory.mkdir()
+    global_git_config = home / ".gitconfig"
+    global_git_config.touch()
+    repo = make_repo(case_dir)
+
+    write_executable(tool_bin / "autolint", AUTOLINT_WRAPPER)
+    write_executable(tool_bin / "shellcheck", SHELLCHECK)
+    write_executable(tool_bin / "yq", "#!/usr/bin/env bash\nexit 0\n")
+    driver = case_dir / "driver.sh"
+    write_executable(driver, DRIVER)
+
+    env = os.environ.copy()
+    env.update(
+        {
+            "PATH": f"{tool_bin}:{env['PATH']}",
+            "HOME": str(home),
+            "GIT_CONFIG_GLOBAL": str(global_git_config),
+            "TMPDIR": str(scratch),
+            "SLEY_EXTENSION_DIR": str(extensions),
+            "SLEY_CHECKRUN_AUTOLINT": str(CHECKRUN_ROOT / "bin/autolint"),
+            "SLEY_CHECKRUN_INTEGRATION_PYTHON": PYTHON,
+            "SLEY_CHECKRUN_INTEGRATION_REPO": str(repo),
+            "SLEY_CHECKRUN_INTEGRATION_ROOT": str(sync),
+            "SLEY_CHECKRUN_INTEGRATION_SLEY": str(SLEY_ROOT / "lib/sley/sley.sh"),
+            "CHECKRUN_AUTOLINT_JOBS": "2",
+            "CHECKRUN_CONFIG_DIR": str(case_dir / "missing-config"),
+            "PYTHONDONTWRITEBYTECODE": "1",
+        }
+    )
+
+    process = subprocess.Popen(
+        [str(driver)],
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    errors: list[str] = []
+    stdout = ""
+    stderr = ""
+    recorded_pids: list[int] = []
+    try:
+        wait_for(lambda: (sync / "autolint.process").exists(), "real autolint entrypoint")
+        wait_for(
+            lambda: all((sync / f"backend-{index}.ready").exists() for index in range(2)),
+            "both real-Checkrun backends",
+        )
+        autolint_pid, autolint_group = read_pair(sync / "autolint.process")
+        recorded_pids.append(autolint_pid)
+        backend_groups = []
+        for index in range(2):
+            backend_pid, backend_group = read_pair(sync / f"backend-{index}.process")
+            recorded_pids.extend(
+                [backend_pid, int((sync / f"worker-{index}.pid").read_text(encoding="ascii"))]
+            )
+            backend_groups.append(backend_group)
+        if any(group == autolint_group for group in backend_groups):
+            errors.append("Checkrun backends did not enter a nested private process group")
+
+        os.kill(process.pid, signal.SIGTERM)
+        try:
+            stdout, stderr = process.communicate(timeout=12)
+        except subprocess.TimeoutExpired as error:
+            stdout = error.stdout or ""
+            stderr = error.stderr or ""
+            errors.append("Sley caller did not return after nested cancellation")
+
+        result_path = sync / "result"
+        if not result_path.exists():
+            errors.append("Sley caller did not publish restored state")
+            result = {}
+        else:
+            result = dict(
+                line.split("=", 1)
+                for line in result_path.read_text(encoding="utf-8").splitlines()
+            )
+        if result.get("rc") != "143":
+            errors.append(f"Sley returned {result.get('rc')!r}, expected '143'")
+        for key in (
+            "traps_restored",
+            "options_restored",
+            "shopt_restored",
+            "cwd_restored",
+            "unrelated_alive",
+        ):
+            if result.get(key) != "yes":
+                errors.append(f"{key} was {result.get(key)!r}, expected 'yes'")
+        if result.get("caller_trap_count") != "0":
+            errors.append("nested cancellation invoked a caller-owned trap")
+        if not all((sync / f"backend-{index}.term").exists() for index in range(2)):
+            errors.append("nested Checkrun backends did not observe cooperative TERM")
+
+        deadline = time.monotonic() + 1.0
+        survivors = []
+        while True:
+            survivors = [(pid, process_state(pid)) for pid in recorded_pids]
+            survivors = [(pid, state) for pid, state in survivors if state]
+            if not survivors or time.monotonic() >= deadline:
+                break
+            time.sleep(0.02)
+        if survivors:
+            errors.append(f"nested Checkrun processes survived or became zombies: {survivors!r}")
+        leftovers = sorted(path.name for path in scratch.iterdir())
+        if leftovers:
+            errors.append(f"Sley or Checkrun scratch survived: {leftovers!r}")
+        if "Done" in stderr or any(line.startswith("[") for line in stderr.splitlines()):
+            errors.append(f"job-control notification leaked: {stderr!r}")
+    except BaseException as error:
+        errors.append(str(error))
+    finally:
+        needs_cleanup = process.poll() is None or any(
+            process_state(pid) for pid in recorded_pids
+        )
+        if needs_cleanup:
+            # The driver remains this isolated session's immutable identity
+            # while it is live; if it returned, a recorded survivor retains
+            # that SID. Avoid scanning or signalling anything after a clean
+            # return, when the numeric driver PID could eventually be reused.
+            for pid in reversed(session_pids(process.pid)):
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+        try:
+            process.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            errors.append("test cleanup could not reap the Sley caller")
+
+    if errors:
+        for error in errors:
+            print(f"  {error}", file=sys.stderr)
+        if stdout:
+            print(f"  stdout: {stdout!r}", file=sys.stderr)
+        if stderr:
+            print(f"  stderr: {stderr!r}", file=sys.stderr)
+        raise SystemExit(1)
+
+
+run()
+PY
+
+echo "=== Sley ready -> Checkrun autolint cancellation ==="
+output=""
+rc=0
+output=$(python3 "$orchestrator" "$root" "$checkrun_root" "$fixture" 2>&1) || rc=$?
+if [[ "$rc" -eq 0 ]]; then
+  _pass "nested real-Checkrun cancellation is contained and reaped"
+else
+  _fail "nested real-Checkrun cancellation is contained and reaped"
+  [[ -z "$output" ]] || printf '%s\n' "$output" >&2
+fi
+
+_test_summary

@@ -9,9 +9,11 @@ program	lib/sley/verify.sh
 program	share/sley/shell.sh
 program	test/helpers.sh
 program	test/sley-test
+program	test/suites/checkrun-cancellation-integration-test
 program	test/suites/manpage-test
 program	test/suites/nvim-test
 program	test/suites/ready-cancellation-test
+program	test/suites/secrets-cancellation-test
 program	test/suites/sley-behavior-test
 program	test/suites/sley-performance-test
 program	test/suites/timeout-test
