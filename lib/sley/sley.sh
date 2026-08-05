@@ -941,8 +941,11 @@ _sley_secrets_parallel_job_is_active() {
   while IFS= read -r job_pid; do
     [[ "$job_pid" == "$expected_pid" ]] && return 0
   done < <(
-    jobs -pr
-    jobs -ps
+    # Sley is sourced, so ordinary command lookup may select caller functions.
+    # Ask Bash's builtin dispatcher for its own job table: only that table can
+    # prove the numeric PID is still our exact, unreaped asynchronous child.
+    builtin jobs -pr
+    builtin jobs -ps
   )
   return 1
 }
@@ -958,12 +961,19 @@ _sley_secrets_parallel_record_signal() {
   # still gives every other scanner the bounded cooperative TERM grace period.
   if [[ -n "$wait_pid" ]] &&
     _sley_secrets_parallel_job_is_active "$wait_pid"; then
-    kill -KILL "$wait_pid" 2>/dev/null || true
+    # Keep the exact-child proof and signal in one shell. A caller-defined
+    # `kill` function must not turn cancellation into an unbounded wait.
+    builtin kill -KILL "$wait_pid" 2>/dev/null || true
   fi
 }
 
 _sley_secrets_parallel_stop_children() {
-  local attempt index pid any_running
+  local attempt index pid any_running sleep_executable=""
+
+  # Fractional sleep is not a Bash builtin. Resolve the real utility once so a
+  # sourced caller's `sleep` function cannot collapse or extend the 250 ms
+  # cooperative grace period. If unavailable, skip directly to bounded KILL.
+  sleep_executable=$(builtin type -P sleep 2>/dev/null || true)
 
   # The operation owns only direct scanner children. Keep their unreaped slots
   # active until the exact wait below so a numeric PID cannot be reused between
@@ -972,7 +982,7 @@ _sley_secrets_parallel_stop_children() {
     pid=${_sley_secrets_parallel_pids[$index]}
     [[ -n "$pid" ]] || continue
     if _sley_secrets_parallel_job_is_active "$pid"; then
-      kill -TERM "$pid" 2>/dev/null || true
+      builtin kill -TERM "$pid" 2>/dev/null || true
     fi
   done
 
@@ -987,31 +997,39 @@ _sley_secrets_parallel_stop_children() {
       fi
     done
     [[ "$any_running" == 1 ]] || break
-    sleep 0.01 || true
+    [[ -n "$sleep_executable" ]] || break
+    "$sleep_executable" 0.01 || break
   done
 
   for index in "${!_sley_secrets_parallel_pids[@]}"; do
     pid=${_sley_secrets_parallel_pids[$index]}
     [[ -n "$pid" ]] || continue
     if _sley_secrets_parallel_job_is_active "$pid"; then
-      kill -KILL "$pid" 2>/dev/null || true
+      builtin kill -KILL "$pid" 2>/dev/null || true
     fi
-    wait "$pid" 2>/dev/null || true
+    # Reap through Bash itself; an external process cannot wait for this
+    # shell's child, and a caller function could falsely claim it did.
+    builtin wait "$pid" 2>/dev/null || true
     _sley_secrets_parallel_pids[index]=""
   done
 }
 
 _sley_secrets_parallel_remove_files() {
-  local rc=0
+  local rc=0 rm_executable="${_sley_secrets_parallel_rm:-}"
   if [[ "${#_sley_secrets_parallel_output_files[@]}" -gt 0 ]]; then
-    rm -f -- "${_sley_secrets_parallel_output_files[@]}" || rc=$?
+    # `command rm` is insufficient in a sourced library because callers may
+    # define a function named `command` too. Pin the real utility before use so
+    # no caller function can claim success while secret output remains.
+    [[ -n "$rm_executable" ]] ||
+      rm_executable=$(builtin type -P rm 2>/dev/null) || return 1
+    "$rm_executable" -f -- "${_sley_secrets_parallel_output_files[@]}" || rc=$?
     [[ "$rc" -ne 0 ]] || _sley_secrets_parallel_output_files=()
   fi
   return "$rc"
 }
 
 _sley_secrets_parallel_remove_output() {
-  local path rc=0
+  local path rc=0 rmdir_executable="${_sley_secrets_parallel_rmdir:-}"
 
   _sley_secrets_parallel_remove_files || rc=$?
   # Remove only empty directories after their exact output files are gone. If
@@ -1019,7 +1037,11 @@ _sley_secrets_parallel_remove_output() {
   # deleting content that this operation did not create.
   if [[ "$rc" -eq 0 && "${#_sley_secrets_parallel_output_dirs[@]}" -gt 0 ]]; then
     for path in "${_sley_secrets_parallel_output_dirs[@]}"; do
-      rmdir "$path" || rc=$?
+      # Match file removal's sourced-shell boundary. Resolve only when needed
+      # so direct helper tests retain the same contract as the full operation.
+      [[ -n "$rmdir_executable" ]] ||
+        rmdir_executable=$(builtin type -P rmdir 2>/dev/null) || return 1
+      "$rmdir_executable" "$path" || rc=$?
     done
     [[ "$rc" -ne 0 ]] || _sley_secrets_parallel_output_dirs=()
   fi
@@ -1029,17 +1051,45 @@ _sley_secrets_parallel_remove_output() {
 
 _sley_secrets_parallel_create_directory() {
   local path="$1" mkdir_executable="${_sley_secrets_parallel_mkdir:-}"
+  local allocator_pid="" rc=0
 
   [[ -n "$mkdir_executable" ]] ||
     mkdir_executable=$(type -P mkdir 2>/dev/null) || return 1
   # The child installs ignored dispositions before invoking mkdir, so a
   # terminal-group signal either arrives before any filesystem operation or is
-  # ignored until exclusive directory creation completes. The sourced parent
-  # retains its latch traps and publishes ownership immediately on success.
-  (
-    trap '' HUP INT TERM
-    exec "$mkdir_executable" -m 700 -- "$path"
-  ) 2>/dev/null
+  # ignored until exclusive directory creation completes. Launch it as an
+  # asynchronous job so interactive Bash keeps the parent as the terminal's
+  # foreground receiver; a real Ctrl-C can then latch cancellation instead of
+  # being swallowed by the signal-ignoring allocator process group.
+  {
+    (
+      trap '' HUP INT TERM
+      exec "$mkdir_executable" -m 700 -- "$path"
+    ) 2>/dev/null &
+    allocator_pid=$!
+  } 2>/dev/null
+  [[ -n "$allocator_pid" ]] || return 1
+
+  # A latched terminal signal interrupts Bash's first wait even though the
+  # allocator deliberately continues to its atomic result. Re-wait signal
+  # statuses until the exact child publishes its real mkdir status; otherwise
+  # a successfully created directory could be mistaken for failure and escape
+  # the ownership ledger. mkdir itself inherits ignored HUP/INT/TERM, so those
+  # statuses can only describe the parent's interrupted wait here.
+  while :; do
+    if builtin wait "$allocator_pid" 2>/dev/null; then
+      rc=0
+    else
+      rc=$?
+    fi
+    if [[ "${_sley_secrets_parallel_signal_status:-0}" -ne 0 ]]; then
+      case "$rc" in
+        129 | 130 | 143) continue ;;
+      esac
+    fi
+    break
+  done
+  return "$rc"
 }
 
 _sley_secrets_parallel_create_output_files() {
@@ -1087,7 +1137,8 @@ _sley_secrets_parallel_allocate_directory() {
 
 _sley_secrets_scan_batch() {
   local gitleaks_executable="$1"
-  shift
+  local combine_diagnostics="$2"
+  shift 2
   local rc=0 scan_rc file stdout_file stderr_file pid index offset
   local -a files=("$@")
   local -a gitleaks_args stdout_files=() stderr_files=()
@@ -1105,9 +1156,22 @@ _sley_secrets_scan_batch() {
     stderr_files+=("$stderr_file")
     [[ "$_sley_secrets_parallel_signal_status" -eq 0 ]] || return 0
 
-    "$gitleaks_executable" dir "${gitleaks_args[@]}" -- "$file" </dev/null \
-      >|"$stdout_file" 2>|"$stderr_file" &
-    pid=$!
+    # Interactive Bash writes `[job] PID` for the asynchronous syntax itself,
+    # independently of the child's stderr redirect and even with `set +m`.
+    # Contain only that shell bookkeeping while publishing `$!` in the same
+    # parent shell. The historical sequential paths merged both scanner streams
+    # to stderr; preserve that contract while parallel scans retain distinct,
+    # file-ordered stdout/stderr replay.
+    {
+      if [[ "$combine_diagnostics" == 1 ]]; then
+        "$gitleaks_executable" dir "${gitleaks_args[@]}" -- "$file" </dev/null \
+          >|"$stderr_file" 2>&1 &
+      else
+        "$gitleaks_executable" dir "${gitleaks_args[@]}" -- "$file" </dev/null \
+          >|"$stdout_file" 2>|"$stderr_file" &
+      fi
+      pid=$!
+    } 2>/dev/null
     _sley_secrets_parallel_pids[index]=$pid
     [[ "$_sley_secrets_parallel_signal_status" -eq 0 ]] || return 0
   done
@@ -1122,16 +1186,26 @@ _sley_secrets_scan_batch() {
       _sley_secrets_parallel_wait_pid=""
       return 0
     fi
-    if wait "$pid"; then
+    # Select Bash's wait builtin explicitly. The library shares its namespace
+    # with the caller, and a same-named function must not clear PID ownership
+    # while the exact scanner child is still running.
+    # A signal can kill the job at the instruction boundary immediately before
+    # wait. Bash may then print its asynchronous "Killed" bookkeeping while
+    # returning the child's status; the status is the API, not shell job noise.
+    if builtin wait "$pid" 2>/dev/null; then
       scan_rc=0
     else
       scan_rc=$?
     fi
     _sley_secrets_parallel_wait_pid=""
     if [[ "$_sley_secrets_parallel_signal_status" -ne 0 ]]; then
-      if ! _sley_secrets_parallel_job_is_active "$pid"; then
-        _sley_secrets_parallel_pids[index]=""
-      fi
+      # The signal handler KILLs only this exact unreaped Bash job. Finish its
+      # PID-specific wait directly instead of consulting `jobs` after the kill:
+      # that consultation makes Bash print its own "Killed" status on stderr.
+      # An already-completed child is also safe here because the first wait has
+      # reaped it, and a second wait merely reports that no such child remains.
+      builtin wait "$pid" 2>/dev/null || true
+      _sley_secrets_parallel_pids[index]=""
       return 0
     fi
     _sley_secrets_parallel_pids[index]=""
@@ -1162,7 +1236,7 @@ _sley_secrets_scan_worktree_files() {
     [[ -n "$cancellation_output_name" ]] || return 2
     printf -v "$cancellation_output_name" '%s' 0
   fi
-  local rc=0 jobs scratch_slots start file out scan_rc remove_rc
+  local rc=0 jobs scratch_slots start scan_rc remove_rc combine_diagnostics=0
   local gitleaks_type gitleaks_executable
   local _sley_secrets_parallel_signal_status=0
   local _sley_secrets_parallel_setup_failed=0
@@ -1171,125 +1245,160 @@ _sley_secrets_scan_worktree_files() {
   local _sley_secrets_parallel_saved_term=""
   local _sley_secrets_parallel_wait_pid=""
   local _sley_secrets_parallel_mkdir=""
+  local _sley_secrets_parallel_rm=""
+  local _sley_secrets_parallel_rmdir=""
   local _sley_secrets_parallel_scratch_dir=""
   local -a files=("$@")
-  local -a gitleaks_args
   local -a _sley_secrets_parallel_pids=()
   local -a _sley_secrets_parallel_output_files=()
   local -a _sley_secrets_parallel_output_dirs=()
   [[ "${#files[@]}" -eq 0 ]] && return 0
-  _sley_gitleaks_args
-  gitleaks_args=("${_SLEY_GITLEAKS_ARGS[@]}")
-
   jobs=${SLEY_SECRETS_JOBS:-$(_sley_secrets_default_jobs)}
   case "$jobs" in
     '' | *[!0-9]*) jobs=1 ;;
   esac
   [[ "$jobs" -lt 1 ]] && jobs=1
-  scratch_slots=$jobs
-  [[ "$scratch_slots" -le "${#files[@]}" ]] || scratch_slots=${#files[@]}
 
   gitleaks_type=$(type -t gitleaks 2>/dev/null || true)
-  _sley_secrets_parallel_mkdir=$(type -P mkdir 2>/dev/null || true)
-  if [[ "$jobs" -eq 1 ]] ||
-    [[ "$gitleaks_type" != file ]] ||
-    [[ -z "$_sley_secrets_parallel_mkdir" ]] ||
-    ! command -v rm >/dev/null 2>&1 ||
-    ! command -v rmdir >/dev/null 2>&1; then
-    for file in "${files[@]}"; do
-      if out=$(gitleaks dir "${gitleaks_args[@]}" -- "$file" </dev/null 2>&1); then
-        scan_rc=0
-      else
-        scan_rc=$?
-      fi
-      if [[ "$scan_rc" -ne 0 ]]; then
-        [[ -n "$out" ]] && printf '%s\n' "$out" >&2
-        # Preserve MAX rc across files: gitleaks rc=1 (leaks found) must not
-        # downgrade an earlier rc≥2 (scanner error). See the matching note in
-        # `_sley_secrets_scan_batch`.
-        [[ "$scan_rc" -gt "$rc" ]] && rc=$scan_rc
-      fi
-    done
-  else
+  if [[ "$gitleaks_type" == function ]]; then
+    # A function cannot be resolved to an executable, but it can run as an
+    # exact background child in Bash. Force one-at-a-time waves to preserve
+    # the compatibility path's sequential semantics while giving it the same
+    # signal latch, PID ownership, and scratch cleanup as executable scans.
+    gitleaks_executable=gitleaks
+    jobs=1
+    combine_diagnostics=1
+  elif [[ "$gitleaks_type" == file ]]; then
     if ! gitleaks_executable=$(type -P gitleaks 2>/dev/null); then
       _sley_die "unable to resolve gitleaks executable"
       return 2
     fi
     [[ "$gitleaks_executable" == /* ]] || gitleaks_executable="$PWD/$gitleaks_executable"
+  else
+    _sley_die "unable to resolve supported gitleaks command"
+    return 2
+  fi
+  # Before cancellation hardening, an explicit one-job scan used command
+  # substitution with `2>&1` and surfaced every failure diagnostic on stderr in
+  # authored cross-stream order. Keep that compatibility behavior; only true
+  # parallel waves use the split-descriptor replay contract.
+  [[ "$jobs" -ne 1 ]] || combine_diagnostics=1
 
-    # `gitleaks dir <single-file>` has high process startup overhead compared
-    # with the bytes scanned. Overlap independent worktree scans, but collect
-    # output in file order so the human `ready` report stays deterministic. A
-    # single operation-scoped signal latch owns every wave: handlers only
-    # record the first signal, while normal control flow reaps exact scanner
-    # PIDs and removes exact temp paths before restoring caller traps.
-    _sley_secrets_parallel_saved_hup=$(trap -p HUP)
-    _sley_secrets_parallel_saved_int=$(trap -p INT)
-    _sley_secrets_parallel_saved_term=$(trap -p TERM)
-    trap '_sley_secrets_parallel_record_signal 129' HUP
-    trap '_sley_secrets_parallel_record_signal 130' INT
-    trap '_sley_secrets_parallel_record_signal 143' TERM
+  # Every worktree scan, including a configured one-job wave, now uses the
+  # cancellable ownership protocol. Resolve the filesystem primitives up front
+  # and fail before launching a scanner if exact cleanup cannot be guaranteed.
+  _sley_secrets_parallel_mkdir=$(builtin type -P mkdir 2>/dev/null || true)
+  _sley_secrets_parallel_rm=$(builtin type -P rm 2>/dev/null || true)
+  _sley_secrets_parallel_rmdir=$(builtin type -P rmdir 2>/dev/null || true)
+  if [[ -z "$_sley_secrets_parallel_mkdir" ||
+    -z "$_sley_secrets_parallel_rm" ||
+    -z "$_sley_secrets_parallel_rmdir" ]]; then
+    _sley_die "unable to resolve secret scan scratch utilities"
+    return 2
+  fi
+  scratch_slots=$jobs
+  [[ "$scratch_slots" -le "${#files[@]}" ]] || scratch_slots=${#files[@]}
 
-    if ! _sley_secrets_parallel_allocate_directory \
-      _sley_secrets_parallel_scratch_dir "${TMPDIR:-/tmp}/sley-secrets" "$scratch_slots"; then
-      _sley_secrets_parallel_setup_failed=1
-      rc=2
-      if [[ "$_sley_secrets_parallel_signal_status" -eq 0 ]]; then
-        _sley_die "unable to allocate secret scan scratch under ${TMPDIR:-/tmp}"
-      fi
-    else
-      for ((start = 0; start < ${#files[@]}; start += jobs)); do
-        [[ "$_sley_secrets_parallel_signal_status" -eq 0 ]] || break
-        # Reset per-batch rc so the previous iteration's value cannot leak in
-        # when the current batch passes cleanly. Then promote to `rc` only if
-        # the batch was worse than what we've seen so far — same severity
-        # protocol as the single-job path above.
-        scan_rc=0
-        _sley_secrets_scan_batch \
-          "$gitleaks_executable" "${files[@]:start:jobs}" || scan_rc=$?
-        [[ "$_sley_secrets_parallel_signal_status" -eq 0 ]] || break
-        [[ "$scan_rc" -gt "$rc" ]] && rc=$scan_rc
-        [[ "$_sley_secrets_parallel_setup_failed" == 0 ]] || break
-      done
-    fi
+  # `gitleaks dir <single-file>` has high process startup overhead compared
+  # with the bytes scanned. Overlap independent worktree scans, but collect
+  # output in file order so the human `ready` report stays deterministic. A
+  # single operation-scoped signal latch owns every wave: handlers only
+  # record the first signal, while normal control flow reaps exact scanner
+  # PIDs and removes exact temp paths before restoring caller traps.
+  _sley_secrets_parallel_saved_hup=$(trap -p HUP)
+  _sley_secrets_parallel_saved_int=$(trap -p INT)
+  _sley_secrets_parallel_saved_term=$(trap -p TERM)
+  # `jobs` is used only to prove that the wait PID is still an exact unreaped
+  # child before the handler wakes it. Bash can flush a completed job status
+  # while answering that query, so contain that shell-owned diagnostic inside
+  # the handler rather than leaking it through this sourced API.
+  trap '_sley_secrets_parallel_record_signal 129 2>/dev/null' HUP
+  trap '_sley_secrets_parallel_record_signal 130 2>/dev/null' INT
+  trap '_sley_secrets_parallel_record_signal 143 2>/dev/null' TERM
 
-    # Once a signal is latched, ignore repeated delivery while bounded cleanup
-    # runs. With no signal yet, retain the latch handlers through cleanup so the
-    # first HUP/INT/TERM cannot disappear in this final ownership window.
-    if [[ "$_sley_secrets_parallel_signal_status" -ne 0 ]]; then
-      trap '' HUP INT TERM
+  if ! _sley_secrets_parallel_allocate_directory \
+    _sley_secrets_parallel_scratch_dir "${TMPDIR:-/tmp}/sley-secrets" "$scratch_slots"; then
+    _sley_secrets_parallel_setup_failed=1
+    rc=2
+    if [[ "$_sley_secrets_parallel_signal_status" -eq 0 ]]; then
+      _sley_die "unable to allocate secret scan scratch under ${TMPDIR:-/tmp}"
     fi
-    if [[ "$_sley_secrets_parallel_signal_status" -ne 0 ||
-      "$_sley_secrets_parallel_setup_failed" != 0 ]]; then
-      _sley_secrets_parallel_stop_children
+  else
+    for ((start = 0; start < ${#files[@]}; start += jobs)); do
+      [[ "$_sley_secrets_parallel_signal_status" -eq 0 ]] || break
+      # Reset per-batch rc so the previous iteration's value cannot leak in
+      # when the current batch passes cleanly. Then promote to `rc` only if
+      # the batch was worse than what we've seen so far — same severity
+      # protocol as the single-job path above.
+      scan_rc=0
+      _sley_secrets_scan_batch \
+        "$gitleaks_executable" "$combine_diagnostics" \
+        "${files[@]:start:jobs}" || scan_rc=$?
+      [[ "$_sley_secrets_parallel_signal_status" -eq 0 ]] || break
+      [[ "$scan_rc" -gt "$rc" ]] && rc=$scan_rc
+      [[ "$_sley_secrets_parallel_setup_failed" == 0 ]] || break
+    done
+  fi
+
+  # Once a signal is latched, ignore repeated delivery while bounded cleanup
+  # runs. With no signal yet, retain the latch handlers through cleanup so the
+  # first HUP/INT/TERM cannot disappear in this final ownership window.
+  if [[ "$_sley_secrets_parallel_signal_status" -ne 0 ]]; then
+    trap '' HUP INT TERM
+  fi
+  if [[ "$_sley_secrets_parallel_signal_status" -ne 0 ||
+    "$_sley_secrets_parallel_setup_failed" != 0 ]]; then
+    # Establish stderr containment before TERM/KILL changes job state. A later
+    # `jobs` probe otherwise makes Bash emit asynchronous status text even
+    # with monitor mode disabled (and more visibly for `set -m` callers).
+    _sley_secrets_parallel_stop_children 2>/dev/null
+  fi
+  if [[ "$_sley_secrets_parallel_signal_status" -ne 0 ]]; then
+    trap '' HUP INT TERM
+  fi
+  remove_rc=0
+  _sley_secrets_parallel_remove_output || remove_rc=$?
+  if [[ "$_sley_secrets_parallel_signal_status" -ne 0 ]]; then
+    trap '' HUP INT TERM
+    # A terminal-group signal may have interrupted the first rm before Bash
+    # ran the latch handler. Retry exact owned paths with repeats ignored.
+    if [[ "$remove_rc" -ne 0 ]]; then
+      remove_rc=0
+      _sley_secrets_parallel_remove_output || remove_rc=$?
     fi
-    if [[ "$_sley_secrets_parallel_signal_status" -ne 0 ]]; then
-      trap '' HUP INT TERM
-    fi
-    remove_rc=0
-    _sley_secrets_parallel_remove_output || remove_rc=$?
-    if [[ "$_sley_secrets_parallel_signal_status" -ne 0 ]]; then
-      trap '' HUP INT TERM
-      # A terminal-group signal may have interrupted the first rm before Bash
-      # ran the latch handler. Retry exact owned paths with repeats ignored.
-      [[ "$remove_rc" -eq 0 ]] || _sley_secrets_parallel_remove_output || true
-    elif [[ "$remove_rc" -ne 0 ]]; then
-      # Never report a clean secrets verdict while owned scratch remains. The
-      # removal primitive already names the retained path; preserve it for
-      # inspection rather than recursively deleting unexpected content.
+  fi
+
+  # Do not base the final ownership decision on a signal value sampled before
+  # removal. TERM may arrive between that test and the failure branch. The
+  # arrays are the authoritative ledger: if either still owns a path, always
+  # name the retained private scratch, preserve cancellation's 128+signal
+  # status when present, and otherwise fail the secrets verdict closed.
+  if [[ "${#_sley_secrets_parallel_output_files[@]}" -gt 0 ||
+    "${#_sley_secrets_parallel_output_dirs[@]}" -gt 0 ]]; then
+    [[ "$_sley_secrets_parallel_signal_status" -eq 0 ]] || trap '' HUP INT TERM
+    _sley_die "unable to remove secret scan scratch: ${_sley_secrets_parallel_output_dirs[0]:-unknown}" || true
+    if [[ "$_sley_secrets_parallel_signal_status" -eq 0 ]]; then
+      # Never report a clean secrets verdict while owned output remains.
+      # Preserve unexpected foreign content for inspection rather than
+      # recursively deleting anything outside the operation's exact ledger.
       _sley_secrets_parallel_setup_failed=1
       [[ "$rc" -ge 2 ]] || rc=2
     fi
+  elif [[ "$remove_rc" -ne 0 ]]; then
+    # A helper that reports failure after clearing the exact ownership ledger
+    # is still an operational error, but there is no retained path to name.
+    _sley_secrets_parallel_setup_failed=1
+    [[ "$rc" -ge 2 ]] || rc=2
+  fi
 
-    eval "${_sley_secrets_parallel_saved_hup:-trap - HUP}"
-    eval "${_sley_secrets_parallel_saved_int:-trap - INT}"
-    eval "${_sley_secrets_parallel_saved_term:-trap - TERM}"
+  eval "${_sley_secrets_parallel_saved_hup:-trap - HUP}"
+  eval "${_sley_secrets_parallel_saved_int:-trap - INT}"
+  eval "${_sley_secrets_parallel_saved_term:-trap - TERM}"
 
-    if [[ "$_sley_secrets_parallel_signal_status" -ne 0 ]]; then
-      [[ -z "$cancellation_output_name" ]] ||
-        printf -v "$cancellation_output_name" '%s' 1
-      return "$_sley_secrets_parallel_signal_status"
-    fi
+  if [[ "$_sley_secrets_parallel_signal_status" -ne 0 ]]; then
+    [[ -z "$cancellation_output_name" ]] ||
+      printf -v "$cancellation_output_name" '%s' 1
+    return "$_sley_secrets_parallel_signal_status"
   fi
 
   return "$rc"
