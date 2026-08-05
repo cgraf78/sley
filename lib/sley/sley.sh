@@ -1051,44 +1051,76 @@ _sley_secrets_parallel_remove_output() {
 
 _sley_secrets_parallel_create_directory() {
   local path="$1" mkdir_executable="${_sley_secrets_parallel_mkdir:-}"
-  local allocator_pid="" rc=0
+  local allocator_pid="" allocator_read_fd="" allocator_write_fd=""
+  local rc=1 status_received=0
+  local -a _sley_secrets_allocator=()
+  local _sley_secrets_allocator_PID=""
 
   [[ -n "$mkdir_executable" ]] ||
     mkdir_executable=$(type -P mkdir 2>/dev/null) || return 1
   # The child installs ignored dispositions before invoking mkdir, so a
   # terminal-group signal either arrives before any filesystem operation or is
   # ignored until exclusive directory creation completes. Launch it as an
-  # asynchronous job so interactive Bash keeps the parent as the terminal's
-  # foreground receiver; a real Ctrl-C can then latch cancellation instead of
-  # being swallowed by the signal-ignoring allocator process group.
+  # asynchronous coprocess so interactive Bash keeps the parent as the
+  # terminal's foreground receiver; a real Ctrl-C can then latch cancellation
+  # instead of being swallowed by the signal-ignoring allocator process group.
+  #
+  # The pipe is also the authoritative completion channel. Bash versions do
+  # not agree on whether a second `wait` after an interrupted first wait yields
+  # the child's eventual status or repeats the synthetic signal status. Worse,
+  # a real child status such as 130 is numerically indistinguishable from that
+  # synthetic status. Publishing mkdir's result before the child exits makes
+  # ownership independent of those wait semantics. The acknowledgement keeps
+  # the named coprocess alive until its local descriptors and exact PID have
+  # been copied, avoiding Bash's fast-exit coprocess-variable race.
   {
-    (
-      trap '' HUP INT TERM
-      exec "$mkdir_executable" -m 700 -- "$path"
-    ) 2>/dev/null &
-    allocator_pid=$!
-  } 2>/dev/null
-  [[ -n "$allocator_pid" ]] || return 1
+    coproc _sley_secrets_allocator {
+      local allocator_rc=0
 
-  # A latched terminal signal interrupts Bash's first wait even though the
-  # allocator deliberately continues to its atomic result. Re-wait signal
-  # statuses until the exact child publishes its real mkdir status; otherwise
-  # a successfully created directory could be mistaken for failure and escape
-  # the ownership ledger. mkdir itself inherits ignored HUP/INT/TERM, so those
-  # statuses can only describe the parent's interrupted wait here.
+      builtin trap '' HUP INT TERM
+      if "$mkdir_executable" -m 700 -- "$path" >/dev/null 2>&1; then
+        allocator_rc=0
+      else
+        allocator_rc=$?
+      fi
+      builtin printf '%s\n' "$allocator_rc"
+      IFS= builtin read -r _ || true
+      builtin exit "$allocator_rc"
+    }
+    allocator_pid=${_sley_secrets_allocator_PID:-}
+    allocator_read_fd=${_sley_secrets_allocator[0]:-}
+    allocator_write_fd=${_sley_secrets_allocator[1]:-}
+  } 2>/dev/null
+  [[ -n "$allocator_pid" && -n "$allocator_read_fd" &&
+    -n "$allocator_write_fd" ]] || return 1
+
+  # A terminal signal can interrupt the parent's builtin read, but it cannot
+  # consume the line already buffered in the pipe. Retry only while the exact
+  # coprocess remains active; EOF without a published result is a hard failure.
   while :; do
-    if builtin wait "$allocator_pid" 2>/dev/null; then
-      rc=0
-    else
-      rc=$?
+    if IFS= builtin read -r rc <&"$allocator_read_fd"; then
+      status_received=1
+      break
     fi
-    if [[ "${_sley_secrets_parallel_signal_status:-0}" -ne 0 ]]; then
-      case "$rc" in
-        129 | 130 | 143) continue ;;
-      esac
-    fi
-    break
+    _sley_secrets_parallel_job_is_active "$allocator_pid" || break
   done
+
+  if [[ "$status_received" -eq 1 ]]; then
+    { builtin printf 'received\n' >&"$allocator_write_fd"; } 2>/dev/null || true
+  fi
+  # The pipe result above decides ownership. These waits only reap the exact
+  # child, so an interrupted wait cannot alter the mkdir result or strand the
+  # allocator. Bash closes the coprocess descriptors when this wait completes.
+  while _sley_secrets_parallel_job_is_active "$allocator_pid"; do
+    builtin wait "$allocator_pid" 2>/dev/null || true
+  done
+  builtin wait "$allocator_pid" 2>/dev/null || true
+
+  [[ "$status_received" -eq 1 ]] || return 1
+  case "$rc" in
+    '' | *[!0-9]*) return 1 ;;
+  esac
+  [[ "$rc" -le 255 ]] || return 1
   return "$rc"
 }
 
