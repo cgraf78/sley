@@ -1108,12 +1108,13 @@ _sley_secrets_parallel_create_directory() {
   if [[ "$status_received" -eq 1 ]]; then
     { builtin printf 'received\n' >&"$allocator_write_fd"; } 2>/dev/null || true
   fi
-  # The pipe result above decides ownership. These waits only reap the exact
-  # child, so an interrupted wait cannot alter the mkdir result or strand the
-  # allocator. Bash closes the coprocess descriptors when this wait completes.
-  while _sley_secrets_parallel_job_is_active "$allocator_pid"; do
-    builtin wait "$allocator_pid" 2>/dev/null || true
-  done
+  # The pipe result above decides ownership, and the acknowledgement releases
+  # the child directly into exit. Wait exactly once while its PID still names
+  # our unreaped child. After any wait can reap it, polling `jobs` by that
+  # numeric value loses the identity guarantee: another asynchronous helper or
+  # stale platform job-table entry can claim the same value and keep a retry
+  # loop alive forever. An interrupted wait cannot alter the published mkdir
+  # result, and the acknowledged child no longer has work left to abandon.
   builtin wait "$allocator_pid" 2>/dev/null || true
 
   [[ "$status_received" -eq 1 ]] || return 1
