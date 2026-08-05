@@ -912,11 +912,28 @@ _sley_secrets_message_file() {
   return "$rc"
 }
 
+_sley_secrets_replay_scan_output() {
+  local path="$1" line=""
+
+  [[ -s "$path" ]] || return 0
+  # Keep replay in the sourced parent. Waiting on an unrelated foreground
+  # `cat` would defer the parent's terminal-signal trap until that process
+  # exits, outside the exact scanner-child cleanup protocol below.
+  while IFS= read -r line; do
+    [[ "${_sley_secrets_parallel_signal_status:-0}" -eq 0 ]] || return 0
+    printf '%s\n' "$line"
+  done <"$path"
+  [[ "${_sley_secrets_parallel_signal_status:-0}" -eq 0 ]] || return 0
+  # `read` returns nonzero for a final unterminated line but still publishes
+  # its bytes. Preserve the scanner's original trailing-newline behavior.
+  [[ -z "$line" ]] || printf '%s' "$line"
+}
+
 _sley_secrets_print_failed_scan_output() {
   local scan_rc="$1" stdout_file="$2" stderr_file="$3"
   [[ "$scan_rc" -eq 0 ]] && return 0
-  [[ -s "$stdout_file" ]] && cat "$stdout_file"
-  [[ -s "$stderr_file" ]] && cat "$stderr_file" >&2
+  _sley_secrets_replay_scan_output "$stdout_file"
+  _sley_secrets_replay_scan_output "$stderr_file" >&2
 }
 
 _sley_secrets_parallel_job_is_active() {
@@ -984,47 +1001,97 @@ _sley_secrets_parallel_stop_children() {
   done
 }
 
-_sley_secrets_parallel_remove_output() {
-  [[ "${#_sley_secrets_parallel_output_files[@]}" -gt 0 ]] || return 0
-  rm -f -- "${_sley_secrets_parallel_output_files[@]}" || return $?
-  _sley_secrets_parallel_output_files=()
-}
-
-_sley_secrets_parallel_create_output() {
-  local output_name="$1" path="$2" old_umask="" created=0 had_noclobber=0
-
-  printf -v "$output_name" '%s' ""
-  old_umask=$(builtin umask) || return 1
-  case "$-" in
-    *C*) had_noclobber=1 ;;
-  esac
-
-  # Create the parent-known path in this shell. Signal handlers only latch, so
-  # Bash completes this builtin redirection before normal control registers the
-  # exact file; no child can die before publishing its allocation identity.
-  builtin umask 077 || return 1
-  set -C
-  if : 2>/dev/null >"$path"; then
-    created=1
+_sley_secrets_parallel_remove_files() {
+  local rc=0
+  if [[ "${#_sley_secrets_parallel_output_files[@]}" -gt 0 ]]; then
+    rm -f -- "${_sley_secrets_parallel_output_files[@]}" || rc=$?
+    [[ "$rc" -ne 0 ]] || _sley_secrets_parallel_output_files=()
   fi
-  [[ "$had_noclobber" -eq 1 ]] || set +C
-  builtin umask "$old_umask"
-
-  [[ "$created" -eq 1 ]] || return 1
-  _sley_secrets_parallel_output_files+=("$path")
-  printf -v "$output_name" '%s' "$path"
+  return "$rc"
 }
 
-_sley_secrets_parallel_allocate_output() {
-  local output_name="$1" stem="$2" path="" attempt=0
+_sley_secrets_parallel_remove_output() {
+  local path rc=0
+
+  _sley_secrets_parallel_remove_files || rc=$?
+  # Remove only empty directories after their exact output files are gone. If
+  # anything foreign appeared, rmdir fails closed instead of recursively
+  # deleting content that this operation did not create.
+  if [[ "$rc" -eq 0 && "${#_sley_secrets_parallel_output_dirs[@]}" -gt 0 ]]; then
+    for path in "${_sley_secrets_parallel_output_dirs[@]}"; do
+      rmdir "$path" || rc=$?
+    done
+    [[ "$rc" -ne 0 ]] || _sley_secrets_parallel_output_dirs=()
+  fi
+
+  return "$rc"
+}
+
+_sley_secrets_parallel_create_directory() {
+  local path="$1" output_count="${2:-1}"
+  local python="${_sley_secrets_parallel_python:-}"
+
+  [[ -n "$python" ]] || python=$(type -P python3 2>/dev/null) || return 1
+  # os.mkdir is the portable exclusive-create primitive for every pathname
+  # type: unlike Bash noclobber, it neither follows a symlink nor opens a FIFO.
+  # The helper ignores terminal signals only while it creates one private
+  # directory and its bounded set of output files. That prevents group delivery
+  # from killing it after exclusive creation but before ownership reaches the
+  # parent. Exit 73 tells the parent to retain cleanup ownership if setup fails
+  # after the directory was created; exit 17 is an unowned name collision.
+  "$python" -c '
+import os
+import signal
+import sys
+
+for signum in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM):
+    signal.signal(signum, signal.SIG_IGN)
+
+path = sys.argv[1]
+count = int(sys.argv[2])
+owned = False
+try:
+    os.mkdir(path, 0o700)
+    owned = True
+    os.chmod(path, 0o700)
+    for index in range(count):
+        for stream in ("stdout", "stderr"):
+            fd = os.open(
+                os.path.join(path, f"{stream}.{index}"),
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
+            )
+            os.fchmod(fd, 0o600)
+            os.close(fd)
+except FileExistsError:
+    raise SystemExit(73 if owned else 17)
+except BaseException:
+    raise SystemExit(73 if owned else 1)
+' "$path" "$output_count" 2>/dev/null
+}
+
+_sley_secrets_parallel_allocate_directory() {
+  local output_name="$1" stem="$2" output_count="${3:-1}"
+  local path="" attempt=0 allocation_rc=0 index stream
 
   printf -v "$output_name" '%s' ""
   while ((attempt < 20)); do
     path="$stem.${BASHPID:-$$}.$RANDOM.$RANDOM.$attempt"
-    if _sley_secrets_parallel_create_output "$output_name" "$path"; then
+    allocation_rc=0
+    _sley_secrets_parallel_create_directory "$path" "$output_count" || allocation_rc=$?
+    if [[ "$allocation_rc" -eq 0 || "$allocation_rc" -eq 73 ]]; then
+      _sley_secrets_parallel_output_dirs+=("$path")
+      for ((index = 0; index < output_count; index++)); do
+        for stream in stdout stderr; do
+          _sley_secrets_parallel_output_files+=("$path/$stream.$index")
+        done
+      done
+      [[ "$allocation_rc" -eq 0 ]] || return 1
+      printf -v "$output_name" '%s' "$path"
       return 0
     fi
     [[ "${_sley_secrets_parallel_signal_status:-0}" -eq 0 ]] || return 1
+    [[ "$allocation_rc" -eq 17 ]] || return 1
     attempt=$((attempt + 1))
   done
 
@@ -1041,24 +1108,13 @@ _sley_secrets_scan_batch() {
   gitleaks_args=("${_SLEY_GITLEAKS_ARGS[@]}")
 
   _sley_secrets_parallel_pids=()
-  _sley_secrets_parallel_output_files=()
   for offset in "${!files[@]}"; do
     [[ "$_sley_secrets_parallel_signal_status" -eq 0 ]] || return 0
     index=$offset
     file=${files[$offset]}
-    if ! _sley_secrets_parallel_allocate_output \
-      stdout_file "${TMPDIR:-/tmp}/sley-secrets-stdout"; then
-      _sley_secrets_parallel_setup_failed=1
-      return 2
-    fi
+    stdout_file="$_sley_secrets_parallel_scratch_dir/stdout.$offset"
+    stderr_file="$_sley_secrets_parallel_scratch_dir/stderr.$offset"
     stdout_files+=("$stdout_file")
-    [[ "$_sley_secrets_parallel_signal_status" -eq 0 ]] || return 0
-
-    if ! _sley_secrets_parallel_allocate_output \
-      stderr_file "${TMPDIR:-/tmp}/sley-secrets-stderr"; then
-      _sley_secrets_parallel_setup_failed=1
-      return 2
-    fi
     stderr_files+=("$stderr_file")
     [[ "$_sley_secrets_parallel_signal_status" -eq 0 ]] || return 0
 
@@ -1105,11 +1161,6 @@ _sley_secrets_scan_batch() {
     [[ "$scan_rc" -gt "$rc" ]] && rc=$scan_rc
   done
 
-  if ! _sley_secrets_parallel_remove_output; then
-    _sley_secrets_parallel_setup_failed=1
-    [[ "$rc" -ge 2 ]] || rc=2
-  fi
-
   return "$rc"
 }
 
@@ -1131,10 +1182,13 @@ _sley_secrets_scan_worktree_files() {
   local _sley_secrets_parallel_saved_int=""
   local _sley_secrets_parallel_saved_term=""
   local _sley_secrets_parallel_wait_pid=""
+  local _sley_secrets_parallel_python=""
+  local _sley_secrets_parallel_scratch_dir=""
   local -a files=("$@")
   local -a gitleaks_args
   local -a _sley_secrets_parallel_pids=()
   local -a _sley_secrets_parallel_output_files=()
+  local -a _sley_secrets_parallel_output_dirs=()
   [[ "${#files[@]}" -eq 0 ]] && return 0
   _sley_gitleaks_args
   gitleaks_args=("${_SLEY_GITLEAKS_ARGS[@]}")
@@ -1146,10 +1200,12 @@ _sley_secrets_scan_worktree_files() {
   [[ "$jobs" -lt 1 ]] && jobs=1
 
   gitleaks_type=$(type -t gitleaks 2>/dev/null || true)
+  _sley_secrets_parallel_python=$(type -P python3 2>/dev/null || true)
   if [[ "$jobs" -eq 1 ]] ||
     [[ "$gitleaks_type" != file ]] ||
-    ! command -v cat >/dev/null 2>&1 ||
-    ! command -v rm >/dev/null 2>&1; then
+    [[ -z "$_sley_secrets_parallel_python" ]] ||
+    ! command -v rm >/dev/null 2>&1 ||
+    ! command -v rmdir >/dev/null 2>&1; then
     for file in "${files[@]}"; do
       if out=$(gitleaks dir "${gitleaks_args[@]}" -- "$file" </dev/null 2>&1); then
         scan_rc=0
@@ -1184,19 +1240,25 @@ _sley_secrets_scan_worktree_files() {
     trap '_sley_secrets_parallel_record_signal 130' INT
     trap '_sley_secrets_parallel_record_signal 143' TERM
 
-    for ((start = 0; start < ${#files[@]}; start += jobs)); do
-      [[ "$_sley_secrets_parallel_signal_status" -eq 0 ]] || break
-      # Reset per-batch rc so the previous iteration's value cannot leak in
-      # when the current batch passes cleanly. Then promote to `rc` only if
-      # the batch was worse than what we've seen so far — same severity
-      # protocol as the single-job path above.
-      scan_rc=0
-      _sley_secrets_scan_batch \
-        "$gitleaks_executable" "${files[@]:start:jobs}" || scan_rc=$?
-      [[ "$_sley_secrets_parallel_signal_status" -eq 0 ]] || break
-      [[ "$scan_rc" -gt "$rc" ]] && rc=$scan_rc
-      [[ "$_sley_secrets_parallel_setup_failed" == 0 ]] || break
-    done
+    if ! _sley_secrets_parallel_allocate_directory \
+      _sley_secrets_parallel_scratch_dir "${TMPDIR:-/tmp}/sley-secrets" "$jobs"; then
+      _sley_secrets_parallel_setup_failed=1
+      rc=2
+    else
+      for ((start = 0; start < ${#files[@]}; start += jobs)); do
+        [[ "$_sley_secrets_parallel_signal_status" -eq 0 ]] || break
+        # Reset per-batch rc so the previous iteration's value cannot leak in
+        # when the current batch passes cleanly. Then promote to `rc` only if
+        # the batch was worse than what we've seen so far — same severity
+        # protocol as the single-job path above.
+        scan_rc=0
+        _sley_secrets_scan_batch \
+          "$gitleaks_executable" "${files[@]:start:jobs}" || scan_rc=$?
+        [[ "$_sley_secrets_parallel_signal_status" -eq 0 ]] || break
+        [[ "$scan_rc" -gt "$rc" ]] && rc=$scan_rc
+        [[ "$_sley_secrets_parallel_setup_failed" == 0 ]] || break
+      done
+    fi
 
     # Once a signal is latched, ignore repeated delivery while bounded cleanup
     # runs. With no signal yet, retain the latch handlers through cleanup so the
