@@ -1028,70 +1028,57 @@ _sley_secrets_parallel_remove_output() {
 }
 
 _sley_secrets_parallel_create_directory() {
-  local path="$1" output_count="${2:-1}"
-  local python="${_sley_secrets_parallel_python:-}"
+  local path="$1" mkdir_executable="${_sley_secrets_parallel_mkdir:-}"
 
-  [[ -n "$python" ]] || python=$(type -P python3 2>/dev/null) || return 1
-  # os.mkdir is the portable exclusive-create primitive for every pathname
-  # type: unlike Bash noclobber, it neither follows a symlink nor opens a FIFO.
-  # The helper ignores terminal signals only while it creates one private
-  # directory and its bounded set of output files. That prevents group delivery
-  # from killing it after exclusive creation but before ownership reaches the
-  # parent. Exit 73 tells the parent to retain cleanup ownership if setup fails
-  # after the directory was created; exit 17 is an unowned name collision.
-  "$python" -c '
-import os
-import signal
-import sys
+  [[ -n "$mkdir_executable" ]] ||
+    mkdir_executable=$(type -P mkdir 2>/dev/null) || return 1
+  # The child installs ignored dispositions before invoking mkdir, so a
+  # terminal-group signal either arrives before any filesystem operation or is
+  # ignored until exclusive directory creation completes. The sourced parent
+  # retains its latch traps and publishes ownership immediately on success.
+  (
+    trap '' HUP INT TERM
+    exec "$mkdir_executable" -m 700 -- "$path"
+  ) 2>/dev/null
+}
 
-for signum in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM):
-    signal.signal(signum, signal.SIG_IGN)
+_sley_secrets_parallel_create_output_files() {
+  local path="$1" output_count="$2" old_umask="" output=""
+  local index stream rc=0
 
-path = sys.argv[1]
-count = int(sys.argv[2])
-owned = False
-try:
-    os.mkdir(path, 0o700)
-    owned = True
-    os.chmod(path, 0o700)
-    for index in range(count):
-        for stream in ("stdout", "stderr"):
-            fd = os.open(
-                os.path.join(path, f"{stream}.{index}"),
-                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
-                0o600,
-            )
-            os.fchmod(fd, 0o600)
-            os.close(fd)
-except FileExistsError:
-    raise SystemExit(73 if owned else 17)
-except BaseException:
-    raise SystemExit(73 if owned else 1)
-' "$path" "$output_count" 2>/dev/null
+  old_umask=$(umask) || return 1
+  umask 077 || return 1
+  for ((index = 0; index < output_count; index++)); do
+    for stream in stdout stderr; do
+      output="$path/$stream.$index"
+      if : >"$output"; then
+        _sley_secrets_parallel_output_files+=("$output")
+      else
+        rc=1
+        break 2
+      fi
+    done
+  done
+  umask "$old_umask" || rc=1
+  return "$rc"
 }
 
 _sley_secrets_parallel_allocate_directory() {
   local output_name="$1" stem="$2" output_count="${3:-1}"
-  local path="" attempt=0 allocation_rc=0 index stream
+  local path="" attempt=0
 
   printf -v "$output_name" '%s' ""
   while ((attempt < 20)); do
     path="$stem.${BASHPID:-$$}.$RANDOM.$RANDOM.$attempt"
-    allocation_rc=0
-    _sley_secrets_parallel_create_directory "$path" "$output_count" || allocation_rc=$?
-    if [[ "$allocation_rc" -eq 0 || "$allocation_rc" -eq 73 ]]; then
+    if _sley_secrets_parallel_create_directory "$path"; then
       _sley_secrets_parallel_output_dirs+=("$path")
-      for ((index = 0; index < output_count; index++)); do
-        for stream in stdout stderr; do
-          _sley_secrets_parallel_output_files+=("$path/$stream.$index")
-        done
-      done
-      [[ "$allocation_rc" -eq 0 ]] || return 1
+      [[ "${_sley_secrets_parallel_signal_status:-0}" -eq 0 ]] || return 1
+      _sley_secrets_parallel_create_output_files "$path" "$output_count" || return 1
       printf -v "$output_name" '%s' "$path"
       return 0
     fi
     [[ "${_sley_secrets_parallel_signal_status:-0}" -eq 0 ]] || return 1
-    [[ "$allocation_rc" -eq 17 ]] || return 1
+    [[ -e "$path" || -L "$path" ]] || return 1
     attempt=$((attempt + 1))
   done
 
@@ -1119,7 +1106,7 @@ _sley_secrets_scan_batch() {
     [[ "$_sley_secrets_parallel_signal_status" -eq 0 ]] || return 0
 
     "$gitleaks_executable" dir "${gitleaks_args[@]}" -- "$file" </dev/null \
-      >"$stdout_file" 2>"$stderr_file" &
+      >|"$stdout_file" 2>|"$stderr_file" &
     pid=$!
     _sley_secrets_parallel_pids[index]=$pid
     [[ "$_sley_secrets_parallel_signal_status" -eq 0 ]] || return 0
@@ -1175,14 +1162,15 @@ _sley_secrets_scan_worktree_files() {
     [[ -n "$cancellation_output_name" ]] || return 2
     printf -v "$cancellation_output_name" '%s' 0
   fi
-  local rc=0 jobs start file out scan_rc remove_rc gitleaks_type gitleaks_executable
+  local rc=0 jobs scratch_slots start file out scan_rc remove_rc
+  local gitleaks_type gitleaks_executable
   local _sley_secrets_parallel_signal_status=0
   local _sley_secrets_parallel_setup_failed=0
   local _sley_secrets_parallel_saved_hup=""
   local _sley_secrets_parallel_saved_int=""
   local _sley_secrets_parallel_saved_term=""
   local _sley_secrets_parallel_wait_pid=""
-  local _sley_secrets_parallel_python=""
+  local _sley_secrets_parallel_mkdir=""
   local _sley_secrets_parallel_scratch_dir=""
   local -a files=("$@")
   local -a gitleaks_args
@@ -1198,12 +1186,14 @@ _sley_secrets_scan_worktree_files() {
     '' | *[!0-9]*) jobs=1 ;;
   esac
   [[ "$jobs" -lt 1 ]] && jobs=1
+  scratch_slots=$jobs
+  [[ "$scratch_slots" -le "${#files[@]}" ]] || scratch_slots=${#files[@]}
 
   gitleaks_type=$(type -t gitleaks 2>/dev/null || true)
-  _sley_secrets_parallel_python=$(type -P python3 2>/dev/null || true)
+  _sley_secrets_parallel_mkdir=$(type -P mkdir 2>/dev/null || true)
   if [[ "$jobs" -eq 1 ]] ||
     [[ "$gitleaks_type" != file ]] ||
-    [[ -z "$_sley_secrets_parallel_python" ]] ||
+    [[ -z "$_sley_secrets_parallel_mkdir" ]] ||
     ! command -v rm >/dev/null 2>&1 ||
     ! command -v rmdir >/dev/null 2>&1; then
     for file in "${files[@]}"; do
@@ -1241,9 +1231,12 @@ _sley_secrets_scan_worktree_files() {
     trap '_sley_secrets_parallel_record_signal 143' TERM
 
     if ! _sley_secrets_parallel_allocate_directory \
-      _sley_secrets_parallel_scratch_dir "${TMPDIR:-/tmp}/sley-secrets" "$jobs"; then
+      _sley_secrets_parallel_scratch_dir "${TMPDIR:-/tmp}/sley-secrets" "$scratch_slots"; then
       _sley_secrets_parallel_setup_failed=1
       rc=2
+      if [[ "$_sley_secrets_parallel_signal_status" -eq 0 ]]; then
+        _sley_die "unable to allocate secret scan scratch under ${TMPDIR:-/tmp}"
+      fi
     else
       for ((start = 0; start < ${#files[@]}; start += jobs)); do
         [[ "$_sley_secrets_parallel_signal_status" -eq 0 ]] || break
