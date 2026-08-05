@@ -919,28 +919,99 @@ _sley_secrets_print_failed_scan_output() {
   [[ -s "$stderr_file" ]] && cat "$stderr_file" >&2
 }
 
+_sley_secrets_parallel_job_is_owned() {
+  local expected_pid="$1" job_pid
+  while IFS= read -r job_pid; do
+    [[ "$job_pid" == "$expected_pid" ]] && return 0
+  done < <(jobs -p)
+  return 1
+}
+
+_sley_secrets_parallel_stop_children() {
+  local attempt index pid any_running
+
+  # The operation owns only direct scanner children. Keep their unreaped slots
+  # active until the exact wait below so a numeric PID cannot be reused between
+  # the cooperative TERM and bounded KILL phases.
+  for index in "${!_sley_secrets_parallel_pids[@]}"; do
+    pid=${_sley_secrets_parallel_pids[$index]}
+    [[ -n "$pid" ]] || continue
+    kill -TERM "$pid" 2>/dev/null || true
+  done
+
+  for ((attempt = 0; attempt < 25; attempt++)); do
+    any_running=0
+    for index in "${!_sley_secrets_parallel_pids[@]}"; do
+      pid=${_sley_secrets_parallel_pids[$index]}
+      [[ -n "$pid" ]] || continue
+      if _sley_secrets_parallel_job_is_owned "$pid"; then
+        any_running=1
+        break
+      fi
+    done
+    [[ "$any_running" == 1 ]] || break
+    sleep 0.01
+  done
+
+  for index in "${!_sley_secrets_parallel_pids[@]}"; do
+    pid=${_sley_secrets_parallel_pids[$index]}
+    [[ -n "$pid" ]] || continue
+    if _sley_secrets_parallel_job_is_owned "$pid"; then
+      kill -KILL "$pid" 2>/dev/null || true
+    fi
+    wait "$pid" 2>/dev/null || true
+    _sley_secrets_parallel_pids[index]=""
+  done
+}
+
+_sley_secrets_parallel_remove_output() {
+  [[ "${#_sley_secrets_parallel_output_files[@]}" -gt 0 ]] || return 0
+  rm -f -- "${_sley_secrets_parallel_output_files[@]}" || return $?
+  _sley_secrets_parallel_output_files=()
+}
+
 _sley_secrets_scan_batch() {
-  local rc=0 scan_rc file stdout_file stderr_file pid index
+  local gitleaks_executable="$1"
+  shift
+  local rc=0 scan_rc file stdout_file stderr_file pid index offset
   local -a files=("$@")
-  local -a pids=() stdout_files=() stderr_files=()
-  local -a gitleaks_args
+  local -a gitleaks_args stdout_files=() stderr_files=()
   _sley_gitleaks_args
   gitleaks_args=("${_SLEY_GITLEAKS_ARGS[@]}")
 
-  for file in "${files[@]}"; do
-    stdout_file=$(mktemp "${TMPDIR:-/tmp}/sley-secrets-stdout.XXXXXX")
-    stderr_file=$(mktemp "${TMPDIR:-/tmp}/sley-secrets-stderr.XXXXXX")
-    (
-      gitleaks dir "${gitleaks_args[@]}" -- "$file" </dev/null
-    ) >"$stdout_file" 2>"$stderr_file" &
-    pid=$!
-    pids+=("$pid")
+  _sley_secrets_parallel_pids=()
+  _sley_secrets_parallel_output_files=()
+  for offset in "${!files[@]}"; do
+    [[ "$_sley_secrets_parallel_signal_status" -eq 0 ]] || return 0
+    index=$offset
+    file=${files[$offset]}
+    if ! stdout_file=$(mktemp "${TMPDIR:-/tmp}/sley-secrets-stdout.XXXXXX"); then
+      _sley_secrets_parallel_setup_failed=1
+      return 2
+    fi
     stdout_files+=("$stdout_file")
+    _sley_secrets_parallel_output_files+=("$stdout_file")
+    [[ "$_sley_secrets_parallel_signal_status" -eq 0 ]] || return 0
+
+    if ! stderr_file=$(mktemp "${TMPDIR:-/tmp}/sley-secrets-stderr.XXXXXX"); then
+      _sley_secrets_parallel_setup_failed=1
+      return 2
+    fi
     stderr_files+=("$stderr_file")
+    _sley_secrets_parallel_output_files+=("$stderr_file")
+    [[ "$_sley_secrets_parallel_signal_status" -eq 0 ]] || return 0
+
+    "$gitleaks_executable" dir "${gitleaks_args[@]}" -- "$file" </dev/null \
+      >"$stdout_file" 2>"$stderr_file" &
+    pid=$!
+    _sley_secrets_parallel_pids[index]=$pid
+    [[ "$_sley_secrets_parallel_signal_status" -eq 0 ]] || return 0
   done
 
-  for index in "${!files[@]}"; do
-    pid=${pids[$index]}
+  for offset in "${!files[@]}"; do
+    [[ "$_sley_secrets_parallel_signal_status" -eq 0 ]] || return 0
+    index=$offset
+    pid=${_sley_secrets_parallel_pids[$index]}
     stdout_file=${stdout_files[$index]}
     stderr_file=${stderr_files[$index]}
     if wait "$pid"; then
@@ -948,8 +1019,15 @@ _sley_secrets_scan_batch() {
     else
       scan_rc=$?
     fi
+    if [[ "$_sley_secrets_parallel_signal_status" -ne 0 ]]; then
+      if ! _sley_secrets_parallel_job_is_owned "$pid"; then
+        _sley_secrets_parallel_pids[index]=""
+      fi
+      return 0
+    fi
+    _sley_secrets_parallel_pids[index]=""
     _sley_secrets_print_failed_scan_output "$scan_rc" "$stdout_file" "$stderr_file"
-    rm -f "$stdout_file" "$stderr_file"
+    [[ "$_sley_secrets_parallel_signal_status" -eq 0 ]] || return 0
     # Preserve the MAX exit code across batch members. gitleaks's exit-code
     # protocol overloads severity onto the numeric value (1 = leaks found,
     # ≥2 = scanner / IO error). Last-non-zero-wins would let a later
@@ -961,13 +1039,25 @@ _sley_secrets_scan_batch() {
     [[ "$scan_rc" -gt "$rc" ]] && rc=$scan_rc
   done
 
+  if ! _sley_secrets_parallel_remove_output; then
+    _sley_secrets_parallel_setup_failed=1
+    [[ "$rc" -ge 2 ]] || rc=2
+  fi
+
   return "$rc"
 }
 
 _sley_secrets_scan_worktree_files() {
-  local rc=0 jobs start file out scan_rc
+  local rc=0 jobs start file out scan_rc gitleaks_type gitleaks_executable
+  local _sley_secrets_parallel_signal_status=0
+  local _sley_secrets_parallel_setup_failed=0
+  local _sley_secrets_parallel_saved_hup=""
+  local _sley_secrets_parallel_saved_int=""
+  local _sley_secrets_parallel_saved_term=""
   local -a files=("$@")
   local -a gitleaks_args
+  local -a _sley_secrets_parallel_pids=()
+  local -a _sley_secrets_parallel_output_files=()
   [[ "${#files[@]}" -eq 0 ]] && return 0
   _sley_gitleaks_args
   gitleaks_args=("${_SLEY_GITLEAKS_ARGS[@]}")
@@ -978,7 +1068,9 @@ _sley_secrets_scan_worktree_files() {
   esac
   [[ "$jobs" -lt 1 ]] && jobs=1
 
+  gitleaks_type=$(type -t gitleaks 2>/dev/null || true)
   if [[ "$jobs" -eq 1 ]] ||
+    [[ "$gitleaks_type" != file ]] ||
     ! command -v mktemp >/dev/null 2>&1 ||
     ! command -v cat >/dev/null 2>&1 ||
     ! command -v rm >/dev/null 2>&1; then
@@ -997,18 +1089,52 @@ _sley_secrets_scan_worktree_files() {
       fi
     done
   else
+    gitleaks_executable=$(type -P gitleaks 2>/dev/null) || return 2
+    [[ "$gitleaks_executable" == /* ]] || gitleaks_executable="$PWD/$gitleaks_executable"
+
     # `gitleaks dir <single-file>` has high process startup overhead compared
     # with the bytes scanned. Overlap independent worktree scans, but collect
-    # output in file order so the human `ready` report stays deterministic.
+    # output in file order so the human `ready` report stays deterministic. A
+    # single operation-scoped signal latch owns every wave: handlers only
+    # record the first signal, while normal control flow reaps exact scanner
+    # PIDs and removes exact temp paths before restoring caller traps.
+    _sley_secrets_parallel_saved_hup=$(trap -p HUP)
+    _sley_secrets_parallel_saved_int=$(trap -p INT)
+    _sley_secrets_parallel_saved_term=$(trap -p TERM)
+    trap 'if [[ $_sley_secrets_parallel_signal_status -eq 0 ]]; then _sley_secrets_parallel_signal_status=129; fi' HUP
+    trap 'if [[ $_sley_secrets_parallel_signal_status -eq 0 ]]; then _sley_secrets_parallel_signal_status=130; fi' INT
+    trap 'if [[ $_sley_secrets_parallel_signal_status -eq 0 ]]; then _sley_secrets_parallel_signal_status=143; fi' TERM
+
     for ((start = 0; start < ${#files[@]}; start += jobs)); do
+      [[ "$_sley_secrets_parallel_signal_status" -eq 0 ]] || break
       # Reset per-batch rc so the previous iteration's value cannot leak in
       # when the current batch passes cleanly. Then promote to `rc` only if
       # the batch was worse than what we've seen so far — same severity
       # protocol as the single-job path above.
       scan_rc=0
-      _sley_secrets_scan_batch "${files[@]:start:jobs}" || scan_rc=$?
+      _sley_secrets_scan_batch \
+        "$gitleaks_executable" "${files[@]:start:jobs}" || scan_rc=$?
+      [[ "$_sley_secrets_parallel_signal_status" -eq 0 ]] || break
       [[ "$scan_rc" -gt "$rc" ]] && rc=$scan_rc
+      [[ "$_sley_secrets_parallel_setup_failed" == 0 ]] || break
     done
+
+    # Ignore subsequent delivery while bounded cleanup is in progress. The
+    # first latched signal remains the operation's final status and never gets
+    # folded into gitleaks's MAX-severity protocol.
+    trap '' HUP INT TERM
+    if [[ "$_sley_secrets_parallel_signal_status" -ne 0 ||
+      "$_sley_secrets_parallel_setup_failed" != 0 ]]; then
+      _sley_secrets_parallel_stop_children
+    fi
+    _sley_secrets_parallel_remove_output
+
+    eval "${_sley_secrets_parallel_saved_hup:-trap - HUP}"
+    eval "${_sley_secrets_parallel_saved_int:-trap - INT}"
+    eval "${_sley_secrets_parallel_saved_term:-trap - TERM}"
+
+    [[ "$_sley_secrets_parallel_signal_status" -eq 0 ]] ||
+      return "$_sley_secrets_parallel_signal_status"
   fi
 
   return "$rc"
