@@ -1280,6 +1280,12 @@ _sley_secrets_scan_worktree_files() {
       # A terminal-group signal may have interrupted the first rm before Bash
       # ran the latch handler. Retry exact owned paths with repeats ignored.
       [[ "$remove_rc" -eq 0 ]] || _sley_secrets_parallel_remove_output || true
+    elif [[ "$remove_rc" -ne 0 ]]; then
+      # Never report a clean secrets verdict while owned scratch remains. The
+      # removal primitive already names the retained path; preserve it for
+      # inspection rather than recursively deleting unexpected content.
+      _sley_secrets_parallel_setup_failed=1
+      [[ "$rc" -ge 2 ]] || rc=2
     fi
 
     eval "${_sley_secrets_parallel_saved_hup:-trap - HUP}"
