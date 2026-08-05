@@ -1046,8 +1046,8 @@ _sley_secrets_parallel_create_output_files() {
   local path="$1" output_count="$2" old_umask="" output=""
   local index stream rc=0
 
-  old_umask=$(umask) || return 1
-  umask 077 || return 1
+  old_umask=$(builtin umask) || return 1
+  builtin umask 077 || return 1
   for ((index = 0; index < output_count; index++)); do
     for stream in stdout stderr; do
       output="$path/$stream.$index"
@@ -1059,7 +1059,7 @@ _sley_secrets_parallel_create_output_files() {
       fi
     done
   done
-  umask "$old_umask" || rc=1
+  builtin umask "$old_umask" || rc=1
   return "$rc"
 }
 
