@@ -990,6 +990,24 @@ _sley_secrets_parallel_remove_output() {
   _sley_secrets_parallel_output_files=()
 }
 
+_sley_secrets_parallel_allocate_output() {
+  local output_name="$1" stem="$2" path="" allocation_rc=0 valid=0
+  path=$(mktemp "$stem.XXXXXX") || allocation_rc=$?
+
+  # A terminal-group signal can make mktemp return nonzero after it created and
+  # printed the file. Register only the exact regular file under our requested
+  # stem before reporting that failure, so final cancellation cleanup owns it.
+  if [[ -n "$path" && "$path" == "$stem."* && -f "$path" && ! -L "$path" ]]; then
+    _sley_secrets_parallel_output_files+=("$path")
+    printf -v "$output_name" '%s' "$path"
+    valid=1
+  else
+    printf -v "$output_name" '%s' ""
+  fi
+
+  [[ "$allocation_rc" -eq 0 && "$valid" -eq 1 ]]
+}
+
 _sley_secrets_scan_batch() {
   local gitleaks_executable="$1"
   shift
@@ -1005,20 +1023,20 @@ _sley_secrets_scan_batch() {
     [[ "$_sley_secrets_parallel_signal_status" -eq 0 ]] || return 0
     index=$offset
     file=${files[$offset]}
-    if ! stdout_file=$(mktemp "${TMPDIR:-/tmp}/sley-secrets-stdout.XXXXXX"); then
+    if ! _sley_secrets_parallel_allocate_output \
+      stdout_file "${TMPDIR:-/tmp}/sley-secrets-stdout"; then
       _sley_secrets_parallel_setup_failed=1
       return 2
     fi
     stdout_files+=("$stdout_file")
-    _sley_secrets_parallel_output_files+=("$stdout_file")
     [[ "$_sley_secrets_parallel_signal_status" -eq 0 ]] || return 0
 
-    if ! stderr_file=$(mktemp "${TMPDIR:-/tmp}/sley-secrets-stderr.XXXXXX"); then
+    if ! _sley_secrets_parallel_allocate_output \
+      stderr_file "${TMPDIR:-/tmp}/sley-secrets-stderr"; then
       _sley_secrets_parallel_setup_failed=1
       return 2
     fi
     stderr_files+=("$stderr_file")
-    _sley_secrets_parallel_output_files+=("$stderr_file")
     [[ "$_sley_secrets_parallel_signal_status" -eq 0 ]] || return 0
 
     "$gitleaks_executable" dir "${gitleaks_args[@]}" -- "$file" </dev/null \
