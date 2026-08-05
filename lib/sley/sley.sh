@@ -1053,6 +1053,16 @@ _sley_secrets_scan_batch() {
 }
 
 _sley_secrets_scan_worktree_files() {
+  local cancellation_output_name=""
+  # Scanner failures may use the same numeric statuses as shell signals. Keep
+  # parent cancellation on a separate output channel so callers do not infer
+  # control flow from an ordinary scanner exit code.
+  if [[ "${1:-}" == --cancellation-output ]]; then
+    cancellation_output_name="${2:-}"
+    shift 2
+    [[ -n "$cancellation_output_name" ]] || return 2
+    printf -v "$cancellation_output_name" '%s' 0
+  fi
   local rc=0 jobs start file out scan_rc gitleaks_type gitleaks_executable
   local _sley_secrets_parallel_signal_status=0
   local _sley_secrets_parallel_setup_failed=0
@@ -1094,7 +1104,10 @@ _sley_secrets_scan_worktree_files() {
       fi
     done
   else
-    gitleaks_executable=$(type -P gitleaks 2>/dev/null) || return 2
+    if ! gitleaks_executable=$(type -P gitleaks 2>/dev/null); then
+      _sley_die "unable to resolve gitleaks executable"
+      return 2
+    fi
     [[ "$gitleaks_executable" == /* ]] || gitleaks_executable="$PWD/$gitleaks_executable"
 
     # `gitleaks dir <single-file>` has high process startup overhead compared
@@ -1138,8 +1151,11 @@ _sley_secrets_scan_worktree_files() {
     eval "${_sley_secrets_parallel_saved_int:-trap - INT}"
     eval "${_sley_secrets_parallel_saved_term:-trap - TERM}"
 
-    [[ "$_sley_secrets_parallel_signal_status" -eq 0 ]] ||
+    if [[ "$_sley_secrets_parallel_signal_status" -ne 0 ]]; then
+      [[ -z "$cancellation_output_name" ]] ||
+        printf -v "$cancellation_output_name" '%s' 1
       return "$_sley_secrets_parallel_signal_status"
+    fi
   fi
 
   return "$rc"
@@ -1161,7 +1177,7 @@ _sley_secrets() {
   fi
   _sley_init_repo || return $?
   _sley_parse_scope "$@" || return $?
-  local files runnable staged_files file rc=0 out scan_rc
+  local files runnable staged_files file rc=0 out scan_rc worktree_cancelled=0
   local -a worktree_files=()
   declare -A _scanned_set=()
   files=$(_sley_selected_files) || return 2
@@ -1257,14 +1273,13 @@ _sley_secrets() {
   # worktree result is strictly worse. Mirrors the per-batch discipline
   # inside `_sley_secrets_scan_worktree_files` itself.
   scan_rc=0
-  _sley_secrets_scan_worktree_files "${worktree_files[@]}" || scan_rc=$?
+  _sley_secrets_scan_worktree_files \
+    --cancellation-output worktree_cancelled "${worktree_files[@]}" || scan_rc=$?
   [[ "$scan_rc" -gt "$rc" ]] && rc=$scan_rc
-  # A parallel scan restores the caller's traps before returning its latched
-  # signal status. Treat that status as control flow, not scanner severity: no
-  # extension pass may start after the user has cancelled the base scan.
-  case "$scan_rc" in
-    129 | 130 | 143) return "$scan_rc" ;;
-  esac
+  # A parallel scan restores the caller's traps before returning. Its explicit
+  # cancellation bit, rather than the overloaded scanner status, decides
+  # whether an extension pass may start after the base scan.
+  [[ "$worktree_cancelled" -eq 0 ]] || return "$scan_rc"
   # Extra secrets configs: independent gitleaks passes (e.g. an overlay's
   # forbidden-vocabulary rules) over the same staged + worktree inputs. Base
   # sley returns none, so this is a no-op unless an extension opts in.
