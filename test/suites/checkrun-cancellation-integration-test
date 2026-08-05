@@ -91,7 +91,7 @@ def process_state(pid: int) -> str:
 
 def session_pids(session_id: int) -> list[int]:
     result = subprocess.run(
-        [SYSTEM_PS, "-eo", "pid=,sid="],
+        [SYSTEM_PS, "-A", "-o", "pid=", "-o", "sess="],
         check=False,
         capture_output=True,
         text=True,
