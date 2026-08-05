@@ -990,23 +990,45 @@ _sley_secrets_parallel_remove_output() {
   _sley_secrets_parallel_output_files=()
 }
 
-_sley_secrets_parallel_allocate_output() {
-  local output_name="$1" stem="$2" path="" allocation_rc=0 valid=0
-  path=$(mktemp "$stem.XXXXXX") || allocation_rc=$?
+_sley_secrets_parallel_create_output() {
+  local output_name="$1" path="$2" old_umask="" created=0 had_noclobber=0
 
-  # A terminal-group signal can kill mktemp after it created and printed the
-  # file. Adopt that exact empty regular file so cancellation cleanup owns it;
-  # a non-empty lookalike is not ours and remains untouched.
-  if [[ -n "$path" && "$path" == "$stem."* && -f "$path" && ! -L "$path" &&
-    ! -s "$path" ]]; then
-    _sley_secrets_parallel_output_files+=("$path")
-    printf -v "$output_name" '%s' "$path"
-    valid=1
-  else
-    printf -v "$output_name" '%s' ""
+  printf -v "$output_name" '%s' ""
+  old_umask=$(builtin umask) || return 1
+  case "$-" in
+    *C*) had_noclobber=1 ;;
+  esac
+
+  # Create the parent-known path in this shell. Signal handlers only latch, so
+  # Bash completes this builtin redirection before normal control registers the
+  # exact file; no child can die before publishing its allocation identity.
+  builtin umask 077 || return 1
+  set -C
+  if : 2>/dev/null >"$path"; then
+    created=1
   fi
+  [[ "$had_noclobber" -eq 1 ]] || set +C
+  builtin umask "$old_umask"
 
-  [[ "$allocation_rc" -eq 0 && "$valid" -eq 1 ]]
+  [[ "$created" -eq 1 ]] || return 1
+  _sley_secrets_parallel_output_files+=("$path")
+  printf -v "$output_name" '%s' "$path"
+}
+
+_sley_secrets_parallel_allocate_output() {
+  local output_name="$1" stem="$2" path="" attempt=0
+
+  printf -v "$output_name" '%s' ""
+  while ((attempt < 20)); do
+    path="$stem.${BASHPID:-$$}.$RANDOM.$RANDOM.$attempt"
+    if _sley_secrets_parallel_create_output "$output_name" "$path"; then
+      return 0
+    fi
+    [[ "${_sley_secrets_parallel_signal_status:-0}" -eq 0 ]] || return 1
+    attempt=$((attempt + 1))
+  done
+
+  return 1
 }
 
 _sley_secrets_scan_batch() {
@@ -1126,7 +1148,6 @@ _sley_secrets_scan_worktree_files() {
   gitleaks_type=$(type -t gitleaks 2>/dev/null || true)
   if [[ "$jobs" -eq 1 ]] ||
     [[ "$gitleaks_type" != file ]] ||
-    ! command -v mktemp >/dev/null 2>&1 ||
     ! command -v cat >/dev/null 2>&1 ||
     ! command -v rm >/dev/null 2>&1; then
     for file in "${files[@]}"; do
