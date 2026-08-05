@@ -930,6 +930,21 @@ _sley_secrets_parallel_job_is_active() {
   return 1
 }
 
+_sley_secrets_parallel_record_signal() {
+  local status="$1" wait_pid="${_sley_secrets_parallel_wait_pid:-}"
+
+  if [[ "$_sley_secrets_parallel_signal_status" -eq 0 ]]; then
+    _sley_secrets_parallel_signal_status=$status
+  fi
+  # A signal can be handled after the guard but before `wait` starts. Wake that
+  # exact unreaped Bash job even if its scanner ignores TERM; normal cleanup
+  # still gives every other scanner the bounded cooperative TERM grace period.
+  if [[ -n "$wait_pid" ]] &&
+    _sley_secrets_parallel_job_is_active "$wait_pid"; then
+    kill -KILL "$wait_pid" 2>/dev/null || true
+  fi
+}
+
 _sley_secrets_parallel_stop_children() {
   local attempt index pid any_running
 
@@ -955,7 +970,7 @@ _sley_secrets_parallel_stop_children() {
       fi
     done
     [[ "$any_running" == 1 ]] || break
-    sleep 0.01
+    sleep 0.01 || true
   done
 
   for index in "${!_sley_secrets_parallel_pids[@]}"; do
@@ -1014,16 +1029,21 @@ _sley_secrets_scan_batch() {
   done
 
   for offset in "${!files[@]}"; do
-    [[ "$_sley_secrets_parallel_signal_status" -eq 0 ]] || return 0
     index=$offset
     pid=${_sley_secrets_parallel_pids[$index]}
     stdout_file=${stdout_files[$index]}
     stderr_file=${stderr_files[$index]}
+    _sley_secrets_parallel_wait_pid=$pid
+    if [[ "$_sley_secrets_parallel_signal_status" -ne 0 ]]; then
+      _sley_secrets_parallel_wait_pid=""
+      return 0
+    fi
     if wait "$pid"; then
       scan_rc=0
     else
       scan_rc=$?
     fi
+    _sley_secrets_parallel_wait_pid=""
     if [[ "$_sley_secrets_parallel_signal_status" -ne 0 ]]; then
       if ! _sley_secrets_parallel_job_is_active "$pid"; then
         _sley_secrets_parallel_pids[index]=""
@@ -1063,12 +1083,13 @@ _sley_secrets_scan_worktree_files() {
     [[ -n "$cancellation_output_name" ]] || return 2
     printf -v "$cancellation_output_name" '%s' 0
   fi
-  local rc=0 jobs start file out scan_rc gitleaks_type gitleaks_executable
+  local rc=0 jobs start file out scan_rc remove_rc gitleaks_type gitleaks_executable
   local _sley_secrets_parallel_signal_status=0
   local _sley_secrets_parallel_setup_failed=0
   local _sley_secrets_parallel_saved_hup=""
   local _sley_secrets_parallel_saved_int=""
   local _sley_secrets_parallel_saved_term=""
+  local _sley_secrets_parallel_wait_pid=""
   local -a files=("$@")
   local -a gitleaks_args
   local -a _sley_secrets_parallel_pids=()
@@ -1119,9 +1140,9 @@ _sley_secrets_scan_worktree_files() {
     _sley_secrets_parallel_saved_hup=$(trap -p HUP)
     _sley_secrets_parallel_saved_int=$(trap -p INT)
     _sley_secrets_parallel_saved_term=$(trap -p TERM)
-    trap 'if [[ $_sley_secrets_parallel_signal_status -eq 0 ]]; then _sley_secrets_parallel_signal_status=129; fi' HUP
-    trap 'if [[ $_sley_secrets_parallel_signal_status -eq 0 ]]; then _sley_secrets_parallel_signal_status=130; fi' INT
-    trap 'if [[ $_sley_secrets_parallel_signal_status -eq 0 ]]; then _sley_secrets_parallel_signal_status=143; fi' TERM
+    trap '_sley_secrets_parallel_record_signal 129' HUP
+    trap '_sley_secrets_parallel_record_signal 130' INT
+    trap '_sley_secrets_parallel_record_signal 143' TERM
 
     for ((start = 0; start < ${#files[@]}; start += jobs)); do
       [[ "$_sley_secrets_parallel_signal_status" -eq 0 ]] || break
@@ -1137,15 +1158,27 @@ _sley_secrets_scan_worktree_files() {
       [[ "$_sley_secrets_parallel_setup_failed" == 0 ]] || break
     done
 
-    # Ignore subsequent delivery while bounded cleanup is in progress. The
-    # first latched signal remains the operation's final status and never gets
-    # folded into gitleaks's MAX-severity protocol.
-    trap '' HUP INT TERM
+    # Once a signal is latched, ignore repeated delivery while bounded cleanup
+    # runs. With no signal yet, retain the latch handlers through cleanup so the
+    # first HUP/INT/TERM cannot disappear in this final ownership window.
+    if [[ "$_sley_secrets_parallel_signal_status" -ne 0 ]]; then
+      trap '' HUP INT TERM
+    fi
     if [[ "$_sley_secrets_parallel_signal_status" -ne 0 ||
       "$_sley_secrets_parallel_setup_failed" != 0 ]]; then
       _sley_secrets_parallel_stop_children
     fi
-    _sley_secrets_parallel_remove_output
+    if [[ "$_sley_secrets_parallel_signal_status" -ne 0 ]]; then
+      trap '' HUP INT TERM
+    fi
+    remove_rc=0
+    _sley_secrets_parallel_remove_output || remove_rc=$?
+    if [[ "$_sley_secrets_parallel_signal_status" -ne 0 ]]; then
+      trap '' HUP INT TERM
+      # A terminal-group signal may have interrupted the first rm before Bash
+      # ran the latch handler. Retry exact owned paths with repeats ignored.
+      [[ "$remove_rc" -eq 0 ]] || _sley_secrets_parallel_remove_output || true
+    fi
 
     eval "${_sley_secrets_parallel_saved_hup:-trap - HUP}"
     eval "${_sley_secrets_parallel_saved_int:-trap - INT}"
