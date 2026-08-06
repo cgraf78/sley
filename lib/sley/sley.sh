@@ -1129,6 +1129,10 @@ _sley_secrets_parallel_create_output_files() {
   local path="$1" output_count="$2" old_umask="" output=""
   local index stream rc=0
 
+  # Create and record each output while the parent owns the directory. If a
+  # later open or signal aborts setup, cleanup still has every path Sley made
+  # and can use exact unlink/rmdir operations instead of recursive deletion.
+  # Keep those files private independently of the caller's umask.
   old_umask=$(builtin umask) || return 1
   builtin umask 077 || return 1
   for ((index = 0; index < output_count; index++)); do
@@ -1150,6 +1154,11 @@ _sley_secrets_parallel_allocate_directory() {
   local output_name="$1" stem="$2" output_count="${3:-1}"
   local path="" attempt=0
 
+  # Choose the final path in the parent before the signal-ignoring child runs.
+  # That removes a child-output publication gap: after mkdir succeeds, the
+  # parent already knows the only path it may claim. Record the directory
+  # before consulting the signal latch or creating files so every later return
+  # leaves an exact cleanup ledger.
   printf -v "$output_name" '%s' ""
   while ((attempt < 20)); do
     path="$stem.${BASHPID:-$$}.$RANDOM.$RANDOM.$attempt"
@@ -1161,6 +1170,8 @@ _sley_secrets_parallel_allocate_directory() {
       return 0
     fi
     [[ "${_sley_secrets_parallel_signal_status:-0}" -eq 0 ]] || return 1
+    # Retry only a genuine name collision. A failed mkdir with no path left
+    # behind is an allocator failure, not a reason to hide the error in a loop.
     [[ -e "$path" || -L "$path" ]] || return 1
     attempt=$((attempt + 1))
   done
