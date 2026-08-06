@@ -1185,19 +1185,20 @@ _sley_secrets_scan_batch() {
   shift 2
   local rc=0 scan_rc file stdout_file stderr_file pid index offset
   local -a files=("$@")
-  local -a gitleaks_args stdout_files=() stderr_files=()
+  local -a gitleaks_args
   _sley_gitleaks_args
   gitleaks_args=("${_SLEY_GITLEAKS_ARGS[@]}")
 
   _sley_secrets_parallel_pids=()
+  # The allocator creates one output pair per concurrent slot, not per file.
+  # This function waits the entire wave before returning, so the serial outer
+  # loop can safely reuse each offset without retaining a second path ledger.
   for offset in "${!files[@]}"; do
     [[ "$_sley_secrets_parallel_signal_status" -eq 0 ]] || return 0
     index=$offset
     file=${files[$offset]}
     stdout_file="$_sley_secrets_parallel_scratch_dir/stdout.$offset"
     stderr_file="$_sley_secrets_parallel_scratch_dir/stderr.$offset"
-    stdout_files+=("$stdout_file")
-    stderr_files+=("$stderr_file")
     [[ "$_sley_secrets_parallel_signal_status" -eq 0 ]] || return 0
 
     # Interactive Bash writes `[job] PID` for the asynchronous syntax itself,
@@ -1223,8 +1224,8 @@ _sley_secrets_scan_batch() {
   for offset in "${!files[@]}"; do
     index=$offset
     pid=${_sley_secrets_parallel_pids[$index]}
-    stdout_file=${stdout_files[$index]}
-    stderr_file=${stderr_files[$index]}
+    stdout_file="$_sley_secrets_parallel_scratch_dir/stdout.$offset"
+    stderr_file="$_sley_secrets_parallel_scratch_dir/stderr.$offset"
     _sley_secrets_parallel_wait_pid=$pid
     if [[ "$_sley_secrets_parallel_signal_status" -ne 0 ]]; then
       _sley_secrets_parallel_wait_pid=""
@@ -1283,7 +1284,6 @@ _sley_secrets_scan_worktree_files() {
   local rc=0 jobs scratch_slots start scan_rc remove_rc combine_diagnostics=0
   local gitleaks_type gitleaks_executable
   local _sley_secrets_parallel_signal_status=0
-  local _sley_secrets_parallel_setup_failed=0
   local _sley_secrets_parallel_saved_hup=""
   local _sley_secrets_parallel_saved_int=""
   local _sley_secrets_parallel_saved_term=""
@@ -1362,7 +1362,6 @@ _sley_secrets_scan_worktree_files() {
 
   if ! _sley_secrets_parallel_allocate_directory \
     _sley_secrets_parallel_scratch_dir "${TMPDIR:-/tmp}/sley-secrets" "$scratch_slots"; then
-    _sley_secrets_parallel_setup_failed=1
     rc=2
     if [[ "$_sley_secrets_parallel_signal_status" -eq 0 ]]; then
       _sley_die "unable to allocate secret scan scratch under ${TMPDIR:-/tmp}"
@@ -1380,7 +1379,6 @@ _sley_secrets_scan_worktree_files() {
         "${files[@]:start:jobs}" || scan_rc=$?
       [[ "$_sley_secrets_parallel_signal_status" -eq 0 ]] || break
       [[ "$scan_rc" -gt "$rc" ]] && rc=$scan_rc
-      [[ "$_sley_secrets_parallel_setup_failed" == 0 ]] || break
     done
   fi
 
@@ -1390,8 +1388,7 @@ _sley_secrets_scan_worktree_files() {
   if [[ "$_sley_secrets_parallel_signal_status" -ne 0 ]]; then
     trap '' HUP INT TERM
   fi
-  if [[ "$_sley_secrets_parallel_signal_status" -ne 0 ||
-    "$_sley_secrets_parallel_setup_failed" != 0 ]]; then
+  if [[ "$_sley_secrets_parallel_signal_status" -ne 0 ]]; then
     # Establish stderr containment before TERM/KILL changes job state. A later
     # `jobs` probe otherwise makes Bash emit asynchronous status text even
     # with monitor mode disabled (and more visibly for `set -m` callers).
@@ -1425,13 +1422,11 @@ _sley_secrets_scan_worktree_files() {
       # Never report a clean secrets verdict while owned output remains.
       # Preserve unexpected foreign content for inspection rather than
       # recursively deleting anything outside the operation's exact ledger.
-      _sley_secrets_parallel_setup_failed=1
       [[ "$rc" -ge 2 ]] || rc=2
     fi
   elif [[ "$remove_rc" -ne 0 ]]; then
     # A helper that reports failure after clearing the exact ownership ledger
     # is still an operational error, but there is no retained path to name.
-    _sley_secrets_parallel_setup_failed=1
     [[ "$rc" -ge 2 ]] || rc=2
   fi
 
