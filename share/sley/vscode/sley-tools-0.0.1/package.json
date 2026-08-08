@@ -1,0 +1,162 @@
+{
+  "name": "sley-tools",
+  "publisher": "cgraf",
+  "displayName": "Sley Tools",
+  "description": "Routes VS Code formatting and diagnostics through Sley hooks.",
+  "version": "0.0.1",
+  "engines": {
+    "vscode": "^1.80.0"
+  },
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./extension.js",
+  "contributes": {
+    "languages": [
+      {
+        "id": "bzl",
+        "aliases": [
+          "Bazel",
+          "bzl"
+        ],
+        "extensions": [
+          ".bzl",
+          ".star"
+        ],
+        "filenames": [
+          "BUCK",
+          "BUILD",
+          "MODULE.bazel",
+          "TARGETS",
+          "WORKSPACE"
+        ]
+      },
+      {
+        "id": "crontab",
+        "aliases": [
+          "Crontab",
+          "crontab"
+        ],
+        "extensions": [
+          ".cron"
+        ],
+        "filenames": [
+          "cron",
+          "crontab"
+        ]
+      },
+      {
+        "id": "editorconfig",
+        "aliases": [
+          "EditorConfig",
+          "editorconfig"
+        ],
+        "filenames": [
+          ".editorconfig"
+        ]
+      },
+      {
+        "id": "gitconfig",
+        "aliases": [
+          "Git Config",
+          "gitconfig"
+        ],
+        "filenames": [
+          ".gitconfig"
+        ]
+      },
+      {
+        "id": "starlark",
+        "aliases": [
+          "Starlark",
+          "starlark"
+        ],
+        "extensions": [
+          ".bzl",
+          ".star"
+        ],
+        "filenames": [
+          "BUCK",
+          "BUILD",
+          "MODULE.bazel",
+          "TARGETS",
+          "WORKSPACE"
+        ]
+      },
+      {
+        "id": "systemd",
+        "aliases": [
+          "systemd",
+          "Systemd"
+        ],
+        "extensions": [
+          ".automount",
+          ".device",
+          ".mount",
+          ".path",
+          ".scope",
+          ".service",
+          ".slice",
+          ".socket",
+          ".swap",
+          ".target",
+          ".timer"
+        ]
+      },
+      {
+        "id": "tmux",
+        "aliases": [
+          "tmux",
+          "Tmux"
+        ],
+        "filenames": [
+          "tmux.conf"
+        ]
+      }
+    ],
+    "commands": [
+      {
+        "command": "sleyTools.refreshDiagnostics",
+        "title": "Sley: Refresh Diagnostics"
+      }
+    ],
+    "configuration": {
+      "title": "Sley Tools",
+      "properties": {
+        "sleyTools.command": {
+          "type": "string",
+          "default": "sley",
+          "description": "Sley command used for editor format and lint hooks."
+        },
+        "sleyTools.checkrunCommand": {
+          "type": "string",
+          "default": "checkrun",
+          "description": "Checkrun command used to discover supported filetypes."
+        },
+        "sleyTools.timeoutMs": {
+          "type": "number",
+          "default": 10000,
+          "description": "Maximum time for a single Sley editor hook."
+        },
+        "sleyTools.lintOnOpen": {
+          "type": "boolean",
+          "default": true,
+          "description": "Run Sley diagnostics when a supported file opens."
+        },
+        "sleyTools.lintOnSave": {
+          "type": "boolean",
+          "default": true,
+          "description": "Run Sley diagnostics after saving a supported file."
+        },
+        "sleyTools.diagnosticExclude": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "description": "Workspace-relative glob patterns that Sley diagnostics should skip."
+        }
+      }
+    }
+  }
+}

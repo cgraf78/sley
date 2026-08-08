@@ -116,6 +116,9 @@ New integrations should source `sley.sh` through shdeps and call public
 - `share/sley/shell.sh` is the sourceable interactive shell loader.
 - `share/sley/schemas/verify.schema.json` is the JSON Schema for
   `sley verify` registry files.
+- `share/sley/vscode/sley-tools-0.0.1/` is the deployable VS Code extension
+  payload. Consumers register that versioned directory directly; Sley owns its
+  formatting, diagnostics, capability-discovery, and lifecycle behavior.
 - `sley_select` resolves repo and scope context.
 - `sley_hook_format_file` and `sley_hook_lint_file` are the narrow save-time
   hook APIs.
@@ -240,6 +243,8 @@ The former `repo-check` surface has been removed. New code should not introduce
 - `hooks.sh` owns hook APIs.
 - `verify.sh` owns local verification discovery.
 - `ready.sh` owns aggregate readiness orchestration.
+- `share/sley/vscode/` owns the versioned VS Code integration payload and its
+  consumer contract.
 
 Neovim exposes `:SleyStatus`, `:SleyCheck`, and `:SleyReady` for human-facing
 repo workflows. Save-time formatting and diagnostics use the same hook APIs as
