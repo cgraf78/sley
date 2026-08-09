@@ -1,0 +1,98 @@
+#!/usr/bin/env bash
+# sley-commit-gate - native Sapling hook for commit readiness.
+#
+# Keep Sapling commit checks on one native hook path for commands that create
+# or rewrite commits.
+
+set -u
+
+_SL_HOOK_ARGS=()
+
+_load_args() {
+  local arg
+  _SL_HOOK_ARGS=("$@")
+  [ "${#_SL_HOOK_ARGS[@]}" -gt 0 ] && return 0
+  [ -n "${HG_ARGS:-}" ] || return 0
+  command -v python3 >/dev/null 2>&1 || return 0
+
+  while IFS= read -r -d '' arg; do
+    _SL_HOOK_ARGS+=("$arg")
+  done < <(
+    python3 -c 'import os, shlex, sys; sys.stdout.write("\0".join(shlex.split(os.environ.get("HG_ARGS", "")))); sys.stdout.write("\0")' 2>/dev/null ||
+      true
+  )
+}
+
+_arg_is() {
+  local needle="$1" arg
+  for arg in "${_SL_HOOK_ARGS[@]}"; do
+    [ "$arg" = "$needle" ] && return 0
+  done
+  return 1
+}
+
+_sapling_command() {
+  local arg
+  for arg in "${_SL_HOOK_ARGS[@]}"; do
+    case "$arg" in
+      amend | commit | absorb | record | continue | backout | graft | import | fold | split | rebase | histedit)
+        printf '%s\n' "$arg"
+        return 0
+        ;;
+    esac
+  done
+  return 1
+}
+
+_has_pending_changes() {
+  local sl_cmd="${HG:-sl}" output
+  command -v "$sl_cmd" >/dev/null 2>&1 || return 0
+  # If Sapling cannot report status, assume file content may be changing and
+  # let the readiness gate decide.
+  if ! output="$("$sl_cmd" status 2>/dev/null)"; then
+    return 0
+  fi
+  [ -n "$output" ]
+}
+
+_skip_for_command() {
+  case "$(_sapling_command || true)" in
+    amend)
+      _has_pending_changes || return 0
+      ;;
+    absorb)
+      _arg_is --dry-run && return 0
+      _arg_is -n && return 0
+      _has_pending_changes || return 0
+      ;;
+    rebase)
+      _arg_is --abort && return 0
+      _arg_is -a && return 0
+      _arg_is --quit && return 0
+      ;;
+    graft)
+      _arg_is --abort && return 0
+      _arg_is --dry-run && return 0
+      _arg_is -n && return 0
+      ;;
+    backout | import)
+      _arg_is --no-commit && return 0
+      ;;
+    histedit)
+      _arg_is --abort && return 0
+      _arg_is --show-plan && return 0
+      _arg_is --edit-plan && return 0
+      ;;
+  esac
+  return 1
+}
+
+_load_args "$@"
+_skip_for_command && exit 0
+
+if ! command -v sley >/dev/null 2>&1; then
+  echo "sley-commit-gate: sley is required for Sapling commit readiness" >&2
+  exit 1
+fi
+
+exec sley ready --fix --commit

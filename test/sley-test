@@ -15,6 +15,12 @@ runtime_shell_files=(
   "$root/lib/sley/scope.sh"
   "$root/lib/sley/sley.sh"
   "$root/lib/sley/verify.sh"
+  "$root/share/sley/hooks/git/pre-applypatch"
+  "$root/share/sley/hooks/git/pre-commit"
+  "$root/share/sley/hooks/git/pre-merge-commit"
+  "$root/share/sley/hooks/git/prepare-commit-msg"
+  "$root/share/sley/hooks/git/sley-commit-gate"
+  "$root/share/sley/hooks/sapling/sley-commit-gate"
   "$root/share/sley/shell.sh"
 )
 

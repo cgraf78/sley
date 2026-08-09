@@ -1,0 +1,209 @@
+#!/usr/bin/env bash
+# commit-hooks-test — generic Git and Sapling commit-gate launchers.
+
+set -euo pipefail
+export NO_COLOR=1
+
+SLEY_TEST_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
+SLEY_REPO_ROOT="$(cd -- "$SLEY_TEST_DIR/.." && pwd -P)"
+
+# shellcheck source=../helpers.sh
+. "$SLEY_TEST_DIR/helpers.sh"
+
+git_hooks="$SLEY_REPO_ROOT/share/sley/hooks/git"
+sapling_gate="$SLEY_REPO_ROOT/share/sley/hooks/sapling/sley-commit-gate"
+mock_bin=$(_mock_bin)
+sley_log=$(_tmpdir)/sley.log
+gate_log=$(_tmpdir)/gate.log
+git_log=$(_tmpdir)/git.log
+
+cat >"$mock_bin/sley" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"$SLEY_TEST_LOG"
+exit "${SLEY_TEST_RC:-0}"
+EOF
+cat >"$mock_bin/git" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"$SLEY_TEST_GIT_LOG"
+[[ "$*" == "rev-parse --absolute-git-dir" ]] || exit 2
+printf '%s\n' "$SLEY_TEST_GIT_DIR"
+EOF
+cat >"$mock_bin/sl" <<'EOF'
+#!/usr/bin/env bash
+case "${1:-}" in
+  status)
+    printf '%s' "${SLEY_TEST_SL_STATUS:-}"
+    exit "${SLEY_TEST_SL_STATUS_RC:-0}"
+    ;;
+esac
+exit 2
+EOF
+cat >"$mock_bin/custom-gate" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "${SLEY_TEST_HOOK_NAME:-unknown}:$*" >>"$SLEY_TEST_GATE_LOG"
+exit "${SLEY_TEST_GATE_RC:-0}"
+EOF
+chmod +x "$mock_bin"/*
+
+echo "=== sley: generic Git commit hooks ==="
+
+rc=0
+SLEY_TEST_LOG="$sley_log" PATH="$mock_bin:$PATH" \
+  "$git_hooks/sley-commit-gate" >/dev/null 2>&1 || rc=$?
+_assert_exit "git gate: succeeds with sley" 0 "$rc"
+_assert_file_content "git gate: runs full commit readiness" \
+  "ready --fix --commit" "$sley_log"
+
+: >"$sley_log"
+rc=0
+SLEY_TEST_LOG="$sley_log" SLEY_TEST_RC=7 PATH="$mock_bin:$PATH" \
+  "$git_hooks/sley-commit-gate" >/dev/null 2>&1 || rc=$?
+_assert_exit "git gate: preserves sley status" 7 "$rc"
+_assert_file_content "git gate: preserves the readiness arguments" \
+  "ready --fix --commit" "$sley_log"
+
+missing_bin=$(_mock_bin)
+ln -s "$(command -v bash)" "$missing_bin/bash"
+rc=0
+missing_output=$(PATH="$missing_bin" "$git_hooks/sley-commit-gate" 2>&1) || rc=$?
+_assert_exit "git gate: missing sley fails closed" 1 "$rc"
+_assert_contains "git gate: missing sley explains the requirement" \
+  "sley not found on PATH" "$missing_output"
+
+for hook_name in pre-commit pre-merge-commit pre-applypatch; do
+  SLEY_TEST_HOOK_NAME="$hook_name" \
+    SLEY_TEST_GATE_LOG="$gate_log" \
+    SLEY_GIT_COMMIT_GATE="$mock_bin/custom-gate" \
+    "$git_hooks/$hook_name" "argument with spaces"
+done
+_assert_file_content "git hooks: delegate through the consumer gate override" \
+  "$(printf '%s\n' \
+    'pre-commit:' \
+    'pre-merge-commit:' \
+    'pre-applypatch:')" "$gate_log"
+
+rc=0
+SLEY_TEST_HOOK_NAME="pre-commit" \
+  SLEY_TEST_GATE_LOG="$gate_log" \
+  SLEY_TEST_GATE_RC=9 \
+  SLEY_GIT_COMMIT_GATE="$mock_bin/custom-gate" \
+  "$git_hooks/pre-commit" >/dev/null 2>&1 || rc=$?
+_assert_exit "git hooks: preserve a consumer gate failure" 9 "$rc"
+
+git_dir=$(_tmpdir)
+message=$(_tmpdir)/message
+printf 'ordinary commit\n' >"$message"
+: >"$gate_log"
+: >"$git_log"
+SLEY_TEST_GIT_DIR="$git_dir" \
+  SLEY_TEST_GIT_LOG="$git_log" \
+  SLEY_TEST_GATE_LOG="$gate_log" \
+  SLEY_GIT_COMMIT_GATE="$mock_bin/custom-gate" \
+  PATH="$mock_bin:$PATH" \
+  "$git_hooks/prepare-commit-msg" "$message"
+_assert_file_content "prepare hook: ordinary commits skip readiness" "" "$gate_log"
+_assert_file_content "prepare hook: probes sequencer state once" \
+  "rev-parse --absolute-git-dir" "$git_log"
+
+: >"$gate_log"
+touch "$git_dir/CHERRY_PICK_HEAD"
+SLEY_TEST_HOOK_NAME="prepare-commit-msg" \
+  SLEY_TEST_GIT_DIR="$git_dir" \
+  SLEY_TEST_GIT_LOG="$git_log" \
+  SLEY_TEST_GATE_LOG="$gate_log" \
+  SLEY_GIT_COMMIT_GATE="$mock_bin/custom-gate" \
+  PATH="$mock_bin:$PATH" \
+  "$git_hooks/prepare-commit-msg" "$message"
+_assert_file_content "prepare hook: sequencer commits run readiness" \
+  "prepare-commit-msg:" "$gate_log"
+rm -f "$git_dir/CHERRY_PICK_HEAD"
+
+: >"$gate_log"
+cat >"$message" <<'EOF'
+Revert "an earlier change"
+
+This reverts commit 0123456789abcdef.
+EOF
+SLEY_TEST_HOOK_NAME="prepare-commit-msg" \
+  SLEY_TEST_GIT_DIR="$git_dir" \
+  SLEY_TEST_GIT_LOG="$git_log" \
+  SLEY_TEST_GATE_LOG="$gate_log" \
+  SLEY_GIT_COMMIT_GATE="$mock_bin/custom-gate" \
+  PATH="$mock_bin:$PATH" \
+  "$git_hooks/prepare-commit-msg" "$message"
+_assert_file_content "prepare hook: generated reverts run readiness" \
+  "prepare-commit-msg:" "$gate_log"
+
+echo "=== sley: generic Sapling commit hook ==="
+
+: >"$sley_log"
+rc=0
+SLEY_TEST_LOG="$sley_log" PATH="$mock_bin:$PATH" \
+  "$sapling_gate" commit -m message >/dev/null 2>&1 || rc=$?
+_assert_exit "sapling gate: commit succeeds" 0 "$rc"
+_assert_file_content "sapling gate: commit runs full readiness" \
+  "ready --fix --commit" "$sley_log"
+
+: >"$sley_log"
+rc=0
+SLEY_TEST_LOG="$sley_log" SLEY_TEST_RC=7 PATH="$mock_bin:$PATH" \
+  "$sapling_gate" commit -m message >/dev/null 2>&1 || rc=$?
+_assert_exit "sapling gate: preserves sley status" 7 "$rc"
+_assert_file_content "sapling gate: blocking checks retain the readiness arguments" \
+  "ready --fix --commit" "$sley_log"
+
+: >"$sley_log"
+SLEY_TEST_LOG="$sley_log" PATH="$mock_bin:$PATH" \
+  "$sapling_gate" amend -m "message only"
+_assert_file_content "sapling gate: metadata-only amend skips readiness" "" "$sley_log"
+
+: >"$sley_log"
+SLEY_TEST_LOG="$sley_log" SLEY_TEST_SL_STATUS="M changed.cpp" PATH="$mock_bin:$PATH" \
+  "$sapling_gate" amend -m "message plus changes"
+_assert_file_content "sapling gate: amend with pending files runs readiness" \
+  "ready --fix --commit" "$sley_log"
+
+: >"$sley_log"
+SLEY_TEST_LOG="$sley_log" SLEY_TEST_SL_STATUS="M changed.cpp" PATH="$mock_bin:$PATH" \
+  "$sapling_gate" absorb --dry-run
+_assert_file_content "sapling gate: absorb dry-run skips readiness" "" "$sley_log"
+
+: >"$sley_log"
+SLEY_TEST_LOG="$sley_log" PATH="$mock_bin:$PATH" \
+  "$sapling_gate" absorb -a
+_assert_file_content "sapling gate: empty absorb skips readiness" "" "$sley_log"
+
+: >"$sley_log"
+SLEY_TEST_LOG="$sley_log" PATH="$mock_bin:$PATH" \
+  "$sapling_gate" rebase --abort
+_assert_file_content "sapling gate: rebase abort skips readiness" "" "$sley_log"
+
+: >"$sley_log"
+SLEY_TEST_LOG="$sley_log" PATH="$mock_bin:$PATH" \
+  "$sapling_gate" graft --dry-run
+_assert_file_content "sapling gate: graft dry-run skips readiness" "" "$sley_log"
+
+: >"$sley_log"
+SLEY_TEST_LOG="$sley_log" PATH="$mock_bin:$PATH" \
+  "$sapling_gate" import --no-commit patch.diff
+_assert_file_content "sapling gate: import without commit skips readiness" "" "$sley_log"
+
+: >"$sley_log"
+SLEY_TEST_LOG="$sley_log" PATH="$mock_bin:$PATH" \
+  "$sapling_gate" histedit --show-plan
+_assert_file_content "sapling gate: histedit plan display skips readiness" "" "$sley_log"
+
+: >"$sley_log"
+SLEY_TEST_LOG="$sley_log" \
+  HG_ARGS="--cwd /tmp/repo rebase --abort --reason 'native hook probe'" \
+  PATH="$mock_bin:$PATH" \
+  "$sapling_gate"
+_assert_file_content "sapling gate: HG_ARGS participates in skip decisions" "" "$sley_log"
+
+rc=0
+sapling_missing_output=$(PATH="$missing_bin" "$sapling_gate" commit 2>&1) || rc=$?
+_assert_exit "sapling gate: missing sley fails closed" 1 "$rc"
+_assert_contains "sapling gate: missing sley explains the requirement" \
+  "sley is required" "$sapling_missing_output"
+
+_test_summary

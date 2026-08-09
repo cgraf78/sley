@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# sley-commit-gate — generic Git commit-readiness gate.
+
+set -u
+
+if ! command -v sley >/dev/null 2>&1; then
+  {
+    echo "sley-commit-gate: sley not found on PATH."
+    echo "sley-commit-gate: install sley, fix PATH, or use Git's native --no-verify bypass if this commit must skip hooks."
+  } >&2
+  exit 1
+fi
+
+exec sley ready --fix --commit

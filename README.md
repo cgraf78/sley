@@ -116,6 +116,10 @@ New integrations should source `sley.sh` through shdeps and call public
 - `share/sley/shell.sh` is the sourceable interactive shell loader.
 - `share/sley/schemas/verify.schema.json` is the JSON Schema for
   `sley verify` registry files.
+- `share/sley/hooks/` contains provider-owned Git and Sapling commit-gate
+  launchers. Consumers activate those executables from their VCS configuration
+  or hooks directory; `SLEY_GIT_COMMIT_GATE` may name one consumer-owned wrapper
+  around the final Git gate without copying Sley's sequencer policy.
 - `share/sley/vscode/sley-tools-0.0.1/` is the deployable VS Code extension
   payload. Consumers register that versioned directory directly; Sley owns its
   formatting, diagnostics, capability-discovery, and lifecycle behavior.
