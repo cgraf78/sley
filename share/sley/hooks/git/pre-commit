@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# pre-commit — run Sley's full commit-readiness gate.
+#
+# Last resort: git commit --no-verify
+
+set -u
+
+_hook_dir=$(cd -P -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd) || exit 0
+_gate=${SLEY_GIT_COMMIT_GATE:-"$_hook_dir/sley-commit-gate"}
+exec "$_gate"

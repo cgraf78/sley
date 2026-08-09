@@ -12,6 +12,9 @@ This directory owns reusable Sley behavior.
   behavior.
 - `hooks.sh` owns shell hook integration.
 - `nvim.lua` provides the optional Neovim adapter.
+- `../../share/sley/hooks/` contains deployable Git and Sapling commit-gate
+  launchers. Consumers own activation and may wrap the final Git gate with
+  host policy through its documented executable-path override.
 
 Keep Checkrun integration at the boundary where formatting, linting, and generic
 project analysis are requested. Sley should ask Checkrun for plans or execution

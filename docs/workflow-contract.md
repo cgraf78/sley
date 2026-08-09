@@ -92,6 +92,13 @@ language-specific formatter/linter decisions and JSON diagnostics. This keeps
 VS Code, Neovim, shell hooks, human commands, and agent hooks aligned while
 still letting Sley handle when the checks run.
 
+Generic Git and Sapling commit launchers live under `share/sley/hooks/` so the
+sequencer and command-skip rules have one provider-owned implementation.
+Consumers still own activation and environment-specific policy. In particular,
+a consumer may point `SLEY_GIT_COMMIT_GATE` at an executable wrapper that sets
+repo-local scope before returning to Sley's generic readiness gate; the
+override is never evaluated as shell text.
+
 ## Change Checklist
 
 When changing workflow behavior:

@@ -12,6 +12,11 @@ When touching the deployable VS Code integration, update
 contract consumed through shdeps and the extension's formatting, diagnostics,
 capability refresh, concurrency, cancellation, and exclusion behavior.
 
+`test/suites/commit-hooks-test` owns the generic Git and Sapling launcher
+behavior shipped under `share/sley/hooks/`. Consumer repositories should keep
+only activation and genuinely local policy tests instead of duplicating this
+suite.
+
 The real Sley-to-Checkrun cancellation boundary is an explicit cross-repository
 test. Point it at a Checkrun checkout without making ordinary Sley CI depend on
 that checkout:
