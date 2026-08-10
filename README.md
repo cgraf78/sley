@@ -116,16 +116,21 @@ New integrations should source `sley.sh` through shdeps and call public
 - `share/sley/shell.sh` is the sourceable interactive shell loader.
 - `share/sley/schemas/verify.schema.json` is the JSON Schema for
   `sley verify` registry files.
-- `share/sley/hooks/` contains provider-owned Git and Sapling commit-gate
-  launchers. Consumers activate those executables from their VCS configuration
-  or hooks directory; `SLEY_GIT_COMMIT_GATE` may name one consumer-owned wrapper
-  around the final Git gate without copying Sley's sequencer policy.
+- `share/sley/hooks/` contains provider-owned Git and Sapling commit launchers.
+  Consumers activate those executables from their VCS configuration or hooks
+  directory; `SLEY_GIT_COMMIT_GATE` may name one consumer-owned wrapper around
+  the final Git readiness gate without copying Sley's sequencer policy. The Git
+  `commit-msg` launcher also exposes the optional template and executable
+  message-validator providers documented in that directory.
 - `share/sley/vscode/sley-tools-0.0.1/` is the deployable VS Code extension
   payload. Consumers register that versioned directory directly; Sley owns its
   formatting, diagnostics, capability-discovery, and lifecycle behavior.
 - `sley_select` resolves repo and scope context.
 - `sley_hook_format_file` and `sley_hook_lint_file` are the narrow save-time
   hook APIs.
+- `sley_hook_validate_message` and `sley hook validate-message` validate one
+  proposed commit message through either a structural template or an external
+  executable. They do not choose policy or require repository detection.
 - `sley ready --fix --quiet --commit` is the commit-gate API used by agent
   hooks.
 - `_sley_shell_complete` and `_sley_zsh_complete` are the Bash and zsh

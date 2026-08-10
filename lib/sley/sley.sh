@@ -194,6 +194,17 @@ sley_hook_validate() {
   _sley_hook_validate
 }
 
+# sley_hook_validate_message [--template FILE | --validator EXECUTABLE]
+#                            [--message-file FILE]
+#   Validate one proposed commit message without assuming a particular SCM.
+#   When --message-file is omitted, read the message from stdin. With neither
+#   provider configured, return success without consuming stdin.
+sley_hook_validate_message() {
+  local -
+  set -u
+  _sley_hook_validate_message "$@"
+}
+
 # sley_ext_ready_phases
 #   Print additional `sley ready` phase names, one per line. Local extensions
 #   may override this to add human/agent readiness phases.
@@ -1589,6 +1600,7 @@ Commands:
   format --stdin         format newline-separated files from stdin
   lint --stdin           lint newline-separated files from stdin
   validate               run repo-specific hook validation
+  validate-message       validate a commit message with an optional provider
 EOF
 }
 
@@ -1663,6 +1675,9 @@ _sley_hook() {
     validate)
       sley_hook_init || return $?
       sley_hook_validate
+      ;;
+    validate-message)
+      sley_hook_validate_message "$@"
       ;;
     -h | --help | help)
       _sley_hook_usage

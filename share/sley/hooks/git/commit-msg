@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+# commit-msg — validate and secret-scan a finalized Git commit message.
+#
+# Consumers may select one optional structural provider:
+#   SLEY_COMMIT_MESSAGE_TEMPLATE   Git-compatible plaintext template
+#   SLEY_COMMIT_MESSAGE_VALIDATOR  executable receiving one message-file path
+#
+# Last resort: git commit --no-verify
+
+set -u
+
+if ! command -v sley >/dev/null 2>&1; then
+  {
+    echo "sley-commit-msg: sley not found on PATH."
+    echo "sley-commit-msg: install sley, fix PATH, or use Git's native --no-verify bypass if this commit must skip hooks."
+  } >&2
+  exit 1
+fi
+
+message_file=${1:-}
+if [[ -z "$message_file" ]]; then
+  echo "sley-commit-msg: commit message file is required" >&2
+  exit 2
+fi
+
+validation_args=(hook validate-message)
+if [[ -n "${SLEY_COMMIT_MESSAGE_TEMPLATE:-}" ]]; then
+  validation_args+=(--template "$SLEY_COMMIT_MESSAGE_TEMPLATE")
+fi
+if [[ -n "${SLEY_COMMIT_MESSAGE_VALIDATOR:-}" ]]; then
+  validation_args+=(--validator "$SLEY_COMMIT_MESSAGE_VALIDATOR")
+fi
+validation_args+=(--message-file "$message_file")
+
+# Always run the secret scan even when structural validation fails. These are
+# independent gates, and hiding a secret finding behind a format error would
+# make the next commit attempt fail for a second, less actionable reason.
+validation_rc=0
+sley "${validation_args[@]}" || validation_rc=$?
+sley secrets --message-file "$message_file" || exit "$?"
+exit "$validation_rc"

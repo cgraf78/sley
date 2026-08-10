@@ -85,6 +85,8 @@ Sley to choose repo scope, caller policy, or extension behavior:
 
 - `sley hook format-file FILE`
 - `sley hook lint-file [--json] FILE`
+- `sley hook validate-message [--template FILE | --validator EXECUTABLE]
+  [--message-file FILE]`
 - `sley ready --fix --commit`
 
 Those APIs may delegate to Checkrun, and Checkrun remains the producer of
@@ -98,6 +100,14 @@ Consumers still own activation and environment-specific policy. In particular,
 a consumer may point `SLEY_GIT_COMMIT_GATE` at an executable wrapper that sets
 repo-local scope before returning to Sley's generic readiness gate; the
 override is never evaluated as shell text.
+
+Commit-message validation follows the same separation. Sley owns message-file
+transport, provider selection, private stdin staging, and the common structural
+template validator. Consumers own the template or advanced executable and
+therefore retain all naming, strictness, and organization-specific policy. An
+executable receives exactly one opaque message-file path and is invoked
+directly, never as a shell command string. This contract is independent of how
+Git, Sapling, or another SCM obtained the proposed message.
 
 ## Change Checklist
 

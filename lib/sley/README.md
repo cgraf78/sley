@@ -10,11 +10,13 @@ This directory owns reusable Sley behavior.
 - `ready.sh` evaluates whether a workspace is ready for handoff.
 - `verify.sh` and `verify-cache.py` own verification planning and cache
   behavior.
-- `hooks.sh` owns shell hook integration.
+- `hooks.sh` owns shell hook integration, including the SCM-neutral
+  template-or-executable commit-message validation contract.
 - `nvim.lua` provides the optional Neovim adapter.
-- `../../share/sley/hooks/` contains deployable Git and Sapling commit-gate
-  launchers. Consumers own activation and may wrap the final Git gate with
-  host policy through its documented executable-path override.
+- `../../share/sley/hooks/` contains deployable Git and Sapling commit
+  launchers. Consumers own activation, may wrap the final Git readiness gate
+  with host policy, and may supply commit-message policy through the documented
+  template or executable provider paths.
 
 Keep Checkrun integration at the boundary where formatting, linting, and generic
 project analysis are requested. Sley should ask Checkrun for plans or execution
