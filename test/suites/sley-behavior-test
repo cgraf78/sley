@@ -5098,6 +5098,170 @@ __EMC_OUT=$(cd "$repo" && GIT_CONFIG_GLOBAL="$repo/.gitconfig-test" SLEY_EXTENSI
 __EMC_RC=$?
 _assert_exit "secrets message: scanner error dominates a later leak (max rc)" 2 "$__EMC_RC"
 
+# --- message path: base-only scan does not allocate parallel scratch --------
+# The overwhelmingly common no-extension path is already one scanner process.
+# Keep it on the direct path so the concurrency machinery cannot add filesystem
+# work or latency when there is nothing to overlap.
+repo=$(_new_repo)
+mockbin=$(_mock_bin)
+ext=$(_tmpdir)
+export MOCK_LOG="$repo/gl.log" MOCK_STDIN="$repo/gl.stdin" MOCK_LEAK_CONFIG="/nope"
+: >"$MOCK_LOG"
+: >"$MOCK_STDIN"
+_emc_write_mock "$mockbin"
+printf 'ordinary message\n' >"$repo/msg"
+printf 'not a directory\n' >"$repo/not-a-directory"
+__EMC_OUT=$(cd "$repo" && GIT_CONFIG_GLOBAL="$repo/.gitconfig-test" \
+  SLEY_EXTENSION_DIR="$ext" TMPDIR="$repo/not-a-directory" \
+  PATH="$mockbin:$PATH" "$SLEY" secrets --message-file "$repo/msg" 2>&1)
+__EMC_RC=$?
+_assert_exit "secrets message: base-only scan remains scratch-free" 0 "$__EMC_RC"
+
+# --- message path: every duplicate config receives identical cleaned input --
+# An extension may intentionally register the same policy more than once. Do
+# not deduplicate or short-circuit scans: each declaration is an independent
+# policy pass, and every pass must inspect the exact same cleaned message.
+repo=$(_new_repo)
+mockbin=$(_mock_bin)
+ext=$(_tmpdir)
+capture=$(_tmpdir)
+cfg="$repo/extra-policy.toml"
+: >"$cfg"
+cat >"$ext/80-extra.sh" <<EOF
+_sley_hook_secrets_extra_configs() { printf '%s\n' '$cfg' '$cfg'; }
+EOF
+cat >"$mockbin/gitleaks" <<'MOCK'
+#!/usr/bin/env bash
+printf 'gitleaks:%s\n' "$*" >>"$MOCK_LOG"
+cat >"$MOCK_CAPTURE/input.$BASHPID"
+exit 0
+MOCK
+chmod +x "$mockbin/gitleaks"
+export MOCK_LOG="$repo/gl.log" MOCK_CAPTURE="$capture"
+: >"$MOCK_LOG"
+printf 'message body\n\n# kept comment\n# ---------- >8 ----------\nignored diff\n' >"$repo/msg"
+printf 'message body\n\n# kept comment\n' >"$repo/expected-input"
+__EMC_OUT=$(cd "$repo" && GIT_CONFIG_GLOBAL="$repo/.gitconfig-test" \
+  SLEY_EXTENSION_DIR="$ext" PATH="$mockbin:$PATH" \
+  "$SLEY" secrets --message-file "$repo/msg" 2>&1)
+__EMC_RC=$?
+_assert_exit "secrets message: duplicate policies all scan successfully" 0 "$__EMC_RC"
+input_count=0
+inputs_match=yes
+for input_file in "$capture"/input.*; do
+  [[ -f "$input_file" ]] || continue
+  input_count=$((input_count + 1))
+  cmp -s "$repo/expected-input" "$input_file" || inputs_match=no
+done
+_assert_eq "secrets message: base and duplicate policies all run" "3" "$input_count"
+_assert_eq "secrets message: every policy receives identical cleaned bytes" "yes" "$inputs_match"
+duplicate_count=$(awk -v needle="--config $cfg" 'index($0, needle) { count++ } END { print count + 0 }' "$MOCK_LOG")
+_assert_eq "secrets message: duplicate policy declarations are preserved" "2" "$duplicate_count"
+
+# --- message path: explicit one-job mode preserves serial execution ---------
+repo=$(_new_repo)
+mockbin=$(_mock_bin)
+ext=$(_tmpdir)
+cfg="$repo/extra-policy.toml"
+: >"$cfg"
+cat >"$ext/80-extra.sh" <<EOF
+_sley_hook_secrets_extra_configs() { printf '%s\n' '$cfg'; }
+EOF
+cat >"$mockbin/gitleaks" <<'MOCK'
+#!/usr/bin/env bash
+label=base
+case " $* " in
+  *" --config "*) label=extra ;;
+esac
+printf 'start:%s\n' "$label" >>"$MOCK_LOG"
+sleep 0.05
+cat >/dev/null
+printf 'finish:%s\n' "$label" >>"$MOCK_LOG"
+exit 0
+MOCK
+chmod +x "$mockbin/gitleaks"
+export MOCK_LOG="$repo/gl.log"
+: >"$MOCK_LOG"
+printf 'ordinary message\n' >"$repo/msg"
+__EMC_OUT=$(cd "$repo" && GIT_CONFIG_GLOBAL="$repo/.gitconfig-test" \
+  SLEY_EXTENSION_DIR="$ext" SLEY_SECRETS_JOBS=1 PATH="$mockbin:$PATH" \
+  "$SLEY" secrets --message-file "$repo/msg" 2>&1)
+__EMC_RC=$?
+_assert_exit "secrets message: one-job compatibility scan succeeds" 0 "$__EMC_RC"
+_assert_file_content "secrets message: one-job compatibility scan stays serial" \
+  $'start:base\nfinish:base\nstart:extra\nfinish:extra' "$MOCK_LOG"
+
+# --- message path: failed diagnostics keep order and newline normalization ---
+# Command substitution historically merges both streams, strips every trailing
+# newline, then emits exactly one. Preserve that byte-level behavior while a
+# parallel implementation buffers each scan independently.
+repo=$(_new_repo)
+mockbin=$(_mock_bin)
+ext=$(_tmpdir)
+cfg="$repo/extra-policy.toml"
+: >"$cfg"
+cat >"$ext/80-extra.sh" <<EOF
+_sley_hook_secrets_extra_configs() { printf '%s\n' '$cfg'; }
+EOF
+cat >"$mockbin/gitleaks" <<'MOCK'
+#!/usr/bin/env bash
+label=base
+case " $* " in
+  *" --config "*) label=extra ;;
+esac
+cat >/dev/null
+printf 'stdout:%s\n' "$label"
+printf 'stderr:%s\n\n\n' "$label" >&2
+exit 1
+MOCK
+chmod +x "$mockbin/gitleaks"
+printf 'ordinary message\n' >"$repo/msg"
+printf 'stdout:base\nstderr:base\nstdout:extra\nstderr:extra\n' >"$repo/expected-stderr"
+(cd "$repo" && GIT_CONFIG_GLOBAL="$repo/.gitconfig-test" \
+  SLEY_EXTENSION_DIR="$ext" PATH="$mockbin:$PATH" \
+  "$SLEY" secrets --message-file "$repo/msg" \
+  >"$repo/actual-stdout" 2>"$repo/actual-stderr")
+__EMC_RC=$?
+_assert_exit "secrets message: ordered diagnostic fixture reports a finding" 1 "$__EMC_RC"
+if cmp -s "$repo/expected-stderr" "$repo/actual-stderr"; then
+  _pass "secrets message: diagnostics retain declaration order and normalized newlines"
+else
+  _fail "secrets message: diagnostics retain declaration order and normalized newlines"
+fi
+_assert_file_content "secrets message: failed diagnostics remain on stderr" "" "$repo/actual-stdout"
+
+# --- message path: signal-shaped scanner rc does not mean parent cancellation
+# A scanner is allowed to return 129/130/143 as an ordinary failure. Continue
+# every configured scan and aggregate that status without entering the parent's
+# cancellation path.
+repo=$(_new_repo)
+mockbin=$(_mock_bin)
+ext=$(_tmpdir)
+cfg="$repo/extra-policy.toml"
+: >"$cfg"
+cat >"$ext/80-extra.sh" <<EOF
+_sley_hook_secrets_extra_configs() { printf '%s\n' '$cfg'; }
+EOF
+cat >"$mockbin/gitleaks" <<'MOCK'
+#!/usr/bin/env bash
+cat >/dev/null
+case " $* " in
+  *" --config "*) printf 'extra\n' >>"$MOCK_LOG"; exit 0 ;;
+  *) printf 'base\n' >>"$MOCK_LOG"; exit 143 ;;
+esac
+MOCK
+chmod +x "$mockbin/gitleaks"
+export MOCK_LOG="$repo/gl.log"
+: >"$MOCK_LOG"
+printf 'ordinary message\n' >"$repo/msg"
+__EMC_OUT=$(cd "$repo" && GIT_CONFIG_GLOBAL="$repo/.gitconfig-test" \
+  SLEY_EXTENSION_DIR="$ext" PATH="$mockbin:$PATH" \
+  "$SLEY" secrets --message-file "$repo/msg" 2>&1)
+__EMC_RC=$?
+_assert_exit "secrets message: signal-shaped scanner status is preserved" 143 "$__EMC_RC"
+_assert_file_content "secrets message: signal-shaped scanner status does not skip policies" \
+  $'base\nextra' "$MOCK_LOG"
+
 # --- extra-config also runs a worktree (gitleaks dir) pass ------------------
 repo=$(_new_repo)
 mockbin=$(_mock_bin)
@@ -5131,6 +5295,6 @@ __EMC_OUT=$(cd "$repo" && GIT_CONFIG_GLOBAL="$repo/.gitconfig-test" PATH="$mockb
 __EMC_RC=$?
 _assert_exit "secrets message: missing path is a usage error" 2 "$__EMC_RC"
 
-unset MOCK_LOG MOCK_STDIN MOCK_LEAK_CONFIG MOCK_RC1_CONFIG MOCK_RC2_CONFIG
+unset MOCK_LOG MOCK_STDIN MOCK_LEAK_CONFIG MOCK_RC1_CONFIG MOCK_RC2_CONFIG MOCK_CAPTURE
 
 _test_summary
