@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# Example consumer-owned policy wrapper for SLEY_GIT_COMMIT_GATE.
+
+set -u
+
+# Very large worktrees may intentionally exclude untracked-file discovery from
+# a commit gate. This is consumer performance policy, so it belongs in the
+# wrapper rather than Sley's generic Git hook. Remove this export when untracked
+# files should participate in readiness.
+export SLEY_SKIP_UNTRACKED=1
+
+# Return to Sley's public API instead of copying its readiness implementation.
+exec sley ready --fix --commit

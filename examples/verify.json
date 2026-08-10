@@ -1,0 +1,16 @@
+{
+  "$schema": "https://cgraf78.github.io/sley/schemas/verify.schema.json",
+  "rules": [
+    {
+      "paths": ["src/**"],
+      "commands": [
+        {
+          "cmd": "./test/run",
+          "kind": "test",
+          "required": false,
+          "tier": "suggested"
+        }
+      ]
+    }
+  ]
+}
