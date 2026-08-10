@@ -18,7 +18,7 @@ if [[ "$checkrun_root" != /* || ! -x "$checkrun_root/bin/autolint" ]]; then
   echo "checkrun integration: SLEY_TEST_CHECKRUN_ROOT must name an absolute Checkrun checkout" >&2
   exit 1
 fi
-for dependency in git ps python3; do
+for dependency in getconf git ps python3; do
   command -v "$dependency" >/dev/null 2>&1 || {
     echo "checkrun integration: missing dependency: $dependency" >&2
     exit 1
@@ -46,6 +46,10 @@ CHECKRUN_ROOT = Path(sys.argv[2])
 BASE = Path(sys.argv[3])
 PYTHON = sys.executable
 SYSTEM_PS = shutil.which("ps")
+SYSTEM_GETCONF = shutil.which("getconf")
+FILE_COUNT = 192
+LONG_DIRECTORY = "0" * 120
+LONG_LEAF = "0" * 60
 
 
 def wait_for(predicate, description: str, timeout: float = 10.0) -> None:
@@ -69,12 +73,18 @@ def make_repo(case_dir: Path) -> Path:
     subprocess.run(["git", "-C", str(repo), "config", "user.name", "Sley Test"], check=True)
     subprocess.run(["git", "-C", str(repo), "config", "core.hooksPath", "/dev/null"], check=True)
     subprocess.run(["git", "-C", str(repo), "config", "commit.gpgsign", "false"], check=True)
-    for index in range(2):
-        (repo / f"case-{index}.sh").write_text("#!/usr/bin/env bash\nprintf '%s\\n' before\n", encoding="utf-8")
-    subprocess.run(["git", "-C", str(repo), "add", "--", "case-0.sh", "case-1.sh"], check=True)
+    source_dir = repo / "packages" / LONG_DIRECTORY
+    source_dir.mkdir(parents=True)
+    # The realistic long-path set plus a large inherited environment forces
+    # Sley's bounded stdin transport under the fixture's 128 KiB ARG_MAX.
+    for index in range(FILE_COUNT):
+        (source_dir / f"case-{LONG_LEAF}-{index}.sh").write_text(
+            "#!/usr/bin/env bash\nprintf '%s\\n' before\n", encoding="utf-8"
+        )
+    subprocess.run(["git", "-C", str(repo), "add", "--", "."], check=True)
     subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", "seed"], check=True)
-    for index in range(2):
-        with (repo / f"case-{index}.sh").open("a", encoding="utf-8") as handle:
+    for index in range(FILE_COUNT):
+        with (source_dir / f"case-{LONG_LEAF}-{index}.sh").open("a", encoding="utf-8") as handle:
             handle.write("printf '%s\\n' after\n")
     return repo
 
@@ -120,6 +130,20 @@ root = Path(os.environ["SLEY_CHECKRUN_INTEGRATION_ROOT"])
 )
 candidate = os.environ["SLEY_CHECKRUN_AUTOLINT"]
 os.execve(candidate, [candidate, *sys.argv[1:]], os.environ)
+'''
+
+
+CHECKRUN_WRAPPER = r'''#!/usr/bin/env bash
+exec "$SLEY_CHECKRUN_CHECKRUN" "$@"
+'''
+
+
+GETCONF_WRAPPER = r'''#!/usr/bin/env bash
+if [[ "${1:-}" == "ARG_MAX" ]]; then
+  printf '131072\n'
+  exit 0
+fi
+exec "$SLEY_CHECKRUN_SYSTEM_GETCONF" "$@"
 '''
 
 
@@ -231,6 +255,8 @@ def run() -> None:
     repo = make_repo(case_dir)
 
     write_executable(tool_bin / "autolint", AUTOLINT_WRAPPER)
+    write_executable(tool_bin / "checkrun", CHECKRUN_WRAPPER)
+    write_executable(tool_bin / "getconf", GETCONF_WRAPPER)
     write_executable(tool_bin / "shellcheck", SHELLCHECK)
     write_executable(tool_bin / "yq", "#!/usr/bin/env bash\nexit 0\n")
     driver = case_dir / "driver.sh"
@@ -245,10 +271,13 @@ def run() -> None:
             "TMPDIR": str(scratch),
             "SLEY_EXTENSION_DIR": str(extensions),
             "SLEY_CHECKRUN_AUTOLINT": str(CHECKRUN_ROOT / "bin/autolint"),
+            "SLEY_CHECKRUN_CHECKRUN": str(CHECKRUN_ROOT / "bin/checkrun"),
             "SLEY_CHECKRUN_INTEGRATION_PYTHON": PYTHON,
             "SLEY_CHECKRUN_INTEGRATION_REPO": str(repo),
             "SLEY_CHECKRUN_INTEGRATION_ROOT": str(sync),
             "SLEY_CHECKRUN_INTEGRATION_SLEY": str(SLEY_ROOT / "lib/sley/sley.sh"),
+            "SLEY_CHECKRUN_SYSTEM_GETCONF": SYSTEM_GETCONF,
+            "SLEY_CHECKRUN_ARGMAX_PADDING": "0" * 66000,
             "CHECKRUN_AUTOLINT_JOBS": "2",
             "CHECKRUN_CONFIG_DIR": str(case_dir / "missing-config"),
             "PYTHONDONTWRITEBYTECODE": "1",

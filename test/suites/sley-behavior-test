@@ -4104,6 +4104,175 @@ HOME="$home" PATH="$mockbin:$PATH" _run_sley "$repo" check
 _assert_exit "check: autolint failure exits 1" 1 "$__SLEY_RC"
 _assert_contains "check: surfaces autolint diagnostics on stderr" "synthetic diagnostic" "$__SLEY_OUT"
 
+echo "=== sley: lint sizing keeps environment values out of xtrace ==="
+
+# The sizing guard runs for every multi-file lint, including ordinary direct
+# batches. A caller may legitimately enable xtrace while debugging Sley; that
+# must not turn environment measurement into disclosure of exported secrets.
+repo=$(_new_repo)
+home=$(_tmpdir)
+_copy_sley_libs "$home"
+mockbin=$(_mock_bin)
+cat >"$mockbin/autolint" <<'MOCK'
+#!/usr/bin/env bash
+exit 0
+MOCK
+chmod +x "$mockbin/autolint"
+printf 'one = 1\n' >"$repo/one.py"
+printf 'two = 1\n' >"$repo/two.py"
+(cd "$repo" && git add -- . && git commit -q -m "seed")
+printf 'one = 2\n' >"$repo/one.py"
+printf 'two = 2\n' >"$repo/two.py"
+export SLEY_XTRACE_SECRET='sley-xtrace-secret-do-not-print'
+xtrace_output=$(
+  cd "$repo" || exit 1
+  HOME="$home" PATH="$mockbin:$PATH" \
+    XDG_CONFIG_HOME="$home/.config" \
+    XDG_CACHE_HOME="$home/.cache" \
+    GIT_CONFIG_GLOBAL="$repo/.gitconfig-test" \
+    bash -x "$SLEY" check 2>&1
+)
+xtrace_rc=$?
+unset SLEY_XTRACE_SECRET
+_assert_exit "check: xtrace-enabled multi-file lint exits 0" 0 "$xtrace_rc"
+_assert_not_contains "check: xtrace omits exported environment values" \
+  'sley-xtrace-secret-do-not-print' "$xtrace_output"
+
+echo "=== sley: large lint batch requires bounded Checkrun input ==="
+
+repo=$(_new_repo)
+home=$(_tmpdir)
+_copy_sley_libs "$home"
+mockbin=$(_mock_bin)
+large_lint_marker="$repo/autolint-ran"
+large_lint_probe="$repo/checkrun-probe"
+export LARGE_LINT_MARKER="$large_lint_marker"
+cat >"$mockbin/autolint" <<'MOCK'
+#!/usr/bin/env bash
+touch "$LARGE_LINT_MARKER"
+MOCK
+cat >"$mockbin/checkrun" <<MOCK
+#!/usr/bin/env bash
+printf '%s\n' "\$@" >"$large_lint_probe"
+exit 1
+MOCK
+cat >"$mockbin/getconf" <<'MOCK'
+#!/usr/bin/env bash
+[[ "${1:-}" == "ARG_MAX" ]] || exit 1
+printf '131072\n'
+MOCK
+chmod +x "$mockbin/autolint" "$mockbin/checkrun" "$mockbin/getconf"
+printf -v long_dir '%0120d' 0
+printf -v long_leaf '%060d' 0
+mkdir -p "$repo/packages/$long_dir"
+for index in {0..191}; do
+  printf 'value = %s\n' "$index" \
+    >"$repo/packages/$long_dir/large-$index-$long_leaf.py"
+done
+(cd "$repo" && git add -- . && git commit -q -m "seed")
+for index in {0..191}; do
+  printf 'changed = %s\n' "$index" \
+    >>"$repo/packages/$long_dir/large-$index-$long_leaf.py"
+done
+printf -v LARGE_LINT_ARGMAX_PADDING '%066000d' 0
+export LARGE_LINT_ARGMAX_PADDING
+
+HOME="$home" PATH="$mockbin:$PATH" _run_sley "$repo" check
+_assert_exit "check: old Checkrun rejects large batch visibly" 2 "$__SLEY_RC"
+_assert_contains "check: old Checkrun upgrade is actionable" \
+  "does not support bounded autolint stdin" "$__SLEY_OUT"
+_assert_file_content "check: probes structured Checkrun capability" \
+  $'capabilities\n--has\nautolint-files0-stdin' "$large_lint_probe"
+_assert_file_missing "check: unsupported bounded input never runs lint" \
+  "$large_lint_marker"
+unset LARGE_LINT_ARGMAX_PADDING LARGE_LINT_MARKER
+
+echo "=== sley: lint preflight preserves cancellation status ==="
+
+preflight_bin=$(_mock_bin)
+preflight_marker=$(_tmpdir)/autolint-ran
+preflight_system_env=$(command -v env)
+cat >"$preflight_bin/getconf" <<'MOCK'
+#!/bin/bash
+if [[ "${1:-}" == "ARG_MAX" ]]; then
+  [[ "${SLEY_PREFLIGHT_GETCONF_RC:-0}" == "0" ]] || \
+    exit "$SLEY_PREFLIGHT_GETCONF_RC"
+  printf '131072\n'
+  exit 0
+fi
+exit 1
+MOCK
+cat >"$preflight_bin/env" <<'MOCK'
+#!/bin/bash
+[[ "${SLEY_PREFLIGHT_ENV_RC:-0}" == "0" ]] || \
+  exit "$SLEY_PREFLIGHT_ENV_RC"
+exec "$SLEY_PREFLIGHT_SYSTEM_ENV" "$@"
+MOCK
+cat >"$preflight_bin/checkrun" <<'MOCK'
+#!/bin/bash
+exit "${SLEY_PREFLIGHT_CAPABILITY_RC:-0}"
+MOCK
+cat >"$preflight_bin/autolint" <<'MOCK'
+#!/bin/bash
+touch "$SLEY_PREFLIGHT_AUTOLINT_MARKER"
+exit 0
+MOCK
+chmod +x "$preflight_bin/getconf" "$preflight_bin/env" \
+  "$preflight_bin/checkrun" "$preflight_bin/autolint"
+
+_run_lint_preflight_case() {
+  local getconf_rc="$1" env_rc="$2" capability_rc="$3"
+  rm -f "$preflight_marker"
+  SLEY_PREFLIGHT_GETCONF_RC="$getconf_rc" \
+    SLEY_PREFLIGHT_ENV_RC="$env_rc" \
+    SLEY_PREFLIGHT_CAPABILITY_RC="$capability_rc" \
+    SLEY_PREFLIGHT_SYSTEM_ENV="$preflight_system_env" \
+    SLEY_PREFLIGHT_AUTOLINT_MARKER="$preflight_marker" \
+    SLEY_PREFLIGHT_ROOT="$SLEY_REPO_ROOT" \
+    PATH="$preflight_bin:/usr/bin:/bin" \
+    bash --noprofile --norc -c '
+      source "$SLEY_PREFLIGHT_ROOT/lib/sley/hooks.sh"
+      set +e
+      _sley_hook_lint $'"'"'one.py\ntwo.py'"'"' 2>&1
+      rc=$?
+      printf "preflight_rc=%s\n" "$rc"
+    '
+}
+
+preflight_output=$(_run_lint_preflight_case 143 0 0)
+_assert_contains "check preflight: getconf cancellation is preserved" \
+  "preflight_rc=143" "$preflight_output"
+_assert_file_missing "check preflight: getconf cancellation starts no lint" \
+  "$preflight_marker"
+
+preflight_output=$(_run_lint_preflight_case 0 130 0)
+_assert_contains "check preflight: environment cancellation is preserved" \
+  "preflight_rc=130" "$preflight_output"
+_assert_file_missing "check preflight: environment cancellation starts no lint" \
+  "$preflight_marker"
+
+# A non-signal sizing failure deliberately chooses bounded transport. The
+# capability probe is therefore the next cancellation point in this fixture.
+preflight_output=$(_run_lint_preflight_case 0 1 143)
+_assert_contains "check preflight: capability cancellation is preserved" \
+  "preflight_rc=143" "$preflight_output"
+_assert_file_missing "check preflight: capability cancellation starts no lint" \
+  "$preflight_marker"
+
+preflight_output=$(_run_lint_preflight_case 0 1 70)
+_assert_contains "check preflight: capability error becomes unavailable" \
+  "preflight_rc=2" "$preflight_output"
+_assert_contains "check preflight: capability error reports its status" \
+  "probe failed with status 70" "$preflight_output"
+_assert_file_missing "check preflight: capability error starts no lint" \
+  "$preflight_marker"
+
+preflight_output=$(_run_lint_preflight_case 1 0 0)
+_assert_contains "check preflight: unavailable getconf uses safe fallback" \
+  "preflight_rc=0" "$preflight_output"
+_assert_file_exists "check preflight: fallback still reaches direct lint" \
+  "$preflight_marker"
+
 echo "=== sley: ready surfaces phase failure detail in human output ==="
 
 repo=$(_new_repo)
