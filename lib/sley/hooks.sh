@@ -73,6 +73,13 @@ _sley_hook_validate() { :; }
 
 _sley_message_validate_template() {
   local template="$1" message_file="$2"
+  local template_operand="$template" message_operand="$message_file"
+
+  # POSIX awk treats a bare NAME=value operand as a variable assignment, not
+  # a filename. Prefix only bare relative paths so every path accepted by the
+  # CLI remains opaque to awk without changing the diagnostic spelling.
+  [[ "$template_operand" == */* ]] || template_operand="./$template_operand"
+  [[ "$message_operand" == */* ]] || message_operand="./$message_operand"
 
   # A Git-compatible template is a deliberately small structural contract,
   # not a policy language. Markdown headings (## through ######) and
@@ -153,14 +160,22 @@ _sley_message_validate_template() {
       colon = index(line, ":")
       if (colon > 1) {
         key = tolower(trim(substr(line, 1, colon - 1)))
+        inline = trim(substr(line, colon + 1))
         if (key in required) {
           section_started = 1
           seen[key] = 1
           current = key
-          inline = trim(substr(line, colon + 1))
           if (inline != "") {
             content[key] = 1
           }
+          next
+        }
+        if (inline == "") {
+          # A colon-terminated label is an extra section just like an unknown
+          # Markdown heading. It must not donate its body to the preceding
+          # required section.
+          section_started = 1
+          current = ""
           next
         }
       }
@@ -197,11 +212,12 @@ _sley_message_validate_template() {
       }
       exit errors
     }
-  ' "$template" "$message_file"
+  ' "$template_operand" "$message_operand"
 }
 
 _sley_message_run_provider() {
   local template="$1" validator="$2" message_file="$3"
+  local validator_operand="$validator"
 
   if [[ -n "$template" ]]; then
     _sley_message_validate_template "$template" "$message_file"
@@ -209,7 +225,10 @@ _sley_message_run_provider() {
     # The executable provider contract is intentionally just one opaque path.
     # Consumers that need profiles or strictness keep those policy choices in
     # their own environment or wrapper instead of teaching Sley their schema.
-    "$validator" "$message_file"
+    # A slashless value still names the file that was checked above. Prefix it
+    # explicitly so Bash cannot substitute a same-named builtin or PATH entry.
+    [[ "$validator_operand" == */* ]] || validator_operand="./$validator_operand"
+    "$validator_operand" "$message_file"
   fi
 }
 
@@ -219,7 +238,7 @@ _sley_hook_validate_message() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --template)
-        [[ $# -ge 2 ]] || {
+        [[ $# -ge 2 && -n "${2:-}" ]] || {
           _sley_die "hook validate-message requires a path after --template"
           return 2
         }
@@ -227,7 +246,7 @@ _sley_hook_validate_message() {
         shift 2
         ;;
       --validator)
-        [[ $# -ge 2 ]] || {
+        [[ $# -ge 2 && -n "${2:-}" ]] || {
           _sley_die "hook validate-message requires a path after --validator"
           return 2
         }
@@ -235,7 +254,7 @@ _sley_hook_validate_message() {
         shift 2
         ;;
       --message-file)
-        [[ $# -ge 2 ]] || {
+        [[ $# -ge 2 && -n "${2:-}" ]] || {
           _sley_die "hook validate-message requires a path after --message-file"
           return 2
         }

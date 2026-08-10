@@ -30,6 +30,16 @@ _run_validation_stdin "unchecked message"
 _assert_exit "no provider: skips validation" 0 "$__SLEY_RC"
 _assert_eq "no provider: emits no diagnostics" "" "$__SLEY_OUT"
 
+_run_validation_stdin "message" --template ""
+_assert_exit "provider selection: empty template path is rejected" 2 "$__SLEY_RC"
+_assert_contains "provider selection: empty template path is actionable" \
+  "requires a path after --template" "$__SLEY_OUT"
+
+_run_validation_stdin "message" --validator ""
+_assert_exit "provider selection: empty validator path is rejected" 2 "$__SLEY_RC"
+_assert_contains "provider selection: empty validator path is actionable" \
+  "requires a path after --validator" "$__SLEY_OUT"
+
 template=$(_tmpdir)/message-template.txt
 validator_dir="$(_tmpdir)/validator fixture"
 validator="$validator_dir/message validator"
@@ -44,6 +54,11 @@ cat >"$validator" <<'EOF'
 exit 0
 EOF
 chmod +x "$validator"
+
+_run_validation_stdin "message" --validator "$validator" --message-file ""
+_assert_exit "message source: empty explicit path is rejected" 2 "$__SLEY_RC"
+_assert_contains "message source: empty explicit path is actionable" \
+  "requires a path after --message-file" "$__SLEY_OUT"
 
 _run_validation_stdin "message" --template "$template" --validator "$validator"
 _assert_exit "provider selection: template and validator are mutually exclusive" 2 "$__SLEY_RC"
@@ -76,6 +91,29 @@ _assert_exit "executable provider: missing validator is a configuration error" 2
 _assert_contains "executable provider: missing path is named" \
   "/missing/message-validator" "$__SLEY_OUT"
 
+# A bare relative path is still a path, not a command name. In particular, a
+# checked file named after a shell builtin must not be replaced by that builtin
+# when Sley invokes the provider.
+relative_provider_dir=$(_tmpdir)
+relative_provider_log="$relative_provider_dir/provider.log"
+printf '%s\n' "message for relative provider" >"$relative_provider_dir/message"
+cat >"$relative_provider_dir/true" <<'EOF'
+#!/usr/bin/env bash
+printf 'local provider ran\n' >"$SLEY_TEST_RELATIVE_PROVIDER_LOG"
+exit 7
+EOF
+chmod +x "$relative_provider_dir/true"
+__SLEY_OUT=$(
+  cd "$relative_provider_dir" || exit 1
+  SLEY_TEST_RELATIVE_PROVIDER_LOG="$relative_provider_log" \
+    "$SLEY" hook validate-message --validator true --message-file message 2>&1
+)
+__SLEY_RC=$?
+_assert_exit "executable provider: bare relative path cannot collide with a builtin" \
+  7 "$__SLEY_RC"
+_assert_file_content "executable provider: invokes the checked relative file" \
+  "local provider ran" "$relative_provider_log"
+
 echo "=== sley template message validation ==="
 
 message=$(_tmpdir)/message.txt
@@ -97,6 +135,59 @@ EOF
 _run_validation --template "$template" --message-file "$message"
 _assert_exit "template provider: accepts title and populated required sections" 0 "$__SLEY_RC"
 _assert_eq "template provider: valid message is quiet" "" "$__SLEY_OUT"
+
+# Awk treats bare operands shaped like NAME=value as variable assignments.
+# They are valid filesystem names, so keep template/message paths opaque.
+assignment_path_dir=$(_tmpdir)
+cat >"$assignment_path_dir/template=policy" <<'EOF'
+## Summary
+
+## Testing
+EOF
+cat >"$assignment_path_dir/message=proposal" <<'EOF'
+Keep unusual paths opaque
+
+## Summary
+
+- preserve the selected files
+
+## Testing
+
+- run the focused suite
+EOF
+__SLEY_OUT=$(
+  cd "$assignment_path_dir" || exit 1
+  "$SLEY" hook validate-message \
+    --template template=policy --message-file message=proposal 2>&1
+)
+__SLEY_RC=$?
+_assert_exit "template provider: assignment-shaped relative paths remain files" \
+  0 "$__SLEY_RC"
+_assert_eq "template provider: assignment-shaped paths stay quiet" "" "$__SLEY_OUT"
+
+colon_template=$(_tmpdir)/colon-template.txt
+colon_message=$(_tmpdir)/colon-message.txt
+cat >"$colon_template" <<'EOF'
+Summary:
+
+Testing:
+EOF
+cat >"$colon_message" <<'EOF'
+Keep colon-style sections isolated
+
+Summary:
+
+Notes:
+
+This belongs only to Notes.
+
+Testing: focused suite
+EOF
+_run_validation --template "$colon_template" --message-file "$colon_message"
+_assert_exit "template provider: extra colon section ends required content" \
+  1 "$__SLEY_RC"
+_assert_contains "template provider: extra colon section leaves Summary empty" \
+  "'Summary' section is empty" "$__SLEY_OUT"
 
 cat >"$message" <<'EOF'
 ## Summary
