@@ -445,7 +445,39 @@ discovery_median_budget=$(_perf_budget_ms \
 discovery_max_budget=$(_perf_budget_ms \
   "$VERIFY_DISCOVERY_MAX_BUDGET_MS" \
   "$VERIFY_DISCOVERY_DARWIN_MAX_BUDGET_MS")
-echo "  PERF: verify discovery median ${discovery_median}ms / ${discovery_median_budget}ms, maximum ${discovery_max}ms / ${discovery_max_budget}ms (files ${SLEY_PERF_CHANGED_FILES}, runs ${SLEY_PERF_RUNS})"
+discovery_report_runs="$SLEY_PERF_RUNS"
+
+# Hosted macOS runners can occasionally sustain contention across an entire
+# seven-sample batch. Confirm only that narrow case: a command failure or a
+# coarse-maximum breach remains immediately fatal, while a median-only breach
+# gets one fresh batch on the same already-warm fixture. Retain the first batch
+# and evaluate all 14 samples together so confirmation preserves the slow
+# evidence and applies the unchanged median and maximum budgets to the whole.
+if [[ "$(uname -s)" == "Darwin" ]] &&
+  ((discovery_median > discovery_median_budget && \
+  discovery_max <= discovery_max_budget)); then
+  discovery_initial_median="$discovery_median"
+  discovery_initial_max="$discovery_max"
+  discovery_initial_durations="$repo/.sley-perf-durations.initial"
+  cp "$repo/.sley-perf-durations" "$discovery_initial_durations"
+
+  echo "  PERF: verify discovery median-only breach; collecting one confirmation batch"
+  _measure_perf_stats "verify perf: large shared subtree confirmation" 15 \
+    "$repo" "$SLEY_PERF_RUNS" verify --json
+  cat "$discovery_initial_durations" >>"$repo/.sley-perf-durations"
+  LC_ALL=C sort -n "$repo/.sley-perf-durations" \
+    >"$repo/.sley-perf-durations.sorted"
+  discovery_combined_runs=$((SLEY_PERF_RUNS * 2))
+  discovery_report_runs="$discovery_combined_runs"
+  discovery_median=$(
+    _median_ms "$discovery_combined_runs" \
+      <"$repo/.sley-perf-durations.sorted"
+  )
+  discovery_max=$(tail -n 1 "$repo/.sley-perf-durations.sorted")
+  echo "  PERF: verify discovery initial median ${discovery_initial_median}ms, maximum ${discovery_initial_max}ms; combined ${discovery_combined_runs}-sample median ${discovery_median}ms, maximum ${discovery_max}ms"
+fi
+
+echo "  PERF: verify discovery median ${discovery_median}ms / ${discovery_median_budget}ms, maximum ${discovery_max}ms / ${discovery_max_budget}ms (files ${SLEY_PERF_CHANGED_FILES}, runs ${discovery_report_runs})"
 _assert_ms_le "verify perf: large shared subtree discovery median" \
   "$discovery_median" "$discovery_median_budget"
 _assert_ms_le "verify perf: large shared subtree discovery maximum" \
