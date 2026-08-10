@@ -23,6 +23,11 @@ general shell-command string: the hook executes the path directly and never
 evaluates it as shell syntax. Dotfiles uses the override to scope its special
 bare-`$HOME` repository without forking Sley's generic behavior.
 
+[`examples/hooks/custom-sley-commit-gate`](../../../examples/hooks/custom-sley-commit-gate)
+is a deliberately small consumer-owned wrapper example. Keep the generic hook
+launchers here and put only genuinely local scope or performance policy in a
+wrapper.
+
 ### Commit-message providers
 
 The `commit-msg` launcher accepts one optional consumer-owned provider:
@@ -38,6 +43,10 @@ The `commit-msg` launcher accepts one optional consumer-owned provider:
   Sley invokes it directly with exactly one commit-message file path, passes
   stdout and stderr through, and preserves its exit status. The value is an
   executable path, not a shell command string.
+
+[`examples/commit-message-template.txt`](../../../examples/commit-message-template.txt)
+is a ready-to-copy structural template. It includes editor guidance as `#`
+comments so the guidance cannot accidentally satisfy a required section.
 
 With neither provider, structural validation is a quiet no-op and the secret
 scan still runs. Configuring both providers is an error. The same provider

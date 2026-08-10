@@ -1,0 +1,99 @@
+#!/usr/bin/env bash
+# examples-test — keep copyable examples aligned with Sley's public contracts.
+
+set -uo pipefail
+export NO_COLOR=1
+
+SLEY_TEST_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
+SLEY_REPO_ROOT="$(cd -- "$SLEY_TEST_DIR/.." && pwd -P)"
+SLEY="$SLEY_REPO_ROOT/bin/sley"
+EXAMPLES="$SLEY_REPO_ROOT/examples"
+
+# shellcheck source=../helpers.sh
+. "$SLEY_TEST_DIR/helpers.sh"
+
+echo "=== sley copyable examples ==="
+
+message=$(_tmpdir)/message
+cat >"$message" <<'EOF'
+Document consumer-owned Sley examples
+
+## Summary
+
+Add copyable examples without duplicating provider-owned hooks.
+
+## Testing
+
+Run the focused example suite.
+EOF
+
+template_out=$("$SLEY" hook validate-message \
+  --template "$EXAMPLES/commit-message-template.txt" \
+  --message-file "$message" 2>&1)
+template_rc=$?
+_assert_exit "commit template: accepts a populated example message" 0 "$template_rc"
+_assert_eq "commit template: valid message is quiet" "" "$template_out"
+
+repo=$(_tmpdir)
+home=$(_tmpdir)
+mkdir -p "$repo/src" "$repo/config" "$home/config"
+git -C "$repo" init -q
+git -C "$repo" config user.email test@example.invalid
+git -C "$repo" config user.name "Sley Test"
+git -C "$repo" config commit.gpgsign false
+# The fixture is testing Sley's example inputs, not the host's active Git
+# policy. Override any global core.hooksPath before creating the seed commit so
+# the suite remains hermetic on a machine that already uses Sley's live hooks.
+git -C "$repo" config core.hooksPath "$repo/.git/hooks"
+printf 'initial\n' >"$repo/src/app.txt"
+printf 'initial\n' >"$repo/config/example.schema"
+git -C "$repo" add src/app.txt config/example.schema
+git -C "$repo" commit -q -m seed
+printf 'changed\n' >>"$repo/src/app.txt"
+
+verify_out=$(
+  cd "$repo" || exit 1
+  HOME="$home" XDG_CONFIG_HOME="$home/config" \
+    SLEY_EXTENSION_DIR="$home/extensions" \
+    SLEY_VERIFY_CONFIG="$EXAMPLES/verify.json" \
+    "$SLEY" verify --json 2>&1
+)
+verify_rc=$?
+_assert_exit "verify registry: copyable config is accepted" 0 "$verify_rc"
+_assert_contains "verify registry: example command is discovered" \
+  '"command":"./test/run"' "$verify_out"
+_assert_contains "verify registry: placeholder remains suggested" \
+  '"required":false' "$verify_out"
+
+git -C "$repo" restore src/app.txt
+printf 'changed\n' >>"$repo/config/example.schema"
+extension_out=$(
+  cd "$repo" || exit 1
+  HOME="$home" XDG_CONFIG_HOME="$home/config" \
+    SLEY_EXTENSION_DIR="$EXAMPLES/extensions.d" \
+    SLEY_VERIFY_CONFIG="$home/missing-verify.json" \
+    "$SLEY" verify --json 2>&1
+)
+extension_rc=$?
+_assert_exit "extension: copyable dynamic provider is accepted" 0 "$extension_rc"
+_assert_contains "extension: matching file discovers the example command" \
+  '"command":"./test/validate-schemas"' "$extension_out"
+_assert_contains "extension: placeholder remains suggested" \
+  '"required":false' "$extension_out"
+
+mock_bin=$(_tmpdir)
+cat >"$mock_bin/sley" <<'EOF'
+#!/usr/bin/env bash
+printf 'skip-untracked=%s\n' "${SLEY_SKIP_UNTRACKED:-}"
+printf 'args=%s\n' "$*"
+EOF
+chmod +x "$mock_bin/sley"
+gate_out=$(PATH="$mock_bin:$PATH" "$EXAMPLES/hooks/custom-sley-commit-gate" 2>&1)
+gate_rc=$?
+_assert_exit "Git gate wrapper: delegates successfully" 0 "$gate_rc"
+_assert_contains "Git gate wrapper: applies only its documented policy" \
+  'skip-untracked=1' "$gate_out"
+_assert_contains "Git gate wrapper: returns to the public readiness command" \
+  'args=ready --fix --commit' "$gate_out"
+
+_test_summary

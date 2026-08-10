@@ -1,5 +1,7 @@
 # type<TAB>repository-relative path
 program	bin/sley
+program	examples/extensions.d/80-verify-command.sh
+program	examples/hooks/custom-sley-commit-gate
 program	lib/sley/hooks.sh
 program	lib/sley/ready.sh
 program	lib/sley/repo.sh
@@ -18,6 +20,7 @@ program	test/helpers.sh
 program	test/sley-test
 program	test/suites/checkrun-cancellation-integration-test
 program	test/suites/commit-hooks-test
+program	test/suites/examples-test
 program	test/suites/manpage-test
 program	test/suites/message-validation-test
 program	test/suites/nvim-test

@@ -2557,13 +2557,25 @@ cat >"$repo/tests/run.sh" <<'EOF'
 set -u
 echo ok > tests/ran
 EOF
-chmod +x "$repo/tests/run.sh"
+cat >"$repo/tests/optional.sh" <<'EOF'
+#!/usr/bin/env bash
+set -u
+echo unexpected > tests/optional-ran
+EOF
+chmod +x "$repo/tests/run.sh" "$repo/tests/optional.sh"
 cat >"$repo/.sley/verify.json" <<'EOF'
 {
   "rules": [
     {
       "paths": ["src/**"],
-      "commands": ["./tests/run.sh"]
+      "commands": [
+        "./tests/run.sh",
+        {
+          "cmd": "./tests/optional.sh",
+          "required": false,
+          "tier": "suggested"
+        }
+      ]
     }
   ]
 }
@@ -2579,6 +2591,8 @@ _assert_contains "verify registry: mapped command listed" "test required fast: .
 _run_sley "$repo" verify --json
 _assert_exit "verify registry --json: mapped command lists" 0 "$__SLEY_RC"
 _assert_contains "verify registry --json: required field is true" '"required":true' "$__SLEY_OUT"
+_assert_contains "verify registry --json: explicit optional field stays false" \
+  '"command":"./tests/optional.sh","kind":"test","required":false' "$__SLEY_OUT"
 _assert_contains "verify registry --json: tier field is fast" '"tier":"fast"' "$__SLEY_OUT"
 _assert_contains "verify registry --json: source context is repo config" \
   '"source":".sley/verify.json","context":"repo-config"' "$__SLEY_OUT"
@@ -2588,6 +2602,8 @@ _assert_exit "verify registry --run-required --json: mapped command exits 0" 0 "
 _assert_contains "verify registry --run-required --json: reports passed status" '"status":"passed"' "$__SLEY_OUT"
 _assert_contains "verify registry --run-required --json: records command result" \
   '"command":"./tests/run.sh","tier":"fast","status":"passed","exit_code":0' "$__SLEY_OUT"
+_assert_file_missing "verify registry --run-required --json: skips optional command" \
+  "$repo/tests/optional-ran"
 _assert_not_contains "verify registry --run-required --json: no human preamble" "selected changed files" "$__SLEY_OUT"
 
 _run_sley "$repo" verify --run-required

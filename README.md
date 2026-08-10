@@ -11,6 +11,9 @@ API is `sley.sh`.
 
 See [`docs/workflow-contract.md`](docs/workflow-contract.md) for the ownership
 contract between Sley, Checkrun, editor adapters, dotfiles, humans, and agents.
+See [`examples/README.md`](examples/README.md) for copyable consumer-owned
+configuration and hook-policy examples. Sley-owned runtime launchers remain
+under `share/sley/` so consumers can activate them without maintaining copies.
 
 `shdeps` installs `bin/sley` as the PATH-visible `~/.local/bin/sley` symlink
 and links the bundled `man/man1/` page into the user-local manpath. The entry
