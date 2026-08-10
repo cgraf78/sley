@@ -20,6 +20,28 @@ and links the bundled `man/man1/` page into the user-local manpath. The entry
 point is self-contained and resolves its dependency libraries through that
 symlink.
 
+## Install from a checkout
+
+Keep the checkout at a stable path and run:
+
+```bash
+./install.sh
+```
+
+The installer creates a checkout-backed `sley` command symlink under
+`$HOME/.local/bin` and a manual-page symlink under
+`$HOME/.local/share/man/man1`. Set `PREFIX` to relocate both trees, or set
+`BIN_DIR` and `MAN_DIR` independently. Re-running the installer is safe and
+retargets existing symlinks, but it refuses to replace a non-symlink path.
+Moving or deleting the checkout breaks the installed links.
+
+The command resolves `lib/sley/` from the checkout. The installer leaves that
+library and `share/sley/` checkout-owned and creates no completion tree. Sley's
+Bash and zsh completion functions remain in `share/sley/shell.sh`; source that
+loader through shdeps, or use its absolute path in this checkout. Git and
+Sapling hook activation likewise continues to select the provider-owned
+launchers under `share/sley/hooks/` explicitly.
+
 ## Commands
 
 ```text
