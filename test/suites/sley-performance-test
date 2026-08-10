@@ -35,6 +35,10 @@ HOOK_LINT_FILE_MEDIAN_BUDGET_MS=350
 HOOK_LINT_FILE_DARWIN_MEDIAN_BUDGET_MS=500
 HOOK_LINT_FILE_P95_BUDGET_MS=1000
 HOOK_LINT_FILE_DARWIN_P95_BUDGET_MS=1500
+CHECK_2_MEDIAN_BUDGET_MS=500
+CHECK_2_DARWIN_MEDIAN_BUDGET_MS=750
+CHECK_2_P95_BUDGET_MS=1500
+CHECK_2_DARWIN_P95_BUDGET_MS=2000
 CHECK_300_MEDIAN_BUDGET_MS=1200
 CHECK_300_DARWIN_MEDIAN_BUDGET_MS=1800
 CHECK_300_P95_BUDGET_MS=3500
@@ -48,6 +52,14 @@ perf_mock_bin=$(_mock_bin)
 cat >"$perf_mock_bin/checkrun" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
+
+if [[ "${1:-}" == "capabilities" && "${2:-}" == "--has" &&
+  "${3:-}" == "autolint-files0-stdin" ]]; then
+  : "${SLEY_PERF_CHECKRUN_CAPABILITY_COUNT_FILE:?}"
+  count=$(cat "$SLEY_PERF_CHECKRUN_CAPABILITY_COUNT_FILE")
+  printf '%s\n' "$((count + 1))" >"$SLEY_PERF_CHECKRUN_CAPABILITY_COUNT_FILE"
+  exit "${SLEY_PERF_CHECKRUN_CAPABILITY_RC:-0}"
+fi
 
 : "${SLEY_PERF_CHECKRUN_COUNT_FILE:?}"
 : "${SLEY_PERF_CHECKRUN_ARGS_PREFIX:?}"
@@ -82,10 +94,43 @@ set -euo pipefail
 count=$(cat "$SLEY_PERF_AUTOLINT_COUNT_FILE")
 count=$((count + 1))
 printf '%s\n' "$count" >"$SLEY_PERF_AUTOLINT_COUNT_FILE"
-printf '%s\n' "$@" >"${SLEY_PERF_AUTOLINT_ARGS_PREFIX}.${count}"
+if [[ "${1:-}" == "--files0-from" && "${2:-}" == "-" ]]; then
+  printf '%s\n' --files0-from >"${SLEY_PERF_AUTOLINT_ARGS_PREFIX}.${count}"
+  while IFS= read -r -d '' file; do
+    printf '%s\n' "$file" >>"${SLEY_PERF_AUTOLINT_ARGS_PREFIX}.${count}"
+  done
+else
+  printf '%s\n' "$@" >"${SLEY_PERF_AUTOLINT_ARGS_PREFIX}.${count}"
+fi
 exit "${SLEY_PERF_AUTOLINT_RC:-0}"
 EOF
-chmod +x "$perf_mock_bin/checkrun" "$perf_mock_bin/autoformat" "$perf_mock_bin/autolint"
+cat >"$perf_mock_bin/getconf" <<'EOF'
+#!/usr/bin/env bash
+case "${1:-}" in
+  ARG_MAX) printf '131072\n' ;;
+  _NPROCESSORS_ONLN) printf '4\n' ;;
+  *) exit 1 ;;
+esac
+EOF
+SLEY_PERF_SYSTEM_ENV=$(command -v env)
+export SLEY_PERF_SYSTEM_ENV
+cat >"$perf_mock_bin/env" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ "${SLEY_PERF_MANY_ENV_ENTRIES:-0}" == "1" ]]; then
+  # Keep the string bytes modest while reproducing the envp pointer pressure
+  # that is otherwise easy to miss when estimating exec's complete payload.
+  for ((i = 0; i < 6004; i++)); do
+    printf 'E%s=x\n' "$i"
+  done
+  exit 0
+fi
+
+exec "$SLEY_PERF_SYSTEM_ENV" "$@"
+EOF
+chmod +x "$perf_mock_bin/checkrun" "$perf_mock_bin/autoformat" \
+  "$perf_mock_bin/autolint" "$perf_mock_bin/getconf" "$perf_mock_bin/env"
 export PATH="$perf_mock_bin:$PATH"
 
 _new_perf_repo() {
@@ -298,6 +343,27 @@ _write_changed_tree() {
   for i in $(seq 1 "$count"); do
     file="$dir/file-$i.js"
     printf 'export const changed%s = %s;\n' "$i" "$i" >>"$file"
+  done
+}
+
+_write_long_changed_tree() {
+  local repo="$1" count="$2" i dir file long_dir long_leaf
+  printf -v long_dir '%0120d' 0
+  printf -v long_leaf '%060d' 0
+  dir="$repo/packages/$long_dir"
+  mkdir -p "$dir"
+  for i in $(seq 1 "$count"); do
+    file="$dir/file-$i-$long_leaf.sh"
+    printf '#!/usr/bin/env bash\nprintf %s before\n' "$i" >"$file"
+  done
+  (
+    cd "$repo" || exit 1
+    git add .
+    git commit -q -m "seed long lint fixture"
+  )
+  for i in $(seq 1 "$count"); do
+    file="$dir/file-$i-$long_leaf.sh"
+    printf 'printf %s after\n' "$i" >>"$file"
   done
 }
 
@@ -591,22 +657,101 @@ _assert_autolint_invocations "hook lint-file perf: measured delegation" \
 echo "=== sley: check performance ==="
 
 repo=$(_new_perf_repo)
-_write_changed_tree "$repo" "$SLEY_PERF_CHANGED_FILES"
+_write_changed_tree "$repo" 2
 autolint_state=$(_tmpdir)
 export SLEY_PERF_AUTOLINT_COUNT_FILE="$autolint_state/count"
 export SLEY_PERF_AUTOLINT_ARGS_PREFIX="$autolint_state/args"
+export SLEY_PERF_CHECKRUN_CAPABILITY_COUNT_FILE="$autolint_state/capability-count"
+export SLEY_PERF_CHECKRUN_CAPABILITY_RC=0
 export SLEY_PERF_AUTOLINT_RC=0
 printf '0\n' >"$SLEY_PERF_AUTOLINT_COUNT_FILE"
+printf '0\n' >"$SLEY_PERF_CHECKRUN_CAPABILITY_COUNT_FILE"
 {
   printf '%s\n' --
   git -C "$repo" diff --name-only
 } >"$autolint_state/expected-args"
 
 _run_perf_sley_timed 10 "$repo" check
-_assert_exit "check perf: 300-file changed tree exits 0" 0 "$__SLEY_RC"
-_assert_autolint_invocations "check perf: one 300-file linter batch" \
+_assert_exit "check perf: ordinary two-file tree exits 0" 0 "$__SLEY_RC"
+_assert_autolint_invocations "check perf: ordinary batch stays direct" \
   1 "$autolint_state/expected-args"
+_assert_file_content "check perf: ordinary batch skips capability process" \
+  0 "$SLEY_PERF_CHECKRUN_CAPABILITY_COUNT_FILE"
 
+printf '0\n' >"$SLEY_PERF_AUTOLINT_COUNT_FILE"
+printf '0\n' >"$SLEY_PERF_CHECKRUN_CAPABILITY_COUNT_FILE"
+_measure_perf_stats "check perf: ordinary two-file tree" 10 "$repo" \
+  "$SLEY_HOOK_PERF_RUNS" check
+check_2_p95="$__PERF_P95"
+check_2_median="$__PERF_MEDIAN"
+check_2_median_budget=$(_perf_budget_ms \
+  "$CHECK_2_MEDIAN_BUDGET_MS" \
+  "$CHECK_2_DARWIN_MEDIAN_BUDGET_MS")
+check_2_p95_budget=$(_perf_budget_ms \
+  "$CHECK_2_P95_BUDGET_MS" \
+  "$CHECK_2_DARWIN_P95_BUDGET_MS")
+echo "  PERF: check 2 files median ${check_2_median}ms / ${check_2_median_budget}ms, p95 ${check_2_p95}ms / ${check_2_p95_budget}ms (runs ${SLEY_HOOK_PERF_RUNS})"
+_assert_ms_le "check perf: ordinary two-file median" \
+  "$check_2_median" "$check_2_median_budget"
+_assert_ms_le "check perf: ordinary two-file p95" \
+  "$check_2_p95" "$check_2_p95_budget"
+_assert_autolint_invocations "check perf: measured ordinary batches stay direct" \
+  "$SLEY_HOOK_PERF_RUNS" "$autolint_state/expected-args"
+_assert_file_content "check perf: measured ordinary batches skip capability" \
+  0 "$SLEY_PERF_CHECKRUN_CAPABILITY_COUNT_FILE"
+
+# A dense environment can exhaust ARG_MAX through its envp pointer table even
+# when its strings and a small file batch fit comfortably. Keep this separate
+# from the large-path fixture so a regression identifies the missing cost.
+export SLEY_PERF_MANY_ENV_ENTRIES=1
+printf '0\n' >"$SLEY_PERF_AUTOLINT_COUNT_FILE"
+printf '0\n' >"$SLEY_PERF_CHECKRUN_CAPABILITY_COUNT_FILE"
+{
+  printf '%s\n' --files0-from
+  git -C "$repo" diff --name-only
+} >"$autolint_state/expected-args"
+_run_perf_sley_timed 10 "$repo" check
+_assert_exit "check perf: dense environment exits 0" 0 "$__SLEY_RC"
+_assert_autolint_invocations \
+  "check perf: dense environment uses bounded stdin" \
+  1 "$autolint_state/expected-args"
+_assert_file_content "check perf: dense environment probes capability once" \
+  1 "$SLEY_PERF_CHECKRUN_CAPABILITY_COUNT_FILE"
+unset SLEY_PERF_MANY_ENV_ENTRIES
+
+repo=$(_new_perf_repo)
+_write_long_changed_tree "$repo" "$SLEY_PERF_CHANGED_FILES"
+autolint_state=$(_tmpdir)
+export SLEY_PERF_AUTOLINT_COUNT_FILE="$autolint_state/count"
+export SLEY_PERF_AUTOLINT_ARGS_PREFIX="$autolint_state/args"
+export SLEY_PERF_CHECKRUN_CAPABILITY_COUNT_FILE="$autolint_state/capability-count"
+printf -v SLEY_PERF_ARGMAX_PADDING '%066000d' 0
+export SLEY_PERF_ARGMAX_PADDING
+printf '0\n' >"$SLEY_PERF_AUTOLINT_COUNT_FILE"
+printf '0\n' >"$SLEY_PERF_CHECKRUN_CAPABILITY_COUNT_FILE"
+{
+  printf '%s\n' --files0-from
+  git -C "$repo" diff --name-only
+} >"$autolint_state/expected-args"
+
+_run_perf_sley_timed 10 "$repo" check
+_assert_exit "check perf: ARG_MAX-constrained tree exits 0" 0 "$__SLEY_RC"
+_assert_autolint_invocations "check perf: bounded stdin preserves 300 paths" \
+  1 "$autolint_state/expected-args"
+_assert_file_content "check perf: bounded batch probes capability once" \
+  1 "$SLEY_PERF_CHECKRUN_CAPABILITY_COUNT_FILE"
+
+export SLEY_PERF_AUTOLINT_RC=7
+printf '0\n' >"$SLEY_PERF_AUTOLINT_COUNT_FILE"
+printf '0\n' >"$SLEY_PERF_CHECKRUN_CAPABILITY_COUNT_FILE"
+_run_perf_sley_timed 10 "$repo" check
+_assert_exit "check perf: failing bounded linter batch exits 1" 1 "$__SLEY_RC"
+_assert_file_content "check perf: failing bounded batch probes once" \
+  1 "$SLEY_PERF_CHECKRUN_CAPABILITY_COUNT_FILE"
+
+export SLEY_PERF_AUTOLINT_RC=0
+printf '0\n' >"$SLEY_PERF_AUTOLINT_COUNT_FILE"
+printf '0\n' >"$SLEY_PERF_CHECKRUN_CAPABILITY_COUNT_FILE"
 _measure_perf_stats "check perf: 300-file changed tree" 10 "$repo" \
   "$SLEY_HOOK_PERF_RUNS" check
 check_300_p95="$__PERF_P95"
@@ -623,7 +768,10 @@ _assert_ms_le "check perf: 300-file median" \
 _assert_ms_le "check perf: 300-file p95" \
   "$check_300_p95" "$check_300_p95_budget"
 _assert_autolint_invocations "check perf: measured 300-file batches" \
-  "$((SLEY_HOOK_PERF_RUNS + 1))" "$autolint_state/expected-args"
+  "$SLEY_HOOK_PERF_RUNS" "$autolint_state/expected-args"
+_assert_file_content "check perf: measured batches probe once each" \
+  "$SLEY_HOOK_PERF_RUNS" "$SLEY_PERF_CHECKRUN_CAPABILITY_COUNT_FILE"
+unset SLEY_PERF_ARGMAX_PADDING
 
 echo "=== sley: fix performance ==="
 

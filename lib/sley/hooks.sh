@@ -61,12 +61,156 @@ _sley_hook_format() {
   _sley_hook_run_batch autoformat "$1" 2>/dev/null || true
 }
 
+_sley_hook_lint_needs_bounded_input() {
+  local LC_ALL=C files_text="$1" file arg_max
+  local count=0 path_bytes=0 environment_bytes environment_pointer_bytes
+  local required_bytes pipeline_status preflight_status
+
+  while IFS= read -r file; do
+    [[ -n "$file" ]] || continue
+    count=$((count + 1))
+    path_bytes=$((path_bytes + ${#file} + 1))
+  done <<<"$files_text"
+
+  # Preserve the established one-file hot path. A valid filesystem path is
+  # itself bounded by the host, so it cannot create the aggregate-argv growth
+  # this guard is intended to contain.
+  [[ "$count" -le 1 ]] && return 1
+
+  if arg_max=$(command getconf ARG_MAX 2>/dev/null); then
+    preflight_status=0
+  else
+    preflight_status=$?
+  fi
+  # Missing or unsupported getconf has a safe conservative fallback. A signal
+  # is different: preserve cancellation instead of continuing into lint work
+  # after the caller already asked this operation to stop.
+  if [[ "$preflight_status" -ge 128 ]]; then
+    return "$preflight_status"
+  elif [[ "$preflight_status" -ne 0 ]]; then
+    arg_max=131072
+  fi
+  case "$arg_max" in
+    '' | *[!0-9]* | 0) arg_max=131072 ;;
+  esac
+
+  # `env` emits one newline in place of each entry's terminating NUL, so its
+  # byte count matches exec's string payload even when values contain newlines.
+  # Keep the raw environment out of a shell variable: besides wasting memory,
+  # Bash would expose every value when a caller enables xtrace. If either side
+  # of the count pipeline fails, choose bounded input rather than risk E2BIG.
+  if environment_bytes=$(
+    command env | command wc -c
+    pipeline_status=("${PIPESTATUS[@]}")
+    if [[ "${pipeline_status[0]:-1}" -ge 128 ]]; then
+      exit "${pipeline_status[0]}"
+    elif [[ "${pipeline_status[1]:-1}" -ge 128 ]]; then
+      exit "${pipeline_status[1]}"
+    elif [[ "${pipeline_status[0]:-1}" -ne 0 ||
+      "${pipeline_status[1]:-1}" -ne 0 ]]; then
+      exit 2
+    fi
+  ); then
+    preflight_status=0
+  else
+    preflight_status=$?
+  fi
+  if [[ "$preflight_status" -ge 128 ]]; then
+    return "$preflight_status"
+  elif [[ "$preflight_status" -ne 0 ]]; then
+    # A non-signal measurement failure leaves the exact size unknown. Prefer
+    # bounded transport, which remains correct for both small and large input.
+    return 0
+  fi
+  environment_bytes=${environment_bytes//[[:space:]]/}
+  case "$environment_bytes" in
+    '' | *[!0-9]*) return 0 ;;
+  esac
+
+  # Exec also charges the envp pointer table. Counting it exactly would require
+  # reparsing output that may contain newlines inside values, so derive a safe
+  # upper bound instead: every valid environment record occupies at least
+  # three bytes (`A=\0`). Eight bytes per possible record covers pointers on
+  # the supported 64-bit hosts and intentionally overestimates 32-bit hosts.
+  environment_pointer_bytes=$(((((environment_bytes + 2) / 3) + 1) * 8))
+
+  # The reserve covers executable/interpreter arguments, auxiliary vectors,
+  # alignment, and platform-specific accounting. Sixteen bytes per path
+  # conservatively covers its argv pointer plus alignment on 64-bit hosts.
+  required_bytes=$((environment_bytes + environment_pointer_bytes + \
+    path_bytes + (count + 4) * 16 + 32768))
+  [[ "$required_bytes" -ge "$arg_max" ]]
+}
+
+_sley_hook_lint_bounded() {
+  local files_text="$1" file capability_status
+  local -a pipeline_status=()
+
+  # This exit-status-only contract lets old Checkrun installations fail closed
+  # without parsing help prose. The capability also promises stdin transport,
+  # which avoids an interruptible Sley temp-file lifecycle entirely.
+  if command checkrun capabilities --has autolint-files0-stdin \
+    >/dev/null 2>&1; then
+    capability_status=0
+  else
+    capability_status=$?
+  fi
+  case "$capability_status" in
+    0) ;;
+    1 | 2)
+      echo "sley: installed Checkrun does not support bounded autolint stdin; update Checkrun before linting this file set" >&2
+      return 2
+      ;;
+    *)
+      if [[ "$capability_status" -ge 128 ]]; then
+        # Preserve conventional signal statuses so cancellation remains
+        # visible even when it arrives during negotiation rather than backend
+        # execution.
+        return "$capability_status"
+      fi
+      echo "sley: Checkrun bounded-input capability probe failed with status $capability_status" >&2
+      return 2
+      ;;
+  esac
+
+  while IFS= read -r file; do
+    [[ -n "$file" ]] || continue
+    printf '%s\0' "$file" || exit 2
+  done <<<"$files_text" | autolint --files0-from -
+  pipeline_status=("${PIPESTATUS[@]}")
+
+  # Autolint owns lint findings, structural errors, and signal statuses. Only
+  # replace a clean scanner status when the producer itself could not deliver
+  # the complete NUL stream.
+  if [[ "${pipeline_status[1]:-2}" -ne 0 ]]; then
+    return "${pipeline_status[1]}"
+  fi
+  if [[ "${pipeline_status[0]:-2}" -ne 0 ]]; then
+    echo "sley: could not stream the complete file list to autolint" >&2
+    return 2
+  fi
+  return 0
+}
+
 _sley_hook_lint() {
+  local sizing_status
   command -v autolint >/dev/null 2>&1 || return 2
   # Let autolint's stderr pass through. `sley check` is a human-facing read-
   # only command and must surface the diagnostics that explain a non-zero exit;
   # hook callers can wrap their own redirection if they want quieter output.
-  _sley_hook_run_batch autolint "$1"
+  # Keep ordinary batches on the established direct path. Larger path sets use
+  # bounded transport only when the complete inherited exec payload would
+  # approach the current host's limit.
+  if _sley_hook_lint_needs_bounded_input "$1"; then
+    sizing_status=0
+  else
+    sizing_status=$?
+  fi
+  case "$sizing_status" in
+    0) _sley_hook_lint_bounded "$1" ;;
+    1) _sley_hook_run_batch autolint "$1" ;;
+    *) return "$sizing_status" ;;
+  esac
 }
 
 _sley_hook_validate() { :; }
