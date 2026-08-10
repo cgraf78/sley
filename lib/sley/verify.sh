@@ -461,7 +461,11 @@ _sley_verify_registry_commands() {
             {
               "command": (.cmd // .command // ""),
               "kind": (.kind // "test"),
-              "required": (.required // true),
+              # The jq alternative operator treats both null and false as
+              # absent. Test the key explicitly so a consumer can opt a
+              # command out of required execution without changing the
+              # default for an omitted field.
+              "required": (if has("required") then .required else true end),
               "tier": (.tier // "fast")
             }
             + (if ((.cache // null) | type) == "object" then {"cache": .cache} else {} end)
