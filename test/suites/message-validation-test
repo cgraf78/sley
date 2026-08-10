@@ -1,0 +1,294 @@
+#!/usr/bin/env bash
+# message-validation-test — SCM-neutral commit-message provider contracts.
+
+set -uo pipefail
+export NO_COLOR=1
+
+SLEY_TEST_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
+SLEY_REPO_ROOT="$(cd -- "$SLEY_TEST_DIR/.." && pwd -P)"
+
+# shellcheck source=../helpers.sh
+. "$SLEY_TEST_DIR/helpers.sh"
+
+SLEY="$SLEY_REPO_ROOT/bin/sley"
+
+_run_validation() {
+  __SLEY_OUT=$("$SLEY" hook validate-message "$@" 2>&1)
+  __SLEY_RC=$?
+}
+
+_run_validation_stdin() {
+  local message="$1"
+  shift
+  __SLEY_OUT=$(printf '%s\n' "$message" | "$SLEY" hook validate-message "$@" 2>&1)
+  __SLEY_RC=$?
+}
+
+echo "=== sley message validation provider selection ==="
+
+_run_validation_stdin "unchecked message"
+_assert_exit "no provider: skips validation" 0 "$__SLEY_RC"
+_assert_eq "no provider: emits no diagnostics" "" "$__SLEY_OUT"
+
+_run_validation_stdin "message" --template ""
+_assert_exit "provider selection: empty template path is rejected" 2 "$__SLEY_RC"
+_assert_contains "provider selection: empty template path is actionable" \
+  "requires a path after --template" "$__SLEY_OUT"
+
+_run_validation_stdin "message" --validator ""
+_assert_exit "provider selection: empty validator path is rejected" 2 "$__SLEY_RC"
+_assert_contains "provider selection: empty validator path is actionable" \
+  "requires a path after --validator" "$__SLEY_OUT"
+
+template=$(_tmpdir)/message-template.txt
+validator_dir="$(_tmpdir)/validator fixture"
+validator="$validator_dir/message validator"
+mkdir -p "$validator_dir"
+cat >"$template" <<'EOF'
+## Summary
+
+## Testing
+EOF
+cat >"$validator" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+chmod +x "$validator"
+
+_run_validation_stdin "message" --validator "$validator" --message-file ""
+_assert_exit "message source: empty explicit path is rejected" 2 "$__SLEY_RC"
+_assert_contains "message source: empty explicit path is actionable" \
+  "requires a path after --message-file" "$__SLEY_OUT"
+
+_run_validation_stdin "message" --template "$template" --validator "$validator"
+_assert_exit "provider selection: template and validator are mutually exclusive" 2 "$__SLEY_RC"
+_assert_contains "provider selection: conflict is actionable" \
+  "accepts only one of --template or --validator" "$__SLEY_OUT"
+
+_run_validation_stdin "message" --template /missing/message-template
+_assert_exit "template provider: missing template is a configuration error" 2 "$__SLEY_RC"
+_assert_contains "template provider: missing path is named" \
+  "/missing/message-template" "$__SLEY_OUT"
+
+malformed_template=$(_tmpdir)/malformed-template.txt
+cat >"$malformed_template" <<'EOF'
+# Explain the desired message here, but define no structural headings.
+EOF
+_run_validation_stdin "message" --template "$malformed_template"
+_assert_exit "template provider: no headings is malformed" 2 "$__SLEY_RC"
+_assert_contains "template provider: malformed template explains the requirement" \
+  "defines no required sections" "$__SLEY_OUT"
+
+empty_template=$(_tmpdir)/empty-template.txt
+: >"$empty_template"
+_run_validation_stdin $'message\n\n## Summary\n\ncontent' --template "$empty_template"
+_assert_exit "template provider: empty template is malformed" 2 "$__SLEY_RC"
+_assert_contains "template provider: empty template explains the requirement" \
+  "defines no required sections" "$__SLEY_OUT"
+
+_run_validation_stdin "message" --validator /missing/message-validator
+_assert_exit "executable provider: missing validator is a configuration error" 2 "$__SLEY_RC"
+_assert_contains "executable provider: missing path is named" \
+  "/missing/message-validator" "$__SLEY_OUT"
+
+# A bare relative path is still a path, not a command name. In particular, a
+# checked file named after a shell builtin must not be replaced by that builtin
+# when Sley invokes the provider.
+relative_provider_dir=$(_tmpdir)
+relative_provider_log="$relative_provider_dir/provider.log"
+printf '%s\n' "message for relative provider" >"$relative_provider_dir/message"
+cat >"$relative_provider_dir/true" <<'EOF'
+#!/usr/bin/env bash
+printf 'local provider ran\n' >"$SLEY_TEST_RELATIVE_PROVIDER_LOG"
+exit 7
+EOF
+chmod +x "$relative_provider_dir/true"
+__SLEY_OUT=$(
+  cd "$relative_provider_dir" || exit 1
+  SLEY_TEST_RELATIVE_PROVIDER_LOG="$relative_provider_log" \
+    "$SLEY" hook validate-message --validator true --message-file message 2>&1
+)
+__SLEY_RC=$?
+_assert_exit "executable provider: bare relative path cannot collide with a builtin" \
+  7 "$__SLEY_RC"
+_assert_file_content "executable provider: invokes the checked relative file" \
+  "local provider ran" "$relative_provider_log"
+
+echo "=== sley template message validation ==="
+
+message=$(_tmpdir)/message.txt
+cat >"$message" <<'EOF'
+Add a portable commit-message validator
+
+## summary
+
+- keep the contract independent of the calling SCM
+
+## Extra Notes
+
+- additional sections remain valid
+
+## TESTING
+
+- run the focused suite
+EOF
+_run_validation --template "$template" --message-file "$message"
+_assert_exit "template provider: accepts title and populated required sections" 0 "$__SLEY_RC"
+_assert_eq "template provider: valid message is quiet" "" "$__SLEY_OUT"
+
+# Awk treats bare operands shaped like NAME=value as variable assignments.
+# They are valid filesystem names, so keep template/message paths opaque.
+assignment_path_dir=$(_tmpdir)
+cat >"$assignment_path_dir/template=policy" <<'EOF'
+## Summary
+
+## Testing
+EOF
+cat >"$assignment_path_dir/message=proposal" <<'EOF'
+Keep unusual paths opaque
+
+## Summary
+
+- preserve the selected files
+
+## Testing
+
+- run the focused suite
+EOF
+__SLEY_OUT=$(
+  cd "$assignment_path_dir" || exit 1
+  "$SLEY" hook validate-message \
+    --template template=policy --message-file message=proposal 2>&1
+)
+__SLEY_RC=$?
+_assert_exit "template provider: assignment-shaped relative paths remain files" \
+  0 "$__SLEY_RC"
+_assert_eq "template provider: assignment-shaped paths stay quiet" "" "$__SLEY_OUT"
+
+colon_template=$(_tmpdir)/colon-template.txt
+colon_message=$(_tmpdir)/colon-message.txt
+cat >"$colon_template" <<'EOF'
+Summary:
+
+Testing:
+EOF
+cat >"$colon_message" <<'EOF'
+Keep colon-style sections isolated
+
+Summary:
+
+Notes:
+
+This belongs only to Notes.
+
+Testing: focused suite
+EOF
+_run_validation --template "$colon_template" --message-file "$colon_message"
+_assert_exit "template provider: extra colon section ends required content" \
+  1 "$__SLEY_RC"
+_assert_contains "template provider: extra colon section leaves Summary empty" \
+  "'Summary' section is empty" "$__SLEY_OUT"
+
+cat >"$message" <<'EOF'
+## Summary
+
+- no title precedes the first section
+
+## Testing
+
+- run the focused suite
+EOF
+_run_validation --template "$template" --message-file "$message"
+_assert_exit "template provider: missing title is rejected" 1 "$__SLEY_RC"
+_assert_contains "template provider: missing title is reported" \
+  "commit message has no title" "$__SLEY_OUT"
+
+cat >"$message" <<'EOF'
+Omit a required section
+
+## Testing
+
+- run the focused suite
+EOF
+_run_validation --template "$template" --message-file "$message"
+_assert_exit "template provider: missing required section is rejected" 1 "$__SLEY_RC"
+_assert_contains "template provider: missing section is named" \
+  "missing 'Summary' section" "$__SLEY_OUT"
+
+cat >"$message" <<'EOF'
+Leave a required section empty
+
+## Summary
+
+# This Git template instruction is not message content.
+
+## Testing
+
+- run the focused suite
+EOF
+_run_validation --template "$template" --message-file "$message"
+_assert_exit "template provider: comment-only section is empty" 1 "$__SLEY_RC"
+_assert_contains "template provider: empty section is named" \
+  "'Summary' section is empty" "$__SLEY_OUT"
+
+colon_template=$(_tmpdir)/colon-template.txt
+cat >"$colon_template" <<'EOF'
+Summary:
+
+Testing:
+EOF
+cat >"$message" <<'EOF'
+Support compact commit messages
+
+testing: focused suite passed
+Summary: implemented the provider contract
+EOF
+_run_validation --template "$colon_template" --message-file "$message"
+_assert_exit "template provider: accepts case-insensitive inline sections" 0 "$__SLEY_RC"
+
+_run_validation --template "$template" --message-file /missing/commit-message
+_assert_exit "message source: explicit missing file is an error" 2 "$__SLEY_RC"
+_assert_contains "message source: missing file is named" \
+  "/missing/commit-message" "$__SLEY_OUT"
+
+echo "=== sley executable message validation ==="
+
+validator_log=$(_tmpdir)/validator.log
+cat >"$validator" <<'EOF'
+#!/usr/bin/env bash
+parent=${1%/*}
+mode=$(stat -c %a "$parent" 2>/dev/null || stat -f %Lp "$parent")
+{
+  printf 'argc=%s\n' "$#"
+  printf 'path=%s\n' "$1"
+  printf 'parent-mode=%s\n' "$mode"
+  printf '%s\n' '--- message ---'
+  cat "$1"
+} >"$SLEY_TEST_VALIDATOR_LOG"
+exit "${SLEY_TEST_VALIDATOR_RC:-0}"
+EOF
+chmod +x "$validator"
+
+spaced_message="$(_tmpdir)/commit message.txt"
+printf '%s\n' "message from an existing file" >"$spaced_message"
+SLEY_TEST_VALIDATOR_LOG="$validator_log" SLEY_TEST_VALIDATOR_RC=7 \
+  _run_validation --validator "$validator" --message-file "$spaced_message"
+_assert_exit "executable provider: preserves validator status" 7 "$__SLEY_RC"
+_assert_contains "executable provider: receives exactly one argument" \
+  "argc=1" "$(cat "$validator_log")"
+_assert_contains "executable provider: receives the exact existing path" \
+  "path=$spaced_message" "$(cat "$validator_log")"
+_assert_contains "executable provider: receives the original message" \
+  "message from an existing file" "$(cat "$validator_log")"
+
+SLEY_TEST_VALIDATOR_LOG="$validator_log" SLEY_TEST_VALIDATOR_RC=0 \
+  _run_validation_stdin "message staged from stdin" --validator "$validator"
+_assert_exit "executable provider stdin: succeeds" 0 "$__SLEY_RC"
+staged_path=$(sed -n 's/^path=//p' "$validator_log")
+_assert_contains "executable provider stdin: stages exact content" \
+  "message staged from stdin" "$(cat "$validator_log")"
+_assert_contains "executable provider stdin: uses a private staging directory" \
+  "parent-mode=700" "$(cat "$validator_log")"
+_assert_file_missing "executable provider stdin: removes the staged message" "$staged_path"
+
+_test_summary

@@ -10,16 +10,49 @@ override documented below.
 
 ## Git
 
-`git/` provides `pre-commit`, `pre-merge-commit`, `pre-applypatch`, and
-`prepare-commit-msg` entry points. The first three always delegate to
-`sley-commit-gate`; `prepare-commit-msg` delegates only for sequencer commits
-that bypass the ordinary pre-commit hooks.
+`git/` provides `pre-commit`, `pre-merge-commit`, `pre-applypatch`,
+`prepare-commit-msg`, and `commit-msg` entry points. The first three always
+delegate to `sley-commit-gate`; `prepare-commit-msg` delegates only for
+sequencer commits that bypass the ordinary pre-commit hooks. `commit-msg`
+passes the finalized message through Sley's optional structural validator and
+then through `sley secrets --message-file`, preserving either blocking result.
 
 Set `SLEY_GIT_COMMIT_GATE` to an executable path when a consumer needs to wrap
 the final gate with host policy. This is intentionally a gate override, not a
 general shell-command string: the hook executes the path directly and never
 evaluates it as shell syntax. Dotfiles uses the override to scope its special
 bare-`$HOME` repository without forking Sley's generic behavior.
+
+### Commit-message providers
+
+The `commit-msg` launcher accepts one optional consumer-owned provider:
+
+- `SLEY_COMMIT_MESSAGE_TEMPLATE` names a readable Git-compatible plaintext
+  template. Markdown headings from `##` through `######`, and labels ending in
+  `:`, declare required nonempty sections. Section matching is
+  case-insensitive, additional sections are allowed, and exactly one leading
+  `#` marks editor guidance rather than content. This intentionally small
+  format does not encode title lengths, regular expressions, conditionals, or
+  organization policy.
+- `SLEY_COMMIT_MESSAGE_VALIDATOR` names an executable for advanced validation.
+  Sley invokes it directly with exactly one commit-message file path, passes
+  stdout and stderr through, and preserves its exit status. The value is an
+  executable path, not a shell command string.
+
+With neither provider, structural validation is a quiet no-op and the secret
+scan still runs. Configuring both providers is an error. The same provider
+contract is available without the Git launcher through:
+
+```bash
+sley hook validate-message --template /path/to/template --message-file /path/to/message
+sley hook validate-message --validator /path/to/executable --message-file /path/to/message
+printf '%s\n' "$message" | sley hook validate-message --validator /path/to/executable
+```
+
+When stdin is used, Sley stages it in a private temporary directory, removes
+the staging file before returning, and leaves the caller's umask and traps
+unchanged. This makes the operation usable by Sapling and future SCM adapters
+without making Sley's core Git-specific.
 
 ## Sapling
 

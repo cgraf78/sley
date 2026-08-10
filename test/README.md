@@ -17,6 +17,11 @@ behavior shipped under `share/sley/hooks/`. Consumer repositories should keep
 only activation and genuinely local policy tests instead of duplicating this
 suite.
 
+`test/suites/message-validation-test` owns the SCM-neutral template and
+executable-provider contracts, including private stdin staging and cleanup.
+Consumer tests should characterize their own policy executable separately and
+use cross-repository tests only to prove that activation selects it correctly.
+
 The real Sley-to-Checkrun cancellation boundary is an explicit cross-repository
 test. Point it at a Checkrun checkout without making ordinary Sley CI depend on
 that checkout:

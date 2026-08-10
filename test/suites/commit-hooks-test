@@ -11,6 +11,7 @@ SLEY_REPO_ROOT="$(cd -- "$SLEY_TEST_DIR/.." && pwd -P)"
 . "$SLEY_TEST_DIR/helpers.sh"
 
 git_hooks="$SLEY_REPO_ROOT/share/sley/hooks/git"
+git_message_hook="$git_hooks/commit-msg"
 sapling_gate="$SLEY_REPO_ROOT/share/sley/hooks/sapling/sley-commit-gate"
 mock_bin=$(_mock_bin)
 sley_log=$(_tmpdir)/sley.log
@@ -20,7 +21,11 @@ git_log=$(_tmpdir)/git.log
 cat >"$mock_bin/sley" <<'EOF'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >>"$SLEY_TEST_LOG"
-exit "${SLEY_TEST_RC:-0}"
+case "${1:-}" in
+  hook) exit "${SLEY_TEST_VALIDATE_RC:-${SLEY_TEST_RC:-0}}" ;;
+  secrets) exit "${SLEY_TEST_SECRETS_RC:-${SLEY_TEST_RC:-0}}" ;;
+  *) exit "${SLEY_TEST_RC:-0}" ;;
+esac
 EOF
 cat >"$mock_bin/git" <<'EOF'
 #!/usr/bin/env bash
@@ -133,6 +138,64 @@ SLEY_TEST_HOOK_NAME="prepare-commit-msg" \
   "$git_hooks/prepare-commit-msg" "$message"
 _assert_file_content "prepare hook: generated reverts run readiness" \
   "prepare-commit-msg:" "$gate_log"
+
+echo "=== sley: generic Git commit-message hook ==="
+
+message_validator="/consumer policy/validate-message"
+message_template="/consumer policy/commit-template"
+printf '%s\n' "commit message" >"$message"
+: >"$sley_log"
+SLEY_TEST_LOG="$sley_log" \
+  SLEY_COMMIT_MESSAGE_VALIDATOR="$message_validator" \
+  PATH="$mock_bin:$PATH" \
+  "$git_message_hook" "$message"
+_assert_file_content "commit-msg hook: validates and scans through Sley" \
+  "$(printf '%s\n' \
+    "hook validate-message --validator $message_validator --message-file $message" \
+    "secrets --message-file $message")" "$sley_log"
+
+: >"$sley_log"
+SLEY_TEST_LOG="$sley_log" \
+  SLEY_COMMIT_MESSAGE_TEMPLATE="$message_template" \
+  PATH="$mock_bin:$PATH" \
+  "$git_message_hook" "$message"
+_assert_file_content "commit-msg hook: forwards the optional template provider" \
+  "$(printf '%s\n' \
+    "hook validate-message --template $message_template --message-file $message" \
+    "secrets --message-file $message")" "$sley_log"
+
+: >"$sley_log"
+SLEY_TEST_LOG="$sley_log" PATH="$mock_bin:$PATH" \
+  "$git_message_hook" "$message"
+_assert_file_content "commit-msg hook: no provider skips structure but keeps secrets" \
+  "$(printf '%s\n' \
+    "hook validate-message --message-file $message" \
+    "secrets --message-file $message")" "$sley_log"
+
+: >"$sley_log"
+rc=0
+SLEY_TEST_LOG="$sley_log" SLEY_TEST_VALIDATE_RC=7 SLEY_TEST_SECRETS_RC=0 \
+  SLEY_COMMIT_MESSAGE_VALIDATOR="$message_validator" \
+  PATH="$mock_bin:$PATH" \
+  "$git_message_hook" "$message" >/dev/null 2>&1 || rc=$?
+_assert_exit "commit-msg hook: clean secrets preserve validator status" 7 "$rc"
+_assert_file_content "commit-msg hook: validation failure does not skip secrets" \
+  "$(printf '%s\n' \
+    "hook validate-message --validator $message_validator --message-file $message" \
+    "secrets --message-file $message")" "$sley_log"
+
+rc=0
+SLEY_TEST_LOG="$sley_log" SLEY_TEST_VALIDATE_RC=0 SLEY_TEST_SECRETS_RC=1 \
+  SLEY_COMMIT_MESSAGE_VALIDATOR="$message_validator" \
+  PATH="$mock_bin:$PATH" \
+  "$git_message_hook" "$message" >/dev/null 2>&1 || rc=$?
+_assert_exit "commit-msg hook: secret finding blocks" 1 "$rc"
+
+rc=0
+commit_message_missing_output=$(PATH="$missing_bin" "$git_message_hook" "$message" 2>&1) || rc=$?
+_assert_exit "commit-msg hook: missing Sley fails closed" 1 "$rc"
+_assert_contains "commit-msg hook: missing Sley explains the requirement" \
+  "sley not found on PATH" "$commit_message_missing_output"
 
 echo "=== sley: generic Sapling commit hook ==="
 

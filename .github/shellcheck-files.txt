@@ -9,6 +9,7 @@ program	lib/sley/verify.sh
 program	share/sley/hooks/git/pre-applypatch
 program	share/sley/hooks/git/pre-commit
 program	share/sley/hooks/git/pre-merge-commit
+program	share/sley/hooks/git/commit-msg
 program	share/sley/hooks/git/prepare-commit-msg
 program	share/sley/hooks/git/sley-commit-gate
 program	share/sley/hooks/sapling/sley-commit-gate
@@ -18,6 +19,7 @@ program	test/sley-test
 program	test/suites/checkrun-cancellation-integration-test
 program	test/suites/commit-hooks-test
 program	test/suites/manpage-test
+program	test/suites/message-validation-test
 program	test/suites/nvim-test
 program	test/suites/ready-cancellation-test
 program	test/suites/secrets-cancellation-test

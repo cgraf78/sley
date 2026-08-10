@@ -18,6 +18,7 @@ runtime_shell_files=(
   "$root/share/sley/hooks/git/pre-applypatch"
   "$root/share/sley/hooks/git/pre-commit"
   "$root/share/sley/hooks/git/pre-merge-commit"
+  "$root/share/sley/hooks/git/commit-msg"
   "$root/share/sley/hooks/git/prepare-commit-msg"
   "$root/share/sley/hooks/git/sley-commit-gate"
   "$root/share/sley/hooks/sapling/sley-commit-gate"
