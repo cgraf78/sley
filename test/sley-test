@@ -73,6 +73,7 @@ check_runtime_shell_inventory
 if [[ "${SLEY_SKIP_SHELLCHECK:-0}" != 1 ]]; then
   shellcheck -x -P SCRIPTDIR \
     "${runtime_shell_files[@]}" \
+    "$root/install.sh" \
     "$test_dir/sley-test" \
     "$test_dir/helpers.sh" \
     "$test_dir"/suites/*-test

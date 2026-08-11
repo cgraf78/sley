@@ -7,6 +7,10 @@ Use fake commands and temporary repositories for verification tests so the suite
 does not depend on globally installed tools or the caller's workspace state.
 When touching Neovim integration, update `test/suites/nvim-test`.
 
+`test/suites/install-test` covers the standalone checkout-backed command and
+manpage links, idempotent retargeting, custom destinations, complete source
+preflight, and refusal to overwrite user-owned paths.
+
 When touching the deployable VS Code integration, update
 `test/suites/vscode-test`. That suite validates both the versioned package
 contract consumed through shdeps and the extension's formatting, diagnostics,
