@@ -9,6 +9,7 @@ program	lib/sley/repo.sh
 program	lib/sley/scope.sh
 program	lib/sley/sley.sh
 program	lib/sley/verify.sh
+program	scripts/checkout-installer.conf
 program	share/sley/hooks/git/pre-applypatch
 program	share/sley/hooks/git/pre-commit
 program	share/sley/hooks/git/pre-merge-commit
@@ -17,6 +18,7 @@ program	share/sley/hooks/git/prepare-commit-msg
 program	share/sley/hooks/git/sley-commit-gate
 program	share/sley/hooks/sapling/sley-commit-gate
 program	share/sley/shell.sh
+program	support/install-checkout.sh
 program	test/helpers.sh
 program	test/sley-test
 program	test/suites/checkrun-cancellation-integration-test

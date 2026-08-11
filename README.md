@@ -20,20 +20,36 @@ and links the bundled `man/man1/` page into the user-local manpath. The entry
 point is self-contained and resolves its dependency libraries through that
 symlink.
 
-## Install from a checkout
+## Installation
 
-Keep the checkout at a stable path and run:
+Install with a checkout-backed curl bootstrap:
 
 ```bash
-./install.sh
+curl -fsSL https://raw.githubusercontent.com/cgraf78/sley/main/install.sh | bash
 ```
 
-The installer creates a checkout-backed `sley` command symlink under
-`$HOME/.local/bin` and a manual-page symlink under
+This keeps a durable managed checkout under `$XDG_DATA_HOME` when that path is
+absolute, or under `$HOME/.local/share` otherwise, and publishes its command
+and manual-page links. It does not use a release asset or copy a second runtime
+tree. Git and Bash 4 or newer are required; the supported Bash must be the first
+`bash` on `PATH`.
+
+To choose and manage the checkout yourself instead:
+
+```bash
+git clone https://github.com/cgraf78/sley.git
+cd sley
+bash install.sh
+```
+
+Keep that checkout in place. The installer creates a `sley` command symlink
+under `$HOME/.local/bin` and a manual-page symlink under
 `$HOME/.local/share/man/man1`. Set `PREFIX` to relocate both trees, or set
-`BIN_DIR` and `MAN_DIR` independently. Re-running the installer is safe and
-retargets existing symlinks, but it refuses to replace a non-symlink path.
-Moving or deleting the checkout breaks the installed links.
+`BIN_DIR` and `MAN_DIR` independently. Re-running either installation path is
+safe and retargets existing symlinks, but it refuses to replace a non-symlink
+path. Rerunning the curl command first safely fast-forwards its clean managed
+checkout. Moving or deleting a manually managed checkout breaks its installed
+links.
 
 The command resolves `lib/sley/` from the checkout. The installer leaves that
 library and `share/sley/` checkout-owned and creates no completion tree. Sley's
