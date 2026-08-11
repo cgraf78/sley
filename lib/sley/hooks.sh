@@ -519,6 +519,271 @@ _sley_xdg_dir() {
   printf -v "$output_name" '%s' "$resolved"
 }
 
+_sley_lint_ignore_dir() {
+  local output_name="$1" path_value root="${XDG_CONFIG_HOME:-}"
+
+  if [[ -n "${SLEY_LINT_IGNORE_DIR:-}" ]]; then
+    path_value="$SLEY_LINT_IGNORE_DIR"
+  elif [[ -n "$root" && "$root" == /* ]]; then
+    path_value="$root/sley/lint-ignore.d"
+  elif [[ -n "${HOME:-}" ]]; then
+    path_value="$HOME/.config/sley/lint-ignore.d"
+  else
+    # This directory is optional policy. A process with no usable config root
+    # must retain full lint coverage rather than fail or silently skip files.
+    return 1
+  fi
+
+  printf -v "$output_name" '%s' "$path_value"
+}
+
+_sley_lint_ignore_discover_configs() {
+  local ignore_dir="$1"
+
+  # Sley's library is sourced by shells it does not own. Use a function-local
+  # GLOBIGNORE so a caller cannot suppress policy discovery, then let Bash
+  # restore the caller's exact value and attributes when this helper returns.
+  # The parent restores the shell and shopt flags *after* that return because
+  # Bash may change dotglob while the special GLOBIGNORE variable is scoped.
+  # Assign explicitly because Bash's localvar_inherit option would otherwise
+  # copy the caller's value into the local and defeat the isolation.
+  local GLOBIGNORE="" 2>/dev/null || return 1
+  set +f
+  shopt -u failglob nocaseglob dotglob
+  shopt -s nullglob
+  configs=("$ignore_dir"/*.paths)
+}
+
+_sley_lint_ignore_load() {
+  # Populate the caller's dynamically scoped `_SLEY_LINT_IGNORE_PREFIXES`
+  # array. Keeping policy as literal path data makes this safe to source from
+  # user-managed dotfiles: no entry is evaluated as shell, a glob, or a regex.
+  local ignore_dir config entry normalized line_number
+  local had_noglob=0
+  local had_nullglob=0 had_failglob=0 had_nocaseglob=0 had_dotglob=0
+  local LC_ALL=C
+  local -a configs=()
+  _SLEY_LINT_IGNORE_PREFIXES=()
+
+  case "${SLEY_LINT_IGNORE:-1}" in
+    0 | false | no) return 0 ;;
+  esac
+
+  _sley_lint_ignore_dir ignore_dir || return 0
+  [[ -d "$ignore_dir" ]] || return 0
+
+  [[ "$-" == *f* ]] && had_noglob=1
+  shopt -q nullglob && had_nullglob=1
+  shopt -q failglob && had_failglob=1
+  shopt -q nocaseglob && had_nocaseglob=1
+  shopt -q dotglob && had_dotglob=1
+  # Sley owns this filename contract even when its sourceable API is called by
+  # a shell with unusual glob policy. Discovery therefore runs with a known
+  # expansion state, while every caller-owned setting is restored below.
+  if ! _sley_lint_ignore_discover_configs "$ignore_dir"; then
+    printf 'sley: warning: cannot isolate lint-ignore config discovery: %s\n' \
+      "$ignore_dir" >&2
+  fi
+  [[ "$had_noglob" -eq 0 ]] || set -f
+  [[ "$had_noglob" -eq 1 ]] || set +f
+  if [[ "$had_nullglob" -eq 1 ]]; then shopt -s nullglob; else shopt -u nullglob; fi
+  if [[ "$had_failglob" -eq 1 ]]; then shopt -s failglob; else shopt -u failglob; fi
+  if [[ "$had_nocaseglob" -eq 1 ]]; then shopt -s nocaseglob; else shopt -u nocaseglob; fi
+  # Revealing a non-empty caller GLOBIGNORE when the helper returns can enable
+  # dotglob even when that caller had explicitly disabled it, so this restore
+  # must be symmetric rather than relying on discovery's `shopt -u` state.
+  if [[ "$had_dotglob" -eq 1 ]]; then shopt -s dotglob; else shopt -u dotglob; fi
+
+  for config in "${configs[@]}"; do
+    if [[ ! -f "$config" || ! -r "$config" ]]; then
+      printf 'sley: warning: lint-ignore config is not readable: %s\n' "$config" >&2
+      continue
+    fi
+    line_number=0
+    while IFS= read -r entry || [[ -n "$entry" ]]; do
+      line_number=$((line_number + 1))
+      # Accept files checked out with CRLF without making carriage return part
+      # of the literal prefix. Other whitespace is significant because it may
+      # legitimately occur in a repository path.
+      entry=${entry%$'\r'}
+      case "$entry" in
+        "" | \#*) continue ;;
+      esac
+
+      normalized="$entry"
+      while [[ "$normalized" == ./* ]]; do
+        normalized=${normalized#./}
+      done
+      while [[ "$normalized" == */ ]]; do
+        normalized=${normalized%/}
+      done
+
+      # A bad rule must never broaden into a repository-wide lint bypass.
+      # Reject roots, absolute paths, empty components, and traversal instead
+      # of attempting clever normalization whose meaning could vary by host.
+      case "$normalized" in
+        "" | . | .. | /* | ../* | */../* | */.. | */./* | */. | *//*)
+          printf 'sley: warning: invalid lint-ignore entry at %s:%s; expected a literal repository-relative path\n' \
+            "$config" "$line_number" >&2
+          continue
+          ;;
+      esac
+      _SLEY_LINT_IGNORE_PREFIXES+=("$normalized")
+    done <"$config"
+  done
+}
+
+_sley_lint_ignore_matches() {
+  local path="$1" prefix
+  for prefix in "${_SLEY_LINT_IGNORE_PREFIXES[@]}"; do
+    if [[ "$path" == "$prefix" || "$path" == "$prefix/"* ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+_sley_lint_ignore_batch_match_path() {
+  local path="$1" caller_relative=1
+  _SLEY_LINT_IGNORE_MATCH_PATH=""
+
+  # A logical PWD may name the same checkout through a symlinked ancestor
+  # (notably macOS /var -> /private/var). Match that proven alias alongside the
+  # existing roots in one dispatch, but preserve `path` for provider use.
+  case "$path" in
+    "$_SLEY_LINT_IGNORE_CALLER_ROOT"/*)
+      path=${path#"$_SLEY_LINT_IGNORE_CALLER_ROOT"/}
+      caller_relative=0
+      ;;
+    "$_SLEY_LINT_IGNORE_ROOT"/*)
+      path=${path#"$_SLEY_LINT_IGNORE_ROOT"/}
+      caller_relative=0
+      ;;
+    "$_SLEY_LINT_IGNORE_ROOT_ABS"/*)
+      path=${path#"$_SLEY_LINT_IGNORE_ROOT_ABS"/}
+      caller_relative=0
+      ;;
+    /*)
+      return 1
+      ;;
+  esac
+  while [[ "$path" == ./* ]]; do
+    path=${path#./}
+  done
+  case "$path" in
+    "" | . | .. | ../* | */../* | */..) return 1 ;;
+  esac
+  if [[ "$caller_relative" == "1" && -n "$_SLEY_LINT_IGNORE_CALLER_PREFIX" ]]; then
+    path="$_SLEY_LINT_IGNORE_CALLER_PREFIX/$path"
+  fi
+  _SLEY_LINT_IGNORE_MATCH_PATH="$path"
+}
+
+_sley_lint_ignore_filter_files() {
+  # Write both outputs into caller-local dynamic variables. Avoiding command
+  # substitution here matters for large changes: filtering thousands of paths
+  # stays in one shell process and never launches a subprocess per file.
+  local files_text="$1" file root_abs caller_abs caller_logical
+  local _SLEY_LINT_IGNORE_ROOT="${_REPO_ROOT:-}"
+  local _SLEY_LINT_IGNORE_ROOT_ABS=""
+  local _SLEY_LINT_IGNORE_CALLER_PREFIX=""
+  local _SLEY_LINT_IGNORE_CALLER_ROOT=""
+  local -a _SLEY_LINT_IGNORE_PREFIXES=() retained=()
+  local _SLEY_LINT_IGNORE_MATCH_PATH=""
+  _SLEY_LINT_FILTERED_FILES=""
+  _SLEY_LINT_IGNORED_COUNT=0
+
+  _sley_lint_ignore_load || return $?
+  if [[ "${#_SLEY_LINT_IGNORE_PREFIXES[@]}" -eq 0 ]]; then
+    _SLEY_LINT_FILTERED_FILES="$files_text"
+    return 0
+  fi
+
+  # Batch hook paths are relative to the hook caller, whereas `sley check`
+  # enters the repository root before selecting paths. Resolve that relationship
+  # once, not once per file, and keep the provider-facing spelling untouched.
+  # If no repository boundary can be proven, fail open by retaining every file.
+  [[ -n "$_SLEY_LINT_IGNORE_ROOT" ]] || {
+    _SLEY_LINT_FILTERED_FILES="$files_text"
+    return 0
+  }
+  root_abs=$(_repo_physical_dir "$_SLEY_LINT_IGNORE_ROOT") || {
+    _SLEY_LINT_FILTERED_FILES="$files_text"
+    return 0
+  }
+  caller_abs=$(_repo_physical_dir "$PWD") || {
+    _SLEY_LINT_FILTERED_FILES="$files_text"
+    return 0
+  }
+  _SLEY_LINT_IGNORE_ROOT_ABS="$root_abs"
+  # Keep this nonempty so the per-file case never gains a catch-all `/*`
+  # pattern when no distinct logical alias can be derived.
+  _SLEY_LINT_IGNORE_CALLER_ROOT="$root_abs"
+  caller_logical=${PWD%/}
+  [[ -n "$caller_logical" ]] || caller_logical=/
+  case "$caller_abs" in
+    "$root_abs")
+      _SLEY_LINT_IGNORE_CALLER_ROOT="$caller_logical"
+      ;;
+    "$root_abs"/*)
+      _SLEY_LINT_IGNORE_CALLER_PREFIX=${caller_abs#"$root_abs"/}
+      # Only derive an alias when the logical and physical caller paths agree
+      # on the repository-relative suffix. That proof prevents an unrelated
+      # absolute path from being reinterpreted as an ignored in-repo file.
+      case "$caller_logical" in
+        */"$_SLEY_LINT_IGNORE_CALLER_PREFIX")
+          _SLEY_LINT_IGNORE_CALLER_ROOT=${caller_logical%"/$_SLEY_LINT_IGNORE_CALLER_PREFIX"}
+          ;;
+      esac
+      ;;
+    *)
+      _SLEY_LINT_FILTERED_FILES="$files_text"
+      return 0
+      ;;
+  esac
+
+  while IFS= read -r file; do
+    [[ -n "$file" ]] || continue
+    if _sley_lint_ignore_batch_match_path "$file" &&
+      _sley_lint_ignore_matches "$_SLEY_LINT_IGNORE_MATCH_PATH"; then
+      _SLEY_LINT_IGNORED_COUNT=$((_SLEY_LINT_IGNORED_COUNT + 1))
+      continue
+    fi
+    retained+=("$file")
+  done <<<"$files_text"
+
+  if [[ "${#retained[@]}" -gt 0 ]]; then
+    # Repeatedly appending into one growing Bash string makes a large, mostly
+    # retained batch quadratic in total path bytes. Join once so a configured
+    # non-match remains linear in the realistic many-file commit path.
+    local IFS=$'\n'
+    _SLEY_LINT_FILTERED_FILES="${retained[*]}"
+  fi
+}
+
+_sley_lint_ignore_file_args() {
+  local file="${*: -1}" match_path=""
+  local -a _SLEY_LINT_IGNORE_PREFIXES=()
+  _SLEY_LINT_FILE_IGNORED=0
+
+  _sley_lint_ignore_load || return $?
+  [[ "${#_SLEY_LINT_IGNORE_PREFIXES[@]}" -gt 0 ]] || return 0
+
+  # lint-file accepts caller-relative and absolute editor paths. Reuse Sley's
+  # boundary-aware path resolver so an outside-repo path or a symlink escape
+  # can never be mistaken for an ignored in-repo prefix.
+  match_path=$(_repo_relpath_for_existing_dir "${_REPO_ROOT:-}" "$file") || return 0
+  if _sley_lint_ignore_matches "$match_path"; then
+    _SLEY_LINT_FILE_IGNORED=1
+  fi
+}
+
+_sley_lint_ignore_summary() {
+  local prefix="$1" count="$2" noun="files"
+  [[ "$count" == "1" ]] && noun="file"
+  printf '%s %s configured %s\n' "$prefix" "$count" "$noun"
+}
+
 _sley_extension_dir() {
   local output_name="$1" path_value
 

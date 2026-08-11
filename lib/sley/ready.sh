@@ -47,6 +47,7 @@ Execution:
   --exclude PHASE      skip a named phase (repeatable)
   --quiet              suppress output on pass (rc=0). Failure output is
                        still emitted so callers can relay it.
+  --no-lint-ignore     lint every selected file, bypassing user lint-ignore.d
 
 Scope:
   default              use active change-context changes
@@ -1465,10 +1466,22 @@ _sley_ready_impl() {
 
   _sley_init_repo || return $?
   local full=0 force=0 fix=0 quiet=0
+  local SLEY_LINT_IGNORE="${SLEY_LINT_IGNORE:-1}"
   local -a scope_args=() exclude_phases=()
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
+      --path)
+        # Keep the following token attached to --path until `_sley_parse_scope`
+        # validates it. Pulling command-specific flags out first would turn a
+        # flag-shaped path value into an unrelated ready option.
+        scope_args+=("$1")
+        shift
+        if [[ $# -gt 0 ]]; then
+          scope_args+=("$1")
+          shift
+        fi
+        ;;
       --full)
         full=1
         shift
@@ -1483,6 +1496,10 @@ _sley_ready_impl() {
         ;;
       --quiet)
         quiet=1
+        shift
+        ;;
+      --no-lint-ignore)
+        SLEY_LINT_IGNORE=0
         shift
         ;;
       --exclude)

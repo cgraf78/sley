@@ -36,6 +36,14 @@ shell_completion_output=$(
     COMP_CWORD=2
     _sley_shell_complete
     printf "opt:%s\n" "${COMPREPLY[@]}"
+    COMP_WORDS=(sley check "")
+    COMP_CWORD=2
+    _sley_shell_complete
+    printf "check_opt:%s\n" "${COMPREPLY[@]}"
+    COMP_WORDS=(sley ready "")
+    COMP_CWORD=2
+    _sley_shell_complete
+    printf "ready_opt:%s\n" "${COMPREPLY[@]}"
     printf "schema:%s\n" "${SLEY_VERIFY_SCHEMA:-}"
     printf "schema_fn:%s\n" "$(sley_verify_schema_path)"
   '
@@ -54,6 +62,10 @@ _assert_contains "shell api: verify completion includes --path" \
   "opt:--path" "$shell_completion_output"
 _assert_contains "shell api: verify completion includes --json" \
   "opt:--json" "$shell_completion_output"
+_assert_contains "shell api: check completion includes --no-lint-ignore" \
+  "check_opt:--no-lint-ignore" "$shell_completion_output"
+_assert_contains "shell api: ready completion includes --no-lint-ignore" \
+  "ready_opt:--no-lint-ignore" "$shell_completion_output"
 _assert_contains "shell api: exposes verify schema env var" \
   "schema:$SLEY_REPO_ROOT/share/sley/schemas/verify.schema.json" \
   "$shell_completion_output"
@@ -104,6 +116,9 @@ if command -v zsh >/dev/null 2>&1; then
       words=(sley verify "")
       CURRENT=3
       _sley_zsh_complete
+      words=(sley check "")
+      CURRENT=3
+      _sley_zsh_complete
       print -r -- "registered=${+functions[_sley_zsh_complete]}"
     '
   )
@@ -121,6 +136,8 @@ if command -v zsh >/dev/null 2>&1; then
     "match:--path" "$zsh_completion_output"
   _assert_contains "shell api: zsh verify completion includes --json" \
     "match:--json" "$zsh_completion_output"
+  _assert_contains "shell api: zsh check completion includes --no-lint-ignore" \
+    "match:--no-lint-ignore" "$zsh_completion_output"
   zsh_deferred_output=$(
     SLEY_REPO_ROOT="$SLEY_REPO_ROOT" zsh -fc '
       source "$SLEY_REPO_ROOT/share/sley/shell.sh"

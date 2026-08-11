@@ -1,4 +1,4 @@
-.TH SLEY 1 "2026-07-21" "sley" "User Commands"
+.TH SLEY 1 "2026-08-11" "sley" "User Commands"
 .SH NAME
 sley \- repository workflow checks for humans, editors, hooks, and agents
 .SH SYNOPSIS
@@ -32,7 +32,9 @@ List selected changed files.
 Run the mutating format phase for selected files.
 .TP
 .B check
-Run the read-only fast lint and validation phase for selected files.
+Run the read-only fast lint and validation phase for selected files. Use
+.B --no-lint-ignore
+to bypass configured user lint exclusions for this invocation.
 .TP
 .B secrets
 Run the configured redacted secret scan.
@@ -47,6 +49,9 @@ Run the aggregate pre-submit readiness report. With
 and
 .BR --commit ,
 this is the commit-gate path used by native hooks.
+Use
+.B --no-lint-ignore
+to bypass user lint exclusions in its check phase.
 .PP
 Sley runs each readiness phase in a managed process group and contains ordinary
 descendants that remain in that group. Extension hooks and phases must remain in
@@ -82,6 +87,16 @@ when a probe should ignore the optional bare-repo fallback.
 Directory containing environment-specific extension files. Defaults to the
 user's XDG config location.
 .TP
+.B SLEY_LINT_IGNORE
+Set to
+.B 0
+to bypass user lint exclusions, including for low-level hook commands.
+.TP
+.B SLEY_LINT_IGNORE_DIR
+Explicit directory containing ordered
+.I *.paths
+lint-ignore files.
+.TP
 .B SLEY_VERIFY_CONFIG
 Explicit verify registry file or directory, discovered before user registries
 from the default config directory.
@@ -90,8 +105,8 @@ from the default config directory.
 Explicit directory for local verify success receipts.
 .TP
 .B XDG_CONFIG_HOME
-Absolute base directory for Sley extensions and user verify registries. An
-empty or relative value falls back to
+Absolute base directory for Sley extensions, lint-ignore paths, and user verify
+registries. An empty or relative value falls back to
 .BR $HOME/.config .
 .TP
 .B XDG_CACHE_HOME
@@ -114,6 +129,13 @@ JSON Schema for Sley verify registry files.
 .TP
 .I $XDG_CONFIG_HOME/sley/extensions.d/*.sh
 Ordered extension files for local hook and verify policy.
+.TP
+.I $XDG_CONFIG_HOME/sley/lint-ignore.d/*.paths
+Ordered user files containing literal repository-relative paths excluded from
+Sley lint dispatch. This directory is user-global, so every entry is considered
+in every repository. Whitespace is literal and comments must occupy a whole
+line. These entries do not affect formatting, secrets, validation, verification,
+direct lint-provider commands, or CI.
 .TP
 .I $XDG_CONFIG_HOME/sley/verify.json
 Primary user verify registry.

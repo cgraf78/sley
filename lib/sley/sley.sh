@@ -97,7 +97,7 @@ sley_fix() {
   _sley_run_with_cwd_restore _sley_fix "$@"
 }
 
-# sley_check [scope options]
+# sley_check [scope options] [--no-lint-ignore]
 #   Run lint and repo validation for selected changed files. Read-only.
 sley_check() {
   local -
@@ -740,8 +740,34 @@ _sley_fix() {
 
 _sley_check() {
   _sley_init_repo || return $?
-  _sley_parse_scope "$@" || return $?
-  local files runnable checked_count
+  local SLEY_LINT_IGNORE="${SLEY_LINT_IGNORE:-1}"
+  local -a scope_args=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --path)
+        # Preserve the option and its next token as a pair so the canonical
+        # scope parser can reject a flag-shaped path. Otherwise a path value
+        # named `--no-lint-ignore` would be silently reinterpreted here.
+        scope_args+=("$1")
+        shift
+        if [[ $# -gt 0 ]]; then
+          scope_args+=("$1")
+          shift
+        fi
+        ;;
+      --no-lint-ignore)
+        SLEY_LINT_IGNORE=0
+        shift
+        ;;
+      *)
+        scope_args+=("$1")
+        shift
+        ;;
+    esac
+  done
+  _sley_parse_scope "${scope_args[@]}" || return $?
+  local files runnable lint_files checked_count
+  local _SLEY_LINT_FILTERED_FILES="" _SLEY_LINT_IGNORED_COUNT=0
   files=$(_sley_selected_files) || return 2
   _sley_warn_out_of_scope "$files"
   runnable=$(printf '%s\n' "$files" | _repo_existing_regular_files)
@@ -749,8 +775,6 @@ _sley_check() {
     echo "sley check: no matching changed files" >&2
     return 0
   fi
-  checked_count=$(_sley_count_file_list "$runnable")
-
   SLEY_CALLER="${SLEY_CALLER:-human}"
   # shellcheck disable=SC2034 # consumed by sourced local extensions.
   SLEY_SCOPED=1
@@ -758,12 +782,17 @@ _sley_check() {
   # lint/validate behavior, but must preserve this sley-selected scope when the
   # scoped flag is set; hooks can still use their faster hook defaults.
   sley_hook_init || return $?
-  sley_hook_lint "$runnable"
-  case $? in
-    0) ;;
-    2) return 2 ;;
-    *) return 1 ;;
-  esac
+  _sley_lint_ignore_filter_files "$runnable" || return $?
+  lint_files="$_SLEY_LINT_FILTERED_FILES"
+  checked_count=$(_sley_count_file_list "$lint_files")
+  if [[ -n "$lint_files" ]]; then
+    sley_hook_lint "$lint_files"
+    case $? in
+      0) ;;
+      2) return 2 ;;
+      *) return 1 ;;
+    esac
+  fi
   if [[ "$_SLEY_SCOPE_REPO_WIDE" == "1" || "${#_SLEY_SCOPE_PATHS[@]}" -eq 0 ]]; then
     # Explicit --path scopes promise isolation. Some repo validators are
     # change-wide and cannot honor a file list, so skip them rather than letting
@@ -772,6 +801,13 @@ _sley_check() {
     sley_hook_validate || return 1
   fi
   _sley_print_file_summary "sley check: checked" "$checked_count"
+  if [[ "$_SLEY_LINT_IGNORED_COUNT" -gt 0 ]]; then
+    # Keep the established checked-file result first: `ready --json` uses the
+    # first successful stdout line as the phase summary. The exclusion detail
+    # remains visible without replacing that machine-facing contract.
+    _sley_lint_ignore_summary \
+      "sley check: ignored lint for" "$_SLEY_LINT_IGNORED_COUNT"
+  fi
 }
 
 _sley_secrets_default_jobs() {
@@ -1692,6 +1728,8 @@ _sley_hook_cd_for_absolute_file_arg() {
 
 _sley_hook() {
   local cmd="${1:-}" files
+  local _SLEY_LINT_FILTERED_FILES="" _SLEY_LINT_IGNORED_COUNT=0
+  local _SLEY_LINT_FILE_IGNORED=0
   [[ -n "$cmd" ]] || {
     _sley_hook_usage
     return 2
@@ -1721,6 +1759,11 @@ _sley_hook() {
       }
       _sley_hook_cd_for_absolute_file_arg "$@" || return $?
       sley_hook_init || return $?
+      _sley_lint_ignore_file_args "$@" || return $?
+      if [[ "$_SLEY_LINT_FILE_IGNORED" == "1" ]]; then
+        _sley_lint_ignore_summary "sley lint: ignored" 1 >&2
+        return 0
+      fi
       sley_hook_lint_file "$@"
       ;;
     format)
@@ -1739,7 +1782,13 @@ _sley_hook() {
       }
       files=$(cat)
       sley_hook_init || return $?
-      sley_hook_lint "$files"
+      _sley_lint_ignore_filter_files "$files" || return $?
+      if [[ "$_SLEY_LINT_IGNORED_COUNT" -gt 0 ]]; then
+        _sley_lint_ignore_summary \
+          "sley lint: ignored" "$_SLEY_LINT_IGNORED_COUNT" >&2
+      fi
+      [[ -z "$_SLEY_LINT_FILTERED_FILES" ]] ||
+        sley_hook_lint "$_SLEY_LINT_FILTERED_FILES"
       ;;
     validate)
       sley_hook_init || return $?

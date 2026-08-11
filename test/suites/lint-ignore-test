@@ -1,0 +1,474 @@
+#!/usr/bin/env bash
+# lint-ignore-test - first-class user lint exclusions across Sley entry points.
+
+set -uo pipefail
+export NO_COLOR=1
+
+SLEY_TEST_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
+SLEY_REPO_ROOT="$(cd -- "$SLEY_TEST_DIR/.." && pwd -P)"
+SLEY="$SLEY_REPO_ROOT/bin/sley"
+
+# shellcheck source=../helpers.sh
+. "$SLEY_TEST_DIR/helpers.sh"
+
+new_repo() {
+  local repo
+  repo=$(_tmpdir)
+  git -C "$repo" init -q
+  git -C "$repo" config user.email test@example.invalid
+  git -C "$repo" config user.name "Sley Test"
+  git -C "$repo" config commit.gpgsign false
+  mkdir -p "$repo/.hooks"
+  git -C "$repo" config core.hooksPath "$repo/.hooks"
+  printf '%s\n' "$repo"
+}
+
+run_sley() {
+  local repo="$1" home="$2" mock_bin="$3"
+  shift 3
+  __SLEY_OUT=$(
+    cd "$repo" || exit 1
+    HOME="$home" XDG_CONFIG_HOME="$home/config" \
+      GIT_CONFIG_GLOBAL="$repo/.gitconfig-test" PATH="$mock_bin:$PATH" \
+      "$SLEY" "$@" 2>&1
+  )
+  __SLEY_RC=$?
+}
+
+repo=$(new_repo)
+home=$(_tmpdir)
+mock_bin=$(_mock_bin)
+lint_log=$repo/lint.log
+mkdir -p \
+  "$repo/src" \
+  "$repo/vendor/generated" \
+  "$repo/vendor/generatedish" \
+  "$repo/web/legacy" \
+  "$repo/sub" \
+  "$repo/name with spaces" \
+  "$home/config/sley/lint-ignore.d"
+touch "$repo/.gitconfig-test"
+printf 'initial\n' >"$repo/src/keep.py"
+printf 'initial\n' >"$repo/vendor/generated/skip.py"
+printf 'initial\n' >"$repo/vendor/generatedish/keep.py"
+printf 'initial\n' >"$repo/web/legacy/ui.ts"
+printf 'initial\n' >"$repo/root-only.py"
+printf 'initial\n' >"$repo/sub/ignored.py"
+printf 'initial\n' >"$repo/sub/keep.py"
+printf 'initial\n' >"$repo/sub/root-only.py"
+printf 'initial\n' >"$repo/name with spaces/skip.py"
+git -C "$repo" add .
+git -C "$repo" commit -q -m seed
+printf 'changed\n' >>"$repo/src/keep.py"
+printf 'changed\n' >>"$repo/vendor/generated/skip.py"
+printf 'changed\n' >>"$repo/vendor/generatedish/keep.py"
+printf 'changed\n' >>"$repo/web/legacy/ui.ts"
+printf 'changed\n' >>"$repo/name with spaces/skip.py"
+
+cat >"$mock_bin/autolint" <<'EOF'
+#!/usr/bin/env bash
+printf 'call:' >>"$SLEY_TEST_LINT_LOG"
+printf '<%s>' "$@" >>"$SLEY_TEST_LINT_LOG"
+printf '\n' >>"$SLEY_TEST_LINT_LOG"
+EOF
+cat >"$mock_bin/autoformat" <<'EOF'
+#!/usr/bin/env bash
+printf 'format:' >>"$SLEY_TEST_FORMAT_LOG"
+printf '<%s>' "$@" >>"$SLEY_TEST_FORMAT_LOG"
+printf '\n' >>"$SLEY_TEST_FORMAT_LOG"
+EOF
+chmod +x "$mock_bin/autolint" "$mock_bin/autoformat"
+export SLEY_TEST_LINT_LOG="$lint_log"
+export SLEY_TEST_FORMAT_LOG="$repo/format.log"
+
+cat >"$home/config/sley/lint-ignore.d/10-project.paths" <<'EOF'
+# Literal repository-relative files or subtrees.
+./vendor/generated/
+name with spaces
+EOF
+cat >"$home/config/sley/lint-ignore.d/20-more.paths" <<'EOF'
+web/legacy
+sub/ignored.py
+root-only.py
+EOF
+
+echo "=== sley: lint-ignore.d batch filtering ==="
+
+: >"$lint_log"
+run_sley "$repo" "$home" "$mock_bin" check --repo-wide
+_assert_exit "check: configured exclusions succeed" 0 "$__SLEY_RC"
+_assert_file_content "check: aggregates files and sends only non-ignored paths" \
+  'call:<--><src/keep.py><vendor/generatedish/keep.py>' "$lint_log"
+_assert_contains "check: reports excluded lint paths" \
+  "sley check: ignored lint for 3 configured files" "$__SLEY_OUT"
+_assert_contains "check: summary counts only linted files" \
+  "sley check: checked 2 files" "$__SLEY_OUT"
+
+: >"$lint_log"
+run_sley "$repo" "$home" "$mock_bin" check --repo-wide --no-lint-ignore
+_assert_exit "check bypass: succeeds" 0 "$__SLEY_RC"
+_assert_contains "check bypass: restores an ignored subtree" \
+  '<vendor/generated/skip.py>' "$(cat "$lint_log")"
+_assert_contains "check bypass: restores a second ignore file" \
+  '<web/legacy/ui.ts>' "$(cat "$lint_log")"
+_assert_not_contains "check bypass: reports no ignored files" \
+  "ignored lint" "$__SLEY_OUT"
+
+: >"$lint_log"
+run_sley "$repo" "$home" "$mock_bin" check --path --no-lint-ignore src
+_assert_exit "check parsing: flag-shaped path remains invalid" 2 "$__SLEY_RC"
+_assert_contains "check parsing: canonical path diagnostic survives pre-parsing" \
+  "--path argument looks like a flag: --no-lint-ignore" "$__SLEY_OUT"
+_assert_file_content "check parsing: invalid path starts no provider" "" "$lint_log"
+
+: >"$lint_log"
+run_sley "$repo" "$home" "$mock_bin" ready --path --no-lint-ignore src \
+  --exclude status --exclude secrets --exclude verify
+_assert_exit "ready parsing: flag-shaped path remains invalid" 2 "$__SLEY_RC"
+_assert_contains "ready parsing: canonical path diagnostic survives pre-parsing" \
+  "--path argument looks like a flag: --no-lint-ignore" "$__SLEY_OUT"
+_assert_file_content "ready parsing: invalid path starts no provider" "" "$lint_log"
+
+: >"$lint_log"
+run_sley "$repo" "$home" "$mock_bin" ready --repo-wide --quiet \
+  --exclude status --exclude secrets --exclude verify
+_assert_exit "ready: configured exclusions succeed" 0 "$__SLEY_RC"
+_assert_file_content "ready: check phase receives the filtered set" \
+  'call:<--><src/keep.py><vendor/generatedish/keep.py>' "$lint_log"
+
+: >"$lint_log"
+run_sley "$repo" "$home" "$mock_bin" ready --repo-wide --json \
+  --exclude status --exclude secrets --exclude verify
+_assert_exit "ready JSON: configured exclusions succeed" 0 "$__SLEY_RC"
+_assert_contains "ready JSON: preserves the established check summary" \
+  '"summary":"sley check: checked 2 files"' "$__SLEY_OUT"
+
+: >"$lint_log"
+run_sley "$repo" "$home" "$mock_bin" ready --repo-wide --quiet \
+  --no-lint-ignore --exclude status --exclude secrets --exclude verify
+_assert_exit "ready bypass: succeeds" 0 "$__SLEY_RC"
+_assert_contains "ready bypass: restores configured paths" \
+  '<vendor/generated/skip.py>' "$(cat "$lint_log")"
+
+echo "=== sley: lint-ignore.d hook filtering ==="
+
+: >"$lint_log"
+hook_stdout="$repo/lint-file.stdout"
+hook_stderr="$repo/lint-file.stderr"
+(
+  cd "$repo" || exit 1
+  HOME="$home" XDG_CONFIG_HOME="$home/config" \
+    GIT_CONFIG_GLOBAL="$repo/.gitconfig-test" PATH="$mock_bin:$PATH" \
+    "$SLEY" hook lint-file --json "$repo/vendor/generated/skip.py" \
+    >"$hook_stdout" 2>"$hook_stderr"
+)
+hook_rc=$?
+_assert_exit "lint-file: ignored absolute file succeeds" 0 "$hook_rc"
+_assert_file_content "lint-file: ignored absolute file skips provider" "" "$lint_log"
+_assert_file_content "lint-file: ignored JSON request keeps stdout clean" \
+  "" "$hook_stdout"
+_assert_contains "lint-file: reports configured exclusion" \
+  "sley lint: ignored 1 configured file" "$(cat "$hook_stderr")"
+
+: >"$lint_log"
+(
+  cd "$repo" || exit 1
+  HOME="$home" XDG_CONFIG_HOME="$home/config" SLEY_LINT_IGNORE=0 \
+    GIT_CONFIG_GLOBAL="$repo/.gitconfig-test" PATH="$mock_bin:$PATH" \
+    "$SLEY" hook lint-file --json "$repo/vendor/generated/skip.py" \
+    >/dev/null 2>"$hook_stderr"
+)
+hook_rc=$?
+_assert_exit "lint-file env bypass: succeeds" 0 "$hook_rc"
+_assert_contains "lint-file env bypass: restores the provider call" \
+  "<$repo/vendor/generated/skip.py>" "$(cat "$lint_log")"
+
+: >"$lint_log"
+hook_out=$(
+  cd "$repo" || exit 1
+  HOME="$home" XDG_CONFIG_HOME="$home/config" \
+    GIT_CONFIG_GLOBAL="$repo/.gitconfig-test" PATH="$mock_bin:$PATH" \
+    "$SLEY" hook lint-file --json "$repo/vendor/generatedish/keep.py" 2>&1
+)
+hook_rc=$?
+_assert_exit "lint-file boundary: similarly named subtree succeeds" 0 "$hook_rc"
+_assert_contains "lint-file boundary: similarly named subtree is linted" \
+  "<$repo/vendor/generatedish/keep.py>" "$(cat "$lint_log")"
+_assert_eq "lint-file boundary: ordinary lint is quiet" "" "$hook_out"
+
+: >"$lint_log"
+hook_out=$(
+  cd "$repo" || exit 1
+  printf '%s\n' \
+    src/keep.py \
+    vendor/generated/skip.py \
+    'name with spaces/skip.py' |
+    HOME="$home" XDG_CONFIG_HOME="$home/config" \
+      GIT_CONFIG_GLOBAL="$repo/.gitconfig-test" PATH="$mock_bin:$PATH" \
+      "$SLEY" hook lint --stdin 2>&1
+)
+hook_rc=$?
+_assert_exit "hook batch: mixed input succeeds" 0 "$hook_rc"
+_assert_file_content "hook batch: preserves only included input" \
+  'call:<--><src/keep.py>' "$lint_log"
+_assert_contains "hook batch: reports both configured exclusions" \
+  "sley lint: ignored 2 configured files" "$hook_out"
+
+: >"$lint_log"
+repo_alias_parent=$(_tmpdir)
+repo_alias="$repo_alias_parent/repo-alias"
+ln -s "$repo" "$repo_alias"
+hook_out=$(
+  # Exercise a logical checkout alias so macOS /var -> /private/var and
+  # symlinked working directories retain identical absolute-path filtering.
+  cd "$repo_alias/sub" || exit 1
+  printf '%s\n' \
+    ignored.py \
+    keep.py \
+    root-only.py \
+    "$repo_alias/vendor/generated/skip.py" |
+    HOME="$home" XDG_CONFIG_HOME="$home/config" \
+      GIT_CONFIG_GLOBAL="$repo/.gitconfig-test" PATH="$mock_bin:$PATH" \
+      "$SLEY" hook lint --stdin 2>&1
+)
+hook_rc=$?
+_assert_exit "hook batch subdir: caller-relative input succeeds" 0 "$hook_rc"
+_assert_file_content "hook batch subdir: matches from repo root but preserves provider paths" \
+  'call:<--><keep.py><root-only.py>' "$lint_log"
+_assert_contains "hook batch subdir: ignores rooted relative and absolute files" \
+  "sley lint: ignored 2 configured files" "$hook_out"
+
+: >"$lint_log"
+hook_out=$(
+  cd "$repo" || exit 1
+  printf '%s\n' vendor/generated/skip.py web/legacy/ui.ts |
+    HOME="$home" XDG_CONFIG_HOME="$home/config" \
+      GIT_CONFIG_GLOBAL="$repo/.gitconfig-test" PATH="$mock_bin:$PATH" \
+      "$SLEY" hook lint --stdin 2>&1
+)
+hook_rc=$?
+_assert_exit "hook batch: all-ignored input succeeds" 0 "$hook_rc"
+_assert_file_content "hook batch: all-ignored input skips provider" "" "$lint_log"
+_assert_contains "hook batch: all-ignored input stays visible" \
+  "sley lint: ignored 2 configured files" "$hook_out"
+
+: >"$SLEY_TEST_FORMAT_LOG"
+format_out=$(
+  cd "$repo" || exit 1
+  HOME="$home" XDG_CONFIG_HOME="$home/config" \
+    GIT_CONFIG_GLOBAL="$repo/.gitconfig-test" PATH="$mock_bin:$PATH" \
+    "$SLEY" hook format-file "$repo/vendor/generated/skip.py" 2>&1
+)
+format_rc=$?
+_assert_exit "format-file: ignored lint path still formats" 0 "$format_rc"
+_assert_contains "format-file: lint policy does not filter formatting" \
+  "<$repo/vendor/generated/skip.py>" "$(cat "$SLEY_TEST_FORMAT_LOG")"
+_assert_eq "format-file: successful formatting remains quiet" "" "$format_out"
+
+echo "=== sley: lint-ignore.d provider extension boundary ==="
+
+mkdir -p "$home/config/sley/extensions.d"
+cat >"$home/config/sley/extensions.d/80-test.sh" <<'EOF'
+sley_hook_lint_file() {
+  printf 'extension-file:' >>"$SLEY_TEST_LINT_LOG"
+  printf '<%s>' "$@" >>"$SLEY_TEST_LINT_LOG"
+  printf '\n' >>"$SLEY_TEST_LINT_LOG"
+}
+sley_hook_lint() {
+  local file
+  printf 'extension-batch:' >>"$SLEY_TEST_LINT_LOG"
+  while IFS= read -r file; do
+    [[ -n "$file" ]] && printf '<%s>' "$file" >>"$SLEY_TEST_LINT_LOG"
+  done <<<"$1"
+  printf '\n' >>"$SLEY_TEST_LINT_LOG"
+}
+EOF
+
+: >"$lint_log"
+run_sley "$repo" "$home" "$mock_bin" check --repo-wide
+_assert_exit "extension: filtered check succeeds" 0 "$__SLEY_RC"
+_assert_file_content "extension: provider override receives filtered batch" \
+  'extension-batch:<src/keep.py><vendor/generatedish/keep.py>' "$lint_log"
+
+git -C "$repo" restore src/keep.py vendor/generatedish/keep.py
+: >"$lint_log"
+run_sley "$repo" "$home" "$mock_bin" check --repo-wide
+_assert_exit "check all ignored: succeeds" 0 "$__SLEY_RC"
+_assert_file_content "check all ignored: does not start the provider" "" "$lint_log"
+_assert_contains "check all ignored: reports a zero-file lint result" \
+  "sley check: checked 0 files" "$__SLEY_OUT"
+printf 'changed\n' >>"$repo/src/keep.py"
+printf 'changed\n' >>"$repo/vendor/generatedish/keep.py"
+
+explicit_ignore_dir="$home/explicit-lint-ignore"
+mkdir -p "$explicit_ignore_dir"
+printf 'src\n' >"$explicit_ignore_dir/10-explicit.paths"
+export SLEY_LINT_IGNORE_DIR="$explicit_ignore_dir"
+: >"$lint_log"
+run_sley "$repo" "$home" "$mock_bin" check --repo-wide
+unset SLEY_LINT_IGNORE_DIR
+_assert_exit "explicit directory: configured override succeeds" 0 "$__SLEY_RC"
+_assert_not_contains "explicit directory: its configured path is excluded" \
+  '<src/keep.py>' "$(cat "$lint_log")"
+_assert_contains "explicit directory: default-directory rules are replaced" \
+  '<vendor/generated/skip.py>' "$(cat "$lint_log")"
+
+: >"$lint_log"
+hook_out=$(
+  cd "$repo" || exit 1
+  HOME="$home" XDG_CONFIG_HOME="$home/config" \
+    GIT_CONFIG_GLOBAL="$repo/.gitconfig-test" PATH="$mock_bin:$PATH" \
+    "$SLEY" hook lint-file --json "$repo/web/legacy/ui.ts" 2>&1
+)
+hook_rc=$?
+_assert_exit "extension lint-file: ignored file succeeds" 0 "$hook_rc"
+_assert_file_content "extension lint-file: ignored file never reaches override" "" "$lint_log"
+
+echo "=== sley: malformed lint-ignore.d entries fail safe ==="
+
+rm -f "$home/config/sley/lint-ignore.d"/*.paths
+cat >"$home/config/sley/lint-ignore.d/20-invalid.paths" <<'EOF'
+.
+..
+../escape
+/absolute/path
+safe/../escape
+EOF
+: >"$lint_log"
+run_sley "$repo" "$home" "$mock_bin" check --repo-wide
+_assert_exit "invalid config: lint still succeeds" 0 "$__SLEY_RC"
+_assert_contains "invalid config: does not suppress ordinary paths" \
+  '<vendor/generated/skip.py>' "$(cat "$lint_log")"
+_assert_contains "invalid config: emits an actionable warning" \
+  "invalid lint-ignore entry" "$__SLEY_OUT"
+
+rm -rf "$home/config/sley/extensions.d"
+: >"$lint_log"
+no_config_root_out=$(
+  cd "$repo" || exit 1
+  env -u HOME XDG_CONFIG_HOME=relative \
+    SLEY_EXTENSION_DIR="$home/missing-extensions" \
+    GIT_CONFIG_GLOBAL="$repo/.gitconfig-test" \
+    SLEY_TEST_LINT_LOG="$lint_log" PATH="$mock_bin:$PATH" \
+    "$SLEY" check --repo-wide 2>&1
+)
+no_config_root_rc=$?
+_assert_exit "missing config root: optional policy does not block lint" 0 "$no_config_root_rc"
+_assert_contains "missing config root: full lint coverage remains" \
+  '<vendor/generated/skip.py>' "$(cat "$lint_log")"
+_assert_not_contains "missing config root: optional policy emits no false error" \
+  "cannot resolve Sley lint-ignore" "$no_config_root_out"
+
+echo "=== sley: sourced API preserves caller glob policy ==="
+
+glob_home=$(_tmpdir)
+glob_extension_dir="$glob_home/config/sley/extensions.d"
+glob_ignore_dir="$glob_home/config/sley/lint-ignore.d"
+glob_probe="$glob_home/glob-probe"
+mkdir -p "$glob_extension_dir" "$glob_ignore_dir"
+printf ':\n' >"$glob_extension_dir/80-noop.sh"
+cat >"$glob_probe" <<'EOF'
+#!/usr/bin/env bash
+set -uo pipefail
+
+mode="$1"
+sley_lib="$2"
+repo="$3"
+before="$4"
+after="$5"
+cd "$repo" || exit 1
+# shellcheck source=/dev/null
+source "$sley_lib"
+
+case "$mode" in
+  failglob)
+    shopt -s failglob
+    shopt -u nullglob nocaseglob dotglob
+    ;;
+  broad-globs)
+    shopt -s failglob nocaseglob dotglob
+    shopt -u nullglob
+    ;;
+  noglob)
+    set -f
+    ;;
+  globignore)
+    GLOBIGNORE='*'
+    # Preserve an uncommon but valid state too: assigning GLOBIGNORE enables
+    # dotglob, but callers remain free to disable it afterward.
+    shopt -u dotglob
+    ;;
+  localvar-inherit)
+    shopt -s localvar_inherit
+    GLOBIGNORE='*'
+    shopt -u dotglob
+    ;;
+esac
+{
+  printf 'flags=%s\n' "$-"
+  printf 'globignore-set=%s\n' "${GLOBIGNORE+x}"
+  printf 'globignore=%s\n' "${GLOBIGNORE-}"
+  shopt -p failglob nullglob nocaseglob dotglob || true
+  shopt -p localvar_inherit 2>/dev/null || true
+} >"$before"
+if sley_check --repo-wide; then
+  rc=0
+else
+  rc=$?
+fi
+{
+  printf 'flags=%s\n' "$-"
+  printf 'globignore-set=%s\n' "${GLOBIGNORE+x}"
+  printf 'globignore=%s\n' "${GLOBIGNORE-}"
+  shopt -p failglob nullglob nocaseglob dotglob || true
+  shopt -p localvar_inherit 2>/dev/null || true
+} >"$after"
+exit "$rc"
+EOF
+chmod +x "$glob_probe"
+
+run_glob_probe() {
+  local mode="$1" expected_src="${2:-linted}" state_dir probe_out probe_rc
+  state_dir="$glob_home/state-$mode"
+  mkdir -p "$state_dir"
+  : >"$lint_log"
+  probe_out=$(
+    HOME="$glob_home" XDG_CONFIG_HOME="$glob_home/config" \
+      SLEY_EXTENSION_DIR="$glob_extension_dir" \
+      SLEY_TEST_LINT_LOG="$lint_log" \
+      GIT_CONFIG_GLOBAL="$repo/.gitconfig-test" PATH="$mock_bin:$PATH" \
+      "$glob_probe" "$mode" "$SLEY_REPO_ROOT/lib/sley/sley.sh" "$repo" \
+      "$state_dir/before" "$state_dir/after" 2>&1
+  )
+  probe_rc=$?
+  _assert_exit "glob state $mode: sourced check succeeds" 0 "$probe_rc"
+  _assert_eq "glob state $mode: caller options are restored exactly" \
+    "$(cat "$state_dir/before")" "$(cat "$state_dir/after")"
+  if [[ "$expected_src" == ignored ]]; then
+    _assert_not_contains "glob state $mode: configured policy is discovered" \
+      '<src/keep.py>' "$(cat "$lint_log" 2>/dev/null)"
+    _assert_contains "glob state $mode: retained files still reach lint" \
+      '<vendor/generated/skip.py>' "$(cat "$lint_log" 2>/dev/null)"
+    _assert_contains "glob state $mode: check reports filtered completion" \
+      'sley check: checked 4 files' "$probe_out"
+  else
+    _assert_contains "glob state $mode: optional discovery retains full lint" \
+      '<src/keep.py>' "$(cat "$lint_log" 2>/dev/null)"
+    _assert_contains "glob state $mode: check reports normal completion" \
+      'sley check: checked 5 files' "$probe_out"
+  fi
+}
+
+run_glob_probe failglob
+printf 'src\n' >"$glob_ignore_dir/.hidden.paths"
+printf 'src\n' >"$glob_ignore_dir/10-UPPER.PATHS"
+run_glob_probe broad-globs
+rm -f "$glob_ignore_dir/.hidden.paths" "$glob_ignore_dir/10-UPPER.PATHS"
+printf 'src\n' >"$glob_ignore_dir/10-project.paths"
+run_glob_probe noglob ignored
+run_glob_probe globignore ignored
+if (shopt -s localvar_inherit) 2>/dev/null; then
+  run_glob_probe localvar-inherit ignored
+fi
+
+_test_summary

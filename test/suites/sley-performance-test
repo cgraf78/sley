@@ -14,6 +14,8 @@ SLEY_PERF_RUNS=${SLEY_PERF_RUNS:-7}
 SLEY_HOOK_PERF_RUNS=${SLEY_HOOK_PERF_RUNS:-20}
 SLEY_READY_FIX_PERF_RUNS=${SLEY_READY_FIX_PERF_RUNS:-3}
 SLEY_PERF_CHANGED_FILES=${SLEY_PERF_CHANGED_FILES:-300}
+SLEY_LINT_IGNORE_PERF_FILES=${SLEY_LINT_IGNORE_PERF_FILES:-5000}
+SLEY_LINT_IGNORE_PERF_RUNS=${SLEY_LINT_IGNORE_PERF_RUNS:-3}
 SLEY_PERF_BUDGET_MULTIPLIER_ENV=SLEY_PERF_BUDGET_MULTIPLIER
 
 # These measure user-visible CLI paths, including repo detection, changed-file
@@ -35,6 +37,8 @@ HOOK_LINT_FILE_MEDIAN_BUDGET_MS=350
 HOOK_LINT_FILE_DARWIN_MEDIAN_BUDGET_MS=500
 HOOK_LINT_FILE_P95_BUDGET_MS=1000
 HOOK_LINT_FILE_DARWIN_P95_BUDGET_MS=1500
+LINT_IGNORE_5000_MEDIAN_BUDGET_MS=1000
+LINT_IGNORE_5000_DARWIN_MEDIAN_BUDGET_MS=1800
 CHECK_2_MEDIAN_BUDGET_MS=500
 CHECK_2_DARWIN_MEDIAN_BUDGET_MS=750
 CHECK_2_P95_BUDGET_MS=1500
@@ -275,24 +279,31 @@ timeout = float(sys.argv[1])
 output_file = sys.argv[2]
 rc_file = sys.argv[3]
 cmd = sys.argv[4:]
+input_path = os.environ.get("SLEY_PERF_STDIN_FILE")
+input_handle = open(input_path, "r", encoding="utf-8") if input_path else None
 
 started = time.perf_counter_ns()
 try:
-    completed = subprocess.run(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        timeout=timeout,
-        env=os.environ.copy(),
-    )
-    rc = completed.returncode
-    output = completed.stdout
-except subprocess.TimeoutExpired as exc:
-    rc = 124
-    output = exc.stdout or ""
-    if isinstance(output, bytes):
-        output = output.decode(errors="replace")
+    try:
+        completed = subprocess.run(
+            cmd,
+            stdin=input_handle,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=timeout,
+            env=os.environ.copy(),
+        )
+        rc = completed.returncode
+        output = completed.stdout
+    except subprocess.TimeoutExpired as exc:
+        rc = 124
+        output = exc.stdout or ""
+        if isinstance(output, bytes):
+            output = output.decode(errors="replace")
+finally:
+    if input_handle is not None:
+        input_handle.close()
 
 elapsed_ms = max(1, (time.perf_counter_ns() - started) // 1_000_000)
 with open(output_file, "w", encoding="utf-8") as handle:
@@ -697,6 +708,12 @@ _assert_autoformat_invocations "hook format-file perf: measured delegation" \
 autolint_state=$(_tmpdir)
 export SLEY_PERF_AUTOLINT_COUNT_FILE="$autolint_state/count"
 export SLEY_PERF_AUTOLINT_ARGS_PREFIX="$autolint_state/args"
+# A user with any lint-ignore policy pays config loading on every edit-hook
+# non-match. Keep the existing one-file budget representative of that deployed
+# hot path instead of measuring only the no-config fast path.
+mkdir -p "$repo/.xdg-config/sley/lint-ignore.d"
+printf 'unrelated/generated\n' \
+  >"$repo/.xdg-config/sley/lint-ignore.d/10-unrelated.paths"
 printf '0\n' >"$SLEY_PERF_AUTOLINT_COUNT_FILE"
 {
   printf '%s\n' --json "$repo/hook.py"
@@ -741,6 +758,53 @@ _assert_ms_le "hook lint-file perf: full CLI p95" \
   "$hook_lint_file_p95" "$hook_lint_file_p95_budget"
 _assert_autolint_invocations "hook lint-file perf: measured delegation" \
   "$SLEY_HOOK_PERF_RUNS" "$autolint_state/expected-args"
+
+echo "=== sley: lint-ignore large batch performance ==="
+
+repo=$(_new_perf_repo)
+lint_ignore_input="$repo/lint-ignore-input"
+lint_ignore_provider_log="$repo/lint-ignore-provider-count"
+mkdir -p \
+  "$repo/.xdg-config/sley/extensions.d" \
+  "$repo/.xdg-config/sley/lint-ignore.d"
+printf 'unrelated/generated\n' \
+  >"$repo/.xdg-config/sley/lint-ignore.d/10-unrelated.paths"
+cat >"$repo/.xdg-config/sley/extensions.d/80-count-lint.sh" <<'EOF'
+sley_hook_lint() {
+  local file count=0
+  while IFS= read -r file; do
+    [[ -n "$file" ]] && count=$((count + 1))
+  done <<<"$1"
+  printf '%s\n' "$count" >"$SLEY_PERF_LINT_IGNORE_PROVIDER_LOG"
+}
+EOF
+: >"$lint_ignore_input"
+for ((i = 1; i <= SLEY_LINT_IGNORE_PERF_FILES; i++)); do
+  printf 'packages/app/src/file-%05d.js\n' "$i" >>"$lint_ignore_input"
+done
+export SLEY_PERF_STDIN_FILE="$lint_ignore_input"
+export SLEY_PERF_LINT_IGNORE_PROVIDER_LOG="$lint_ignore_provider_log"
+
+_run_perf_sley_timed 10 "$repo" hook lint --stdin
+_assert_exit "lint-ignore perf: large nonmatching batch exits 0" 0 "$__SLEY_RC"
+_assert_file_content "lint-ignore perf: provider retains every selected path" \
+  "$SLEY_LINT_IGNORE_PERF_FILES" "$lint_ignore_provider_log"
+
+# A configured prefix activates filtering even when it matches nothing. This is
+# the common large-change case that previously rebuilt one growing string for
+# every retained path and therefore became quadratic in total path bytes.
+_measure_perf_stats "lint-ignore perf: large nonmatching batch" 10 "$repo" \
+  "$SLEY_LINT_IGNORE_PERF_RUNS" hook lint --stdin
+lint_ignore_5000_median="$__PERF_MEDIAN"
+lint_ignore_5000_median_budget=$(_perf_budget_ms \
+  "$LINT_IGNORE_5000_MEDIAN_BUDGET_MS" \
+  "$LINT_IGNORE_5000_DARWIN_MEDIAN_BUDGET_MS")
+echo "  PERF: lint-ignore ${SLEY_LINT_IGNORE_PERF_FILES} files median ${lint_ignore_5000_median}ms / ${lint_ignore_5000_median_budget}ms (runs ${SLEY_LINT_IGNORE_PERF_RUNS})"
+_assert_ms_le "lint-ignore perf: large nonmatching batch median" \
+  "$lint_ignore_5000_median" "$lint_ignore_5000_median_budget"
+_assert_file_content "lint-ignore perf: measured runs retain every selected path" \
+  "$SLEY_LINT_IGNORE_PERF_FILES" "$lint_ignore_provider_log"
+unset SLEY_PERF_STDIN_FILE SLEY_PERF_LINT_IGNORE_PROVIDER_LOG
 
 echo "=== sley: check performance ==="
 

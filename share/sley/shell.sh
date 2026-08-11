@@ -87,9 +87,12 @@ _sley_shell_options() {
       printf '%s\n' "--json"
       ;;
     ready)
-      printf '%s\n' "--fix --full --force --exclude --quiet --commit --include-untracked --repo-wide --path --json"
+      printf '%s\n' "--fix --full --force --exclude --quiet --no-lint-ignore --commit --include-untracked --repo-wide --path --json"
       ;;
-    changes | fix | check | secrets | verify)
+    check)
+      printf '%s\n' "--no-lint-ignore --commit --include-untracked --repo-wide --path --json"
+      ;;
+    changes | fix | secrets | verify)
       printf '%s\n' "--commit --include-untracked --repo-wide --path --json"
       ;;
   esac

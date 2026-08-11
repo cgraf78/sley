@@ -81,6 +81,47 @@ _assert_contains "extension: matching file discovers the example command" \
 _assert_contains "extension: placeholder remains suggested" \
   '"required":false' "$extension_out"
 
+git -C "$repo" restore config/example.schema
+lint_mock_bin=$(_tmpdir)
+mkdir -p \
+  "$repo/vendor/generated" \
+  "$repo/web/legacy" \
+  "$home/config/sley/lint-ignore.d"
+printf 'initial\n' >"$repo/vendor/generated/cache.txt"
+printf 'initial\n' >"$repo/web/legacy/ui.js"
+git -C "$repo" add vendor/generated/cache.txt web/legacy/ui.js
+git -C "$repo" commit -q -m "seed generated example"
+printf 'changed\n' >>"$repo/src/app.txt"
+printf 'changed\n' >>"$repo/vendor/generated/cache.txt"
+printf 'changed\n' >>"$repo/web/legacy/ui.js"
+cp "$EXAMPLES/lint-ignore.d/10-generated.paths" \
+  "$home/config/sley/lint-ignore.d/10-generated.paths"
+example_lint_log=$repo/example-lint.log
+cat >"$lint_mock_bin/autolint" <<'EOF'
+#!/usr/bin/env bash
+printf '<%s>' "$@" >"$SLEY_EXAMPLE_LINT_LOG"
+EOF
+chmod +x "$lint_mock_bin/autolint"
+lint_ignore_out=$(
+  cd "$repo" || exit 1
+  HOME="$home" XDG_CONFIG_HOME="$home/config" \
+    SLEY_EXTENSION_DIR="$home/extensions" \
+    SLEY_EXAMPLE_LINT_LOG="$example_lint_log" \
+    PATH="$lint_mock_bin:$PATH" "$SLEY" check --repo-wide 2>&1
+)
+lint_ignore_rc=$?
+_assert_exit "lint ignore: copyable config is accepted" 0 "$lint_ignore_rc"
+_assert_contains "lint ignore: ordinary changed path reaches the provider" \
+  '<src/app.txt>' "$(cat "$example_lint_log" 2>/dev/null)"
+_assert_not_contains "lint ignore: configured subtree does not reach the provider" \
+  'vendor/generated/cache.txt' "$(cat "$example_lint_log" 2>/dev/null)"
+_assert_not_contains "lint ignore: every shipped prefix stays executable" \
+  'web/legacy/ui.js' "$(cat "$example_lint_log" 2>/dev/null)"
+_assert_contains "lint ignore: runtime reports both example exclusions" \
+  'ignored lint for 2 configured files' "$lint_ignore_out"
+_assert_not_contains "lint ignore: copyable config emits no parser warning" \
+  'lint-ignore' "$lint_ignore_out"
+
 mock_bin=$(_tmpdir)
 cat >"$mock_bin/sley" <<'EOF'
 #!/usr/bin/env bash

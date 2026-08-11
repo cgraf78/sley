@@ -86,6 +86,44 @@ No default `sley` command formats or checks the whole repository. In large
 repos, the active diff is the useful project signal even when commands are run
 from the repo root.
 
+## Lint exclusions
+
+User-managed files under `$XDG_CONFIG_HOME/sley/lint-ignore.d/*.paths`, falling
+back to `~/.config/sley/lint-ignore.d/*.paths`, can keep selected files out of
+Sley's lint dispatch. This is user-global policy: every configured prefix is
+considered in every repository, so choose paths specific enough to avoid
+unintended matches elsewhere. Each nonempty, non-comment line is a literal path
+relative to the current repository root. It matches that exact path and
+descendants separated by `/`; an entry for `vendor/generated` does not match
+`vendor/generated-old`. Leading `./` and trailing `/` are normalized. Other
+whitespace is literal, and comments must occupy a whole line. Absolute paths,
+repository roots, empty path components, and `.` or `..` traversal are rejected
+with a warning and never broaden the ignored set.
+
+```text
+# Generated elsewhere and linted by CI.
+vendor/generated
+web/legacy
+```
+
+Lint exclusions apply consistently to `sley check`, the check phase of
+`sley ready`, and the `sley hook lint` and `sley hook lint-file` entry points.
+Filtering happens before dispatch to the configured lint provider, including a
+provider supplied by an extension. Sley reports the number of excluded files;
+if every selected file is excluded, it does not start the lint provider.
+
+This policy is deliberately lint-only. The original selected file set still
+drives formatting, status, secrets, validation, and verification. Directly
+invoking the underlying lint provider also remains unfiltered, so repository CI
+and explicit provider commands retain their own coverage. Run `sley check
+--no-lint-ignore` or `sley ready --no-lint-ignore` to lint every selected file,
+or set `SLEY_LINT_IGNORE=0` for low-level hook commands. Set
+`SLEY_LINT_IGNORE_DIR` to select an explicit configuration directory.
+
+See [`examples/lint-ignore.d/10-generated.paths`](examples/lint-ignore.d/10-generated.paths)
+for a copyable configuration. The examples test executes that file through the
+production parser so its documented behavior cannot drift silently.
+
 `sley fix --commit` formats commit-input files: staged files in Git and pending
 files in Sapling. In Git, it formats worktree files but does not update the
 index. If formatting changes a staged file, it reports the file and tells the
@@ -269,6 +307,11 @@ or `~/.config/sley/extensions.d/*.sh` otherwise. These files may override the
 documented `sley_hook_*` functions. Set `SLEY_EXTENSION_DIR` when an integration
 needs to source extensions from a test fixture or another managed config
 location.
+
+Extensions that override `sley_hook_lint` or `sley_hook_lint_file` receive the
+already-filtered file set when Sley invokes them through `check`, `ready`, or
+the hook CLI. Lint-ignore policy therefore belongs in the declarative config
+directory rather than being reimplemented by individual providers.
 
 Extensions may also provide `sley_ext_verify_commands <files>` to print additional
 `sley verify` command items as JSON lines. Those items use the same shape as
