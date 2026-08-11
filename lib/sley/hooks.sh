@@ -683,7 +683,7 @@ _sley_lint_ignore_filter_files() {
   # Write both outputs into caller-local dynamic variables. Avoiding command
   # substitution here matters for large changes: filtering thousands of paths
   # stays in one shell process and never launches a subprocess per file.
-  local files_text="$1" file root_abs caller_abs caller_logical
+  local files_text="$1" file root_abs caller_abs caller_logical alias_candidate alias_abs
   local _SLEY_LINT_IGNORE_ROOT="${_REPO_ROOT:-}"
   local _SLEY_LINT_IGNORE_ROOT_ABS=""
   local _SLEY_LINT_IGNORE_CALLER_PREFIX=""
@@ -728,11 +728,16 @@ _sley_lint_ignore_filter_files() {
     "$root_abs"/*)
       _SLEY_LINT_IGNORE_CALLER_PREFIX=${caller_abs#"$root_abs"/}
       # Only derive an alias when the logical and physical caller paths agree
-      # on the repository-relative suffix. That proof prevents an unrelated
-      # absolute path from being reinterpreted as an ignored in-repo file.
+      # on the repository-relative suffix *and* the resulting candidate resolves
+      # to the real repository root. The second proof rejects a symlink that
+      # targets only one repository subdirectory from an unrelated parent.
       case "$caller_logical" in
         */"$_SLEY_LINT_IGNORE_CALLER_PREFIX")
-          _SLEY_LINT_IGNORE_CALLER_ROOT=${caller_logical%"/$_SLEY_LINT_IGNORE_CALLER_PREFIX"}
+          alias_candidate=${caller_logical%"/$_SLEY_LINT_IGNORE_CALLER_PREFIX"}
+          alias_abs=$(_repo_physical_dir "$alias_candidate" || true)
+          if [[ "$alias_abs" == "$root_abs" ]]; then
+            _SLEY_LINT_IGNORE_CALLER_ROOT="$alias_candidate"
+          fi
           ;;
       esac
       ;;

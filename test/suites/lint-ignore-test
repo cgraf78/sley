@@ -239,6 +239,27 @@ _assert_contains "hook batch subdir: ignores rooted relative and absolute files"
   "sley lint: ignored 2 configured files" "$hook_out"
 
 : >"$lint_log"
+leaf_alias_parent=$(_tmpdir)
+mkdir -p "$leaf_alias_parent/vendor/generated"
+ln -s "$repo/sub" "$leaf_alias_parent/sub"
+printf 'outside\n' >"$leaf_alias_parent/vendor/generated/outside.py"
+hook_out=$(
+  cd "$leaf_alias_parent/sub" || exit 1
+  printf '%s\n' \
+    ignored.py \
+    "$leaf_alias_parent/vendor/generated/outside.py" |
+    HOME="$home" XDG_CONFIG_HOME="$home/config" \
+      GIT_CONFIG_GLOBAL="$repo/.gitconfig-test" PATH="$mock_bin:$PATH" \
+      "$SLEY" hook lint --stdin 2>&1
+)
+hook_rc=$?
+_assert_exit "hook batch leaf alias: mixed input succeeds" 0 "$hook_rc"
+_assert_file_content "hook batch leaf alias: outside absolute path remains linted" \
+  "call:<--><$leaf_alias_parent/vendor/generated/outside.py>" "$lint_log"
+_assert_contains "hook batch leaf alias: only the proven in-repo file is ignored" \
+  "sley lint: ignored 1 configured file" "$hook_out"
+
+: >"$lint_log"
 hook_out=$(
   cd "$repo" || exit 1
   printf '%s\n' vendor/generated/skip.py web/legacy/ui.ts |
