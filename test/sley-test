@@ -74,6 +74,8 @@ if [[ "${SLEY_SKIP_SHELLCHECK:-0}" != 1 ]]; then
   shellcheck -x -P SCRIPTDIR \
     "${runtime_shell_files[@]}" \
     "$root/install.sh" \
+    "$root/scripts/checkout-installer.conf" \
+    "$root/support/install-checkout.sh" \
     "$test_dir/sley-test" \
     "$test_dir/helpers.sh" \
     "$test_dir"/suites/*-test
