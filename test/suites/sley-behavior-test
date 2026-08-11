@@ -5191,6 +5191,46 @@ _assert_exit "secrets message: one-job compatibility scan succeeds" 0 "$__EMC_RC
 _assert_file_content "secrets message: one-job compatibility scan stays serial" \
   $'start:base\nfinish:base\nstart:extra\nfinish:extra' "$MOCK_LOG"
 
+# --- message path: caller command shadows cannot misclassify gitleaks --------
+# Sley is sourceable, so caller functions participate in ordinary command
+# lookup. A function named `type` must not convince the scheduler that a
+# function-backed gitleaks is an executable: that compatibility path has always
+# run serially in the caller's Bash environment.
+repo=$(_new_repo)
+ext=$(_tmpdir)
+cfg="$repo/extra-policy.toml"
+: >"$cfg"
+cat >"$ext/80-extra.sh" <<EOF
+_sley_hook_secrets_extra_configs() { printf '%s\n' '$cfg'; }
+EOF
+export MOCK_LOG="$repo/gl.log"
+: >"$MOCK_LOG"
+printf 'ordinary message\n' >"$repo/msg"
+# shellcheck disable=SC2329 # Exported for indirect command lookup in the Sley child.
+gitleaks() {
+  printf 'gitleaks:%s\n' "$*" >>"$MOCK_LOG"
+  cat >/dev/null
+}
+# shellcheck disable=SC2329 # The child must bypass this exported command shadow.
+type() {
+  if [[ "${1:-}" == -t && "${2:-}" == gitleaks ]]; then
+    printf 'file\n'
+  elif [[ "${1:-}" == -P && "${2:-}" == gitleaks ]]; then
+    printf 'file\n'
+  else
+    builtin type "$@"
+  fi
+}
+export -f gitleaks type
+__EMC_OUT=$(cd "$repo" && GIT_CONFIG_GLOBAL="$repo/.gitconfig-test" \
+  SLEY_EXTENSION_DIR="$ext" SLEY_SECRETS_JOBS=2 \
+  "$SLEY" secrets --message-file "$repo/msg" 2>&1)
+__EMC_RC=$?
+unset -f gitleaks type
+_assert_exit "secrets message: caller type shadow preserves function scanner" 0 "$__EMC_RC"
+scan_count=$(awk 'END { print NR + 0 }' "$MOCK_LOG")
+_assert_eq "secrets message: function scanner still runs every policy" "2" "$scan_count"
+
 # --- message path: failed diagnostics keep order and newline normalization ---
 # Command substitution historically merges both streams, strips every trailing
 # newline, then emits exactly one. Preserve that byte-level behavior while a
@@ -5230,6 +5270,84 @@ else
 fi
 _assert_file_content "secrets message: failed diagnostics remain on stderr" "" "$repo/actual-stdout"
 
+# --- message path: bounded scheduler drains every wave ---------------------
+# More policies than workers forces the scheduler to refill its two slots.
+# Check observable semantics instead of elapsed time so this proves multi-wave
+# coverage without making CI depend on host speed or process scheduling.
+repo=$(_new_repo)
+mockbin=$(_mock_bin)
+ext=$(_tmpdir)
+capture=$(_tmpdir)
+for config_number in 1 2 3 4; do
+  : >"$repo/extra-$config_number.toml"
+done
+cat >"$ext/80-extra.sh" <<EOF
+_sley_hook_secrets_extra_configs() {
+  printf '%s\n' \
+    '$repo/extra-1.toml' \
+    '$repo/extra-2.toml' \
+    '$repo/extra-3.toml' \
+    '$repo/extra-4.toml'
+}
+EOF
+cat >"$mockbin/gitleaks" <<'MOCK'
+#!/usr/bin/env bash
+label=base
+while (($#)); do
+  if [[ "$1" == --config ]]; then
+    label=${2##*/}
+    break
+  fi
+  shift
+done
+cat >"$MOCK_CAPTURE/$label.input"
+case "$label" in
+  base)
+    printf 'diag:base\n' >&2
+    exit 1
+    ;;
+  extra-3.toml)
+    printf 'diag:extra-3.toml\n' >&2
+    exit 2
+    ;;
+esac
+exit 0
+MOCK
+chmod +x "$mockbin/gitleaks"
+export MOCK_CAPTURE="$capture"
+printf 'ordinary message\n' >"$repo/msg"
+printf 'ordinary message\n' >"$repo/expected-input"
+printf 'diag:base\ndiag:extra-3.toml\n' >"$repo/expected-stderr"
+(cd "$repo" && GIT_CONFIG_GLOBAL="$repo/.gitconfig-test" \
+  SLEY_EXTENSION_DIR="$ext" SLEY_SECRETS_JOBS=2 PATH="$mockbin:$PATH" \
+  "$SLEY" secrets --message-file "$repo/msg" \
+  >"$repo/actual-stdout" 2>"$repo/actual-stderr")
+__EMC_RC=$?
+_assert_exit "secrets message: multi-wave scan preserves maximum status" 2 "$__EMC_RC"
+multi_wave_inputs=0
+multi_wave_inputs_match=yes
+for input_file in "$capture"/*.input; do
+  [[ -f "$input_file" ]] || continue
+  multi_wave_inputs=$((multi_wave_inputs + 1))
+  cmp -s "$repo/expected-input" "$input_file" || multi_wave_inputs_match=no
+done
+_assert_eq "secrets message: multi-wave scan runs every policy" "5" "$multi_wave_inputs"
+_assert_eq "secrets message: multi-wave scan preserves input bytes" \
+  "yes" "$multi_wave_inputs_match"
+multi_wave_labels_complete=yes
+for label in base extra-1.toml extra-2.toml extra-3.toml extra-4.toml; do
+  [[ -f "$capture/$label.input" ]] || multi_wave_labels_complete=no
+done
+_assert_eq "secrets message: multi-wave scan covers every declaration" \
+  "yes" "$multi_wave_labels_complete"
+if cmp -s "$repo/expected-stderr" "$repo/actual-stderr"; then
+  _pass "secrets message: multi-wave diagnostics retain declaration order"
+else
+  _fail "secrets message: multi-wave diagnostics retain declaration order"
+fi
+_assert_file_content "secrets message: multi-wave diagnostics stay on stderr" \
+  "" "$repo/actual-stdout"
+
 # --- message path: signal-shaped scanner rc does not mean parent cancellation
 # A scanner is allowed to return 129/130/143 as an ordinary failure. Continue
 # every configured scan and aggregate that status without entering the parent's
@@ -5259,8 +5377,9 @@ __EMC_OUT=$(cd "$repo" && GIT_CONFIG_GLOBAL="$repo/.gitconfig-test" \
   "$SLEY" secrets --message-file "$repo/msg" 2>&1)
 __EMC_RC=$?
 _assert_exit "secrets message: signal-shaped scanner status is preserved" 143 "$__EMC_RC"
+LC_ALL=C sort "$MOCK_LOG" >"$repo/sorted-log"
 _assert_file_content "secrets message: signal-shaped scanner status does not skip policies" \
-  $'base\nextra' "$MOCK_LOG"
+  $'base\nextra' "$repo/sorted-log"
 
 # --- extra-config also runs a worktree (gitleaks dir) pass ------------------
 repo=$(_new_repo)

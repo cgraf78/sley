@@ -907,19 +907,44 @@ _sley_secrets_message_file() {
   # concern, not the secrets gate's.
   [[ -n "$cleaned" ]] || return 0
 
-  local rc=0 scan_rc cfg
-  local -a base_args
+  local rc=0 scan_rc cfg jobs gitleaks_type
+  local -a base_args extra_configs=() scan_items=()
+  while IFS= read -r cfg; do
+    [[ -n "$cfg" ]] && extra_configs+=("$cfg")
+  done < <(_sley_secrets_extra_config_list "$extension_dir")
+
+  # A base-only message already performs the minimum one scanner invocation.
+  # Preserve that common path exactly. With additional independent policies,
+  # overlap external gitleaks processes only when the caller allows at least
+  # two jobs; shell functions remain serial because they share caller state.
+  if [[ "${#extra_configs[@]}" -gt 0 ]]; then
+    jobs=${SLEY_SECRETS_JOBS:-$(_sley_secrets_default_jobs)}
+    case "$jobs" in
+      '' | *[!0-9]*) jobs=1 ;;
+    esac
+    [[ "$jobs" -lt 1 ]] && jobs=1
+    gitleaks_type=$(builtin type -t gitleaks 2>/dev/null || true)
+    if [[ "$jobs" -gt 1 && "$gitleaks_type" == file ]]; then
+      # Empty is an unambiguous base-policy sentinel because validated extra
+      # config paths are always nonempty. Preserve every later element,
+      # including duplicates, so concurrency never narrows secret coverage.
+      scan_items=("")
+      scan_items+=("${extra_configs[@]}")
+      _sley_secrets_scan_parallel message "$cleaned" "$jobs" "${scan_items[@]}"
+      return $?
+    fi
+  fi
+
   _sley_gitleaks_args
   base_args=("${_SLEY_GITLEAKS_ARGS[@]}" --verbose)
   _sley_gitleaks_scan_text "$cleaned" "${base_args[@]}" || scan_rc=$?
   scan_rc=${scan_rc:-0}
   [[ "$scan_rc" -gt "$rc" ]] && rc=$scan_rc
-  while IFS= read -r cfg; do
-    [[ -n "$cfg" ]] || continue
+  for cfg in "${extra_configs[@]+"${extra_configs[@]}"}"; do
     scan_rc=0
     _sley_gitleaks_scan_text "$cleaned" --redact --no-banner --verbose --config "$cfg" || scan_rc=$?
     [[ "$scan_rc" -gt "$rc" ]] && rc=$scan_rc
-  done < <(_sley_secrets_extra_config_list "$extension_dir")
+  done
   return "$rc"
 }
 
@@ -945,6 +970,17 @@ _sley_secrets_print_failed_scan_output() {
   [[ "$scan_rc" -eq 0 ]] && return 0
   _sley_secrets_replay_scan_output "$stdout_file"
   _sley_secrets_replay_scan_output "$stderr_file" >&2
+}
+
+_sley_secrets_print_failed_message_output() {
+  local scan_rc="$1" diagnostics_file="$2" diagnostics=""
+  [[ "$scan_rc" -eq 0 || ! -s "$diagnostics_file" ]] && return 0
+  # The historical message path used command substitution around merged
+  # stdout/stderr. Bash therefore removed every trailing newline before Sley
+  # emitted exactly one. Read with the same shell primitive so parallel output
+  # buffering cannot subtly change commit-hook diagnostics.
+  diagnostics=$(<"$diagnostics_file")
+  [[ -n "$diagnostics" ]] && printf '%s\n' "$diagnostics" >&2
 }
 
 _sley_secrets_parallel_job_is_active() {
@@ -1191,23 +1227,29 @@ _sley_secrets_parallel_allocate_directory() {
 }
 
 _sley_secrets_scan_batch() {
-  local gitleaks_executable="$1"
-  local combine_diagnostics="$2"
-  shift 2
-  local rc=0 scan_rc file stdout_file stderr_file pid index offset
-  local -a files=("$@")
+  local scan_mode="$1" scan_input="$2" gitleaks_executable="$3"
+  local combine_diagnostics="$4"
+  shift 4
+  local rc=0 scan_rc item stdout_file stderr_file pid index offset
+  local -a items=("$@")
   local -a gitleaks_args
-  _sley_gitleaks_args
-  gitleaks_args=("${_SLEY_GITLEAKS_ARGS[@]}")
+  case "$scan_mode" in
+    worktree)
+      _sley_gitleaks_args
+      gitleaks_args=("${_SLEY_GITLEAKS_ARGS[@]}")
+      ;;
+    message) ;;
+    *) return 2 ;;
+  esac
 
   _sley_secrets_parallel_pids=()
-  # The allocator creates one output pair per concurrent slot, not per file.
+  # The allocator creates one output pair per concurrent slot, not per item.
   # This function waits the entire wave before returning, so the serial outer
   # loop can safely reuse each offset without retaining a second path ledger.
-  for offset in "${!files[@]}"; do
+  for offset in "${!items[@]}"; do
     [[ "$_sley_secrets_parallel_signal_status" -eq 0 ]] || return 0
     index=$offset
-    file=${files[$offset]}
+    item=${items[$offset]}
     stdout_file="$_sley_secrets_parallel_scratch_dir/stdout.$offset"
     stderr_file="$_sley_secrets_parallel_scratch_dir/stderr.$offset"
     [[ "$_sley_secrets_parallel_signal_status" -eq 0 ]] || return 0
@@ -1217,13 +1259,26 @@ _sley_secrets_scan_batch() {
     # Contain only that shell bookkeeping while publishing `$!` in the same
     # parent shell. The historical sequential paths merged both scanner streams
     # to stderr; preserve that contract while parallel scans retain distinct,
-    # file-ordered stdout/stderr replay.
+    # declaration-ordered stdout/stderr replay.
     {
-      if [[ "$combine_diagnostics" == 1 ]]; then
-        "$gitleaks_executable" dir "${gitleaks_args[@]}" -- "$file" </dev/null \
+      if [[ "$scan_mode" == message ]]; then
+        if [[ -z "$item" ]]; then
+          _sley_gitleaks_args
+          gitleaks_args=("${_SLEY_GITLEAKS_ARGS[@]}" --verbose)
+        else
+          gitleaks_args=(--redact --no-banner --verbose --config "$item")
+        fi
+        # A here-string preserves the old `printf '%s\n'` input bytes while
+        # keeping gitleaks as the direct tracked child. Backgrounding a shell
+        # wrapper instead would let cancellation reap the wrapper and orphan
+        # the scanner that actually holds the commit message.
+        "$gitleaks_executable" stdin "${gitleaks_args[@]}" <<<"$scan_input" \
+          >|"$stderr_file" 2>&1 &
+      elif [[ "$combine_diagnostics" == 1 ]]; then
+        "$gitleaks_executable" dir "${gitleaks_args[@]}" -- "$item" </dev/null \
           >|"$stderr_file" 2>&1 &
       else
-        "$gitleaks_executable" dir "${gitleaks_args[@]}" -- "$file" </dev/null \
+        "$gitleaks_executable" dir "${gitleaks_args[@]}" -- "$item" </dev/null \
           >|"$stdout_file" 2>|"$stderr_file" &
       fi
       pid=$!
@@ -1232,7 +1287,7 @@ _sley_secrets_scan_batch() {
     [[ "$_sley_secrets_parallel_signal_status" -eq 0 ]] || return 0
   done
 
-  for offset in "${!files[@]}"; do
+  for offset in "${!items[@]}"; do
     index=$offset
     pid=${_sley_secrets_parallel_pids[$index]}
     stdout_file="$_sley_secrets_parallel_scratch_dir/stdout.$offset"
@@ -1265,7 +1320,11 @@ _sley_secrets_scan_batch() {
       return 0
     fi
     _sley_secrets_parallel_pids[index]=""
-    _sley_secrets_print_failed_scan_output "$scan_rc" "$stdout_file" "$stderr_file"
+    if [[ "$scan_mode" == message ]]; then
+      _sley_secrets_print_failed_message_output "$scan_rc" "$stderr_file"
+    else
+      _sley_secrets_print_failed_scan_output "$scan_rc" "$stdout_file" "$stderr_file"
+    fi
     [[ "$_sley_secrets_parallel_signal_status" -eq 0 ]] || return 0
     # Preserve the MAX exit code across batch members. gitleaks's exit-code
     # protocol overloads severity onto the numeric value (1 = leaks found,
@@ -1281,7 +1340,9 @@ _sley_secrets_scan_batch() {
   return "$rc"
 }
 
-_sley_secrets_scan_worktree_files() {
+_sley_secrets_scan_parallel() {
+  local scan_mode="$1" scan_input="$2" requested_jobs="$3"
+  shift 3
   local cancellation_output_name=""
   # Scanner failures may use the same numeric statuses as shell signals. Keep
   # parent cancellation on a separate output channel so callers do not infer
@@ -1303,18 +1364,18 @@ _sley_secrets_scan_worktree_files() {
   local _sley_secrets_parallel_rm=""
   local _sley_secrets_parallel_rmdir=""
   local _sley_secrets_parallel_scratch_dir=""
-  local -a files=("$@")
+  local -a items=("$@")
   local -a _sley_secrets_parallel_pids=()
   local -a _sley_secrets_parallel_output_files=()
   local -a _sley_secrets_parallel_output_dirs=()
-  [[ "${#files[@]}" -eq 0 ]] && return 0
-  jobs=${SLEY_SECRETS_JOBS:-$(_sley_secrets_default_jobs)}
+  [[ "${#items[@]}" -eq 0 ]] && return 0
+  jobs=${requested_jobs:-${SLEY_SECRETS_JOBS:-$(_sley_secrets_default_jobs)}}
   case "$jobs" in
     '' | *[!0-9]*) jobs=1 ;;
   esac
   [[ "$jobs" -lt 1 ]] && jobs=1
 
-  gitleaks_type=$(type -t gitleaks 2>/dev/null || true)
+  gitleaks_type=$(builtin type -t gitleaks 2>/dev/null || true)
   if [[ "$gitleaks_type" == function ]]; then
     # A function cannot be resolved to an executable, but it can run as an
     # exact background child in Bash. Force one-at-a-time waves to preserve
@@ -1324,7 +1385,7 @@ _sley_secrets_scan_worktree_files() {
     jobs=1
     combine_diagnostics=1
   elif [[ "$gitleaks_type" == file ]]; then
-    if ! gitleaks_executable=$(type -P gitleaks 2>/dev/null); then
+    if ! gitleaks_executable=$(builtin type -P gitleaks 2>/dev/null); then
       _sley_die "unable to resolve gitleaks executable"
       return 2
     fi
@@ -1338,10 +1399,14 @@ _sley_secrets_scan_worktree_files() {
   # authored cross-stream order. Keep that compatibility behavior; only true
   # parallel waves use the split-descriptor replay contract.
   [[ "$jobs" -ne 1 ]] || combine_diagnostics=1
+  # Commit-message scans historically merged scanner streams before surfacing
+  # a failure. Keep that contract for concurrent waves too; deterministic item
+  # replay still preserves base/config declaration order.
+  [[ "$scan_mode" != message ]] || combine_diagnostics=1
 
-  # Every worktree scan, including a configured one-job wave, now uses the
-  # cancellable ownership protocol. Resolve the filesystem primitives up front
-  # and fail before launching a scanner if exact cleanup cannot be guaranteed.
+  # Every scheduled scan uses the cancellable ownership protocol. Resolve the
+  # filesystem primitives up front and fail before launching a scanner if exact
+  # cleanup cannot be guaranteed.
   _sley_secrets_parallel_mkdir=$(builtin type -P mkdir 2>/dev/null || true)
   _sley_secrets_parallel_rm=$(builtin type -P rm 2>/dev/null || true)
   _sley_secrets_parallel_rmdir=$(builtin type -P rmdir 2>/dev/null || true)
@@ -1352,14 +1417,14 @@ _sley_secrets_scan_worktree_files() {
     return 2
   fi
   scratch_slots=$jobs
-  [[ "$scratch_slots" -le "${#files[@]}" ]] || scratch_slots=${#files[@]}
+  [[ "$scratch_slots" -le "${#items[@]}" ]] || scratch_slots=${#items[@]}
 
-  # `gitleaks dir <single-file>` has high process startup overhead compared
-  # with the bytes scanned. Overlap independent worktree scans, but collect
-  # output in file order so the human `ready` report stays deterministic. A
-  # single operation-scoped signal latch owns every wave: handlers only
-  # record the first signal, while normal control flow reaps exact scanner
-  # PIDs and removes exact temp paths before restoring caller traps.
+  # Gitleaks startup dominates both a single-file scan and an additional commit
+  # message policy pass. Overlap independent items, but collect output in input
+  # order so diagnostics stay deterministic. A single operation-scoped signal
+  # latch owns every wave: handlers only record the first signal, while normal
+  # control flow reaps exact scanner PIDs and removes exact temp paths before
+  # restoring caller traps.
   _sley_secrets_parallel_saved_hup=$(trap -p HUP)
   _sley_secrets_parallel_saved_int=$(trap -p INT)
   _sley_secrets_parallel_saved_term=$(trap -p TERM)
@@ -1378,7 +1443,7 @@ _sley_secrets_scan_worktree_files() {
       _sley_die "unable to allocate secret scan scratch under ${TMPDIR:-/tmp}"
     fi
   else
-    for ((start = 0; start < ${#files[@]}; start += jobs)); do
+    for ((start = 0; start < ${#items[@]}; start += jobs)); do
       [[ "$_sley_secrets_parallel_signal_status" -eq 0 ]] || break
       # Reset per-batch rc so the previous iteration's value cannot leak in
       # when the current batch passes cleanly. Then promote to `rc` only if
@@ -1386,8 +1451,8 @@ _sley_secrets_scan_worktree_files() {
       # protocol as the single-job path above.
       scan_rc=0
       _sley_secrets_scan_batch \
-        "$gitleaks_executable" "$combine_diagnostics" \
-        "${files[@]:start:jobs}" || scan_rc=$?
+        "$scan_mode" "$scan_input" "$gitleaks_executable" \
+        "$combine_diagnostics" "${items[@]:start:jobs}" || scan_rc=$?
       [[ "$_sley_secrets_parallel_signal_status" -eq 0 ]] || break
       [[ "$scan_rc" -gt "$rc" ]] && rc=$scan_rc
     done
@@ -1452,6 +1517,10 @@ _sley_secrets_scan_worktree_files() {
   fi
 
   return "$rc"
+}
+
+_sley_secrets_scan_worktree_files() {
+  _sley_secrets_scan_parallel worktree "" "" "$@"
 }
 
 _sley_secrets() {
