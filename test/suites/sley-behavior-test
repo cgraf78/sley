@@ -148,6 +148,24 @@ _sley_test_xdg_config_home() {
   fi
 }
 
+_files_equal_exact() {
+  local left="$1" right="$2" left_content="" right_content=""
+  local left_bytes="" right_bytes=""
+
+  [[ -f "$left" && -f "$right" ]] || return 1
+  # The minimal Arch and Fedora images intentionally omit diffutils, so `cmp`
+  # is not a portable test dependency. Bash comparison verifies the text while
+  # byte counts retain the trailing-newline distinction command substitution
+  # removes. These fixtures cannot contain NUL because they originate in shell
+  # strings and commit-message text.
+  left_content=$(<"$left")
+  right_content=$(<"$right")
+  [[ "$left_content" == "$right_content" ]] || return 1
+  left_bytes=$(LC_ALL=C wc -c <"$left") || return 1
+  right_bytes=$(LC_ALL=C wc -c <"$right") || return 1
+  [[ "$left_bytes" == "$right_bytes" ]]
+}
+
 _new_repo() {
   local repo
   repo=$(_tmpdir)
@@ -5151,7 +5169,7 @@ inputs_match=yes
 for input_file in "$capture"/input.*; do
   [[ -f "$input_file" ]] || continue
   input_count=$((input_count + 1))
-  cmp -s "$repo/expected-input" "$input_file" || inputs_match=no
+  _files_equal_exact "$repo/expected-input" "$input_file" || inputs_match=no
 done
 _assert_eq "secrets message: base and duplicate policies all run" "3" "$input_count"
 _assert_eq "secrets message: every policy receives identical cleaned bytes" "yes" "$inputs_match"
@@ -5263,7 +5281,7 @@ printf 'stdout:base\nstderr:base\nstdout:extra\nstderr:extra\n' >"$repo/expected
   >"$repo/actual-stdout" 2>"$repo/actual-stderr")
 __EMC_RC=$?
 _assert_exit "secrets message: ordered diagnostic fixture reports a finding" 1 "$__EMC_RC"
-if cmp -s "$repo/expected-stderr" "$repo/actual-stderr"; then
+if _files_equal_exact "$repo/expected-stderr" "$repo/actual-stderr"; then
   _pass "secrets message: diagnostics retain declaration order and normalized newlines"
 else
   _fail "secrets message: diagnostics retain declaration order and normalized newlines"
@@ -5329,7 +5347,7 @@ multi_wave_inputs_match=yes
 for input_file in "$capture"/*.input; do
   [[ -f "$input_file" ]] || continue
   multi_wave_inputs=$((multi_wave_inputs + 1))
-  cmp -s "$repo/expected-input" "$input_file" || multi_wave_inputs_match=no
+  _files_equal_exact "$repo/expected-input" "$input_file" || multi_wave_inputs_match=no
 done
 _assert_eq "secrets message: multi-wave scan runs every policy" "5" "$multi_wave_inputs"
 _assert_eq "secrets message: multi-wave scan preserves input bytes" \
@@ -5340,7 +5358,7 @@ for label in base extra-1.toml extra-2.toml extra-3.toml extra-4.toml; do
 done
 _assert_eq "secrets message: multi-wave scan covers every declaration" \
   "yes" "$multi_wave_labels_complete"
-if cmp -s "$repo/expected-stderr" "$repo/actual-stderr"; then
+if _files_equal_exact "$repo/expected-stderr" "$repo/actual-stderr"; then
   _pass "secrets message: multi-wave diagnostics retain declaration order"
 else
   _fail "secrets message: multi-wave diagnostics retain declaration order"
