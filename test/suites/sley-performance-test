@@ -387,6 +387,62 @@ _write_staged_changed_tree() {
   (cd "$repo" && git add staged)
 }
 
+echo "=== sley: commit-message secret scan concurrency ==="
+
+# Use a condition barrier rather than elapsed-time comparison. Each scanner
+# keeps an active marker only while it is alive and waits for its peer. A serial
+# implementation cannot satisfy the condition; a concurrent implementation can
+# do so regardless of ordinary runner-speed variance.
+repo=$(_new_perf_repo)
+message_mock_bin=$(_mock_bin)
+message_state=$(_tmpdir)
+message_extensions=$(_tmpdir)
+message_config="$repo/extra-policy.toml"
+: >"$message_config"
+cat >"$message_extensions/80-extra.sh" <<EOF
+_sley_hook_secrets_extra_configs() { printf '%s\n' '$message_config'; }
+EOF
+cat >"$message_mock_bin/gitleaks" <<'EOF'
+#!/usr/bin/env bash
+set -u
+
+label=base
+case " $* " in
+  *" --config "*) label=extra ;;
+esac
+active="$SLEY_PERF_MESSAGE_STATE/active.$label"
+: >"$active"
+trap 'rm -f -- "$active"' EXIT
+
+attempt=0
+while [[ ! -f "$SLEY_PERF_MESSAGE_STATE/active.base" ||
+  ! -f "$SLEY_PERF_MESSAGE_STATE/active.extra" ]]; do
+  attempt=$((attempt + 1))
+  [[ "$attempt" -lt 500 ]] || exit 70
+  sleep 0.01
+done
+: >"$SLEY_PERF_MESSAGE_STATE/ready.$label"
+attempt=0
+while [[ ! -f "$SLEY_PERF_MESSAGE_STATE/ready.base" ||
+  ! -f "$SLEY_PERF_MESSAGE_STATE/ready.extra" ]]; do
+  attempt=$((attempt + 1))
+  [[ "$attempt" -lt 500 ]] || exit 71
+  sleep 0.01
+done
+cat >"$SLEY_PERF_MESSAGE_STATE/input.$label"
+EOF
+chmod +x "$message_mock_bin/gitleaks"
+export SLEY_PERF_MESSAGE_STATE="$message_state"
+printf 'ordinary message\n' >"$repo/message"
+PATH="$message_mock_bin:$PATH" \
+  SLEY_EXTENSION_DIR="$message_extensions" SLEY_SECRETS_JOBS=2 \
+  _run_perf_sley_timed 10 "$repo" secrets --message-file "$repo/message"
+_assert_exit "message secrets perf: independent policies overlap" 0 "$__SLEY_RC"
+_assert_file_content "message secrets perf: base receives the message" \
+  "ordinary message" "$message_state/input.base"
+_assert_file_content "message secrets perf: extra policy receives the message" \
+  "ordinary message" "$message_state/input.extra"
+
 echo "=== sley: verify performance ==="
 
 repo=$(_new_perf_repo)
