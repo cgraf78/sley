@@ -9,6 +9,7 @@ files directly keeps behavior on the installed Sley version.
 | --- | --- | --- |
 | `commit-message-template.txt` | Declare required commit-message sections | Any managed config path named by `SLEY_COMMIT_MESSAGE_TEMPLATE` |
 | `verify.json` | Map selected paths to project workflow commands | `.sley/verify.json` or `$XDG_CONFIG_HOME/sley/verify.json` |
+| `lint-ignore.d/10-generated.paths` | Exclude literal paths only from Sley-provided lint dispatch | `$XDG_CONFIG_HOME/sley/lint-ignore.d/` |
 | `extensions.d/80-verify-command.sh` | Select a workflow command dynamically when a static registry is insufficient | `$XDG_CONFIG_HOME/sley/extensions.d/` |
 | `hooks/custom-sley-commit-gate` | Add consumer policy around Sley's Git readiness gate | Any executable path named by `SLEY_GIT_COMMIT_GATE` |
 
@@ -54,6 +55,22 @@ selected command depends on runtime file selection. It emits a suggested JSON
 item only when a matching file is selected. Static mappings are easier to read
 and should stay in `verify.json`; use an extension only when code is genuinely
 needed.
+
+## Lint-ignore paths
+
+`lint-ignore.d/10-generated.paths` demonstrates user-owned lint exclusions.
+Copy it under `$XDG_CONFIG_HOME/sley/lint-ignore.d/`, then replace the generic
+paths with literal repository-relative files or subtrees. Sley aggregates all
+`*.paths` files in that directory, ignores blank lines and `#` comments, and
+matches only an exact path or descendants beneath it. The directory is
+user-global, so use sufficiently repository-specific prefixes. Whitespace is
+literal and comments must occupy a whole line.
+
+The exclusion affects `sley check`, `sley ready`, and Sley's batch and one-file
+lint hooks. It does not suppress formatting, secret scanning, validation,
+verification, direct linter commands, or CI. Use `--no-lint-ignore` with
+`sley check` or `sley ready` when you intentionally want to lint every selected
+file.
 
 ## Git hook policy wrapper
 

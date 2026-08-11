@@ -18,6 +18,7 @@ Sley owns:
 - repo detection across Git, Sapling, and supported bare-repo fallbacks
 - changed-file, commit-input, path, and repo-wide scope selection
 - human, editor, agent, Git-hook, and Sapling-hook command timing
+- user-configured lint-only path exclusion before provider dispatch
 - `sley fix`, `sley check`, `sley hook`, and `sley ready` orchestration
 - `sley verify` command discovery from manifests, the built-in Checkrun verify
   bridge, verify registries, and extensions
@@ -37,9 +38,11 @@ and Checkrun's JSON contracts into editor-native formatters, linters,
 diagnostics, commands, or settings. They should not choose supported filetypes,
 copy language aliases, or rediscover low-level tools.
 
-Dotfiles and project repos own local policy contents: fallback configs,
-project-local tool configs, ignore files, schema association instances, and
-repo-specific verify registry entries.
+Dotfiles own user-global lint-ignore path entries and fallback configs. Project
+repos own their project-local tool configs, schema association instances, and
+repo-specific verify registry entries. Because lint-ignore entries are applied
+across repositories, their prefixes should be specific enough not to suppress
+an unrelated repository's matching path.
 
 ## Check, Fix, Verify, And Ready
 
@@ -49,7 +52,9 @@ the configured formatting backend, which is Checkrun by default.
 `sley check` selects the active file scope and delegates fast read-only
 validation to the configured lint backend, which is Checkrun by default. The
 default path maps to Checkrun's fast automatic lint surface; it is not a second
-place to define language-specific tools.
+place to define language-specific tools. Before provider dispatch, Sley removes
+literal paths configured under the user's `lint-ignore.d`; that exclusion does
+not mutate the selected set used by any other readiness phase.
 
 `sley verify` discovers explicit workflow commands. These commands may be test
 suites, build commands, project health checks, repo-specific analyzers, or the
@@ -94,6 +99,11 @@ language-specific formatter/linter decisions and JSON diagnostics. This keeps
 VS Code, Neovim, shell hooks, human commands, and agent hooks aligned while
 still letting Sley handle when the checks run.
 
+Sley applies user lint exclusions before invoking `lint-file` or batch lint
+providers. Provider extensions must not reinterpret those exclusions or apply
+them to formatting, secrets, validation, or verification. Direct Checkrun and
+repository CI invocations remain outside this Sley-owned routing policy.
+
 Generic Git and Sapling commit launchers live under `share/sley/hooks/` so the
 sequencer and command-skip rules have one provider-owned implementation.
 Consumers still own activation and environment-specific policy. In particular,
@@ -116,7 +126,8 @@ When changing workflow behavior:
 1. Put filetype, language-alias, formatter, linter, schema, diagnostic, and
    fast-check policy in Checkrun.
 2. Put repo scope, hook timing, readiness phase composition, and workflow
-   command discovery in Sley.
+   command discovery in Sley. Keep lint-ignore mechanics in Sley and the
+   concrete path entries in consumer configuration.
 3. Use generic `checkrun verify` or repo-owned commands for explicit
    verification instead of teaching Sley low-level analyzer details.
 4. Keep editor adapters thin: translate public APIs into editor protocols, but

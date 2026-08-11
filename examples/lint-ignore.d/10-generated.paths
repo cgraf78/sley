@@ -1,0 +1,3 @@
+# Literal paths relative to the repository root.
+vendor/generated
+web/legacy
