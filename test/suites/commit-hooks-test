@@ -110,18 +110,26 @@ _assert_file_content "prepare hook: ordinary commits skip readiness" "" "$gate_l
 _assert_file_content "prepare hook: probes sequencer state once" \
   "rev-parse --absolute-git-dir" "$git_log"
 
-: >"$gate_log"
-touch "$git_dir/CHERRY_PICK_HEAD"
-SLEY_TEST_HOOK_NAME="prepare-commit-msg" \
-  SLEY_TEST_GIT_DIR="$git_dir" \
-  SLEY_TEST_GIT_LOG="$git_log" \
-  SLEY_TEST_GATE_LOG="$gate_log" \
-  SLEY_GIT_COMMIT_GATE="$mock_bin/custom-gate" \
-  PATH="$mock_bin:$PATH" \
-  "$git_hooks/prepare-commit-msg" "$message"
-_assert_file_content "prepare hook: sequencer commits run readiness" \
-  "prepare-commit-msg:" "$gate_log"
-rm -f "$git_dir/CHERRY_PICK_HEAD"
+for sequencer_state in CHERRY_PICK_HEAD REVERT_HEAD rebase-merge rebase-apply; do
+  : >"$gate_log"
+  case "$sequencer_state" in
+    *_HEAD) : >"$git_dir/$sequencer_state" ;;
+    *) mkdir "$git_dir/$sequencer_state" ;;
+  esac
+  SLEY_TEST_HOOK_NAME="prepare-commit-msg" \
+    SLEY_TEST_GIT_DIR="$git_dir" \
+    SLEY_TEST_GIT_LOG="$git_log" \
+    SLEY_TEST_GATE_LOG="$gate_log" \
+    SLEY_GIT_COMMIT_GATE="$mock_bin/custom-gate" \
+    PATH="$mock_bin:$PATH" \
+    "$git_hooks/prepare-commit-msg" "$message"
+  _assert_file_content "prepare hook: $sequencer_state runs readiness" \
+    "prepare-commit-msg:" "$gate_log"
+  case "$sequencer_state" in
+    *_HEAD) rm -f "$git_dir/$sequencer_state" ;;
+    *) rmdir "$git_dir/$sequencer_state" ;;
+  esac
+done
 
 : >"$gate_log"
 cat >"$message" <<'EOF'
@@ -138,6 +146,73 @@ SLEY_TEST_HOOK_NAME="prepare-commit-msg" \
   "$git_hooks/prepare-commit-msg" "$message"
 _assert_file_content "prepare hook: generated reverts run readiness" \
   "prepare-commit-msg:" "$gate_log"
+
+echo "=== sley: real Git hook lifecycle ==="
+
+# Direct launcher tests above pin each hook's arguments and failure status.
+# These two small real-Git cases separately prove that Git invokes the public
+# hook filenames at the ordinary-commit and sequencer lifecycle boundaries.
+lifecycle_repo=$(_tmpdir)
+lifecycle_home=$(_tmpdir)
+lifecycle_empty_hooks=$(_tmpdir)
+lifecycle_commit_hooks=$(_tmpdir)
+lifecycle_sequencer_hooks=$(_tmpdir)
+lifecycle_gate_log=$(_tmpdir)/lifecycle-gate.log
+lifecycle_git_config="$lifecycle_home/.gitconfig-test"
+git_exe=$(command -v git)
+mkdir -p "$lifecycle_home/.config"
+: >"$lifecycle_git_config"
+ln -s "$git_hooks/pre-commit" "$lifecycle_commit_hooks/pre-commit"
+ln -s "$git_hooks/prepare-commit-msg" \
+  "$lifecycle_sequencer_hooks/prepare-commit-msg"
+
+_lifecycle_git() {
+  # A user's global includes, hooks, or fsmonitor must never participate in
+  # this provider-owned lifecycle proof. Keep every Git process, including the
+  # hook-spawned child, inside one synthetic configuration authority.
+  HOME="$lifecycle_home" \
+    XDG_CONFIG_HOME="$lifecycle_home/.config" \
+    GIT_CONFIG_GLOBAL="$lifecycle_git_config" \
+    GIT_CONFIG_NOSYSTEM=1 \
+    "$git_exe" -C "$lifecycle_repo" "$@"
+}
+
+_lifecycle_git init -q
+_lifecycle_git config user.email test@example.invalid
+_lifecycle_git config user.name "Sley Test"
+_lifecycle_git config commit.gpgsign false
+_lifecycle_git config core.hooksPath "$lifecycle_empty_hooks"
+printf 'seed\n' >"$lifecycle_repo/base.txt"
+_lifecycle_git add base.txt
+_lifecycle_git commit -q -m seed
+lifecycle_base_branch=$(_lifecycle_git symbolic-ref --short HEAD)
+
+_lifecycle_git checkout -q -b provider-sequencer-fixture
+printf 'sequencer\n' >"$lifecycle_repo/sequencer.txt"
+_lifecycle_git add sequencer.txt
+_lifecycle_git commit -q -m "sequencer fixture"
+lifecycle_sequencer_commit=$(_lifecycle_git rev-parse HEAD)
+_lifecycle_git checkout -q "$lifecycle_base_branch"
+
+: >"$lifecycle_gate_log"
+_lifecycle_git config core.hooksPath "$lifecycle_commit_hooks"
+printf 'ordinary\n' >>"$lifecycle_repo/base.txt"
+_lifecycle_git add base.txt
+SLEY_TEST_HOOK_NAME=pre-commit \
+  SLEY_TEST_GATE_LOG="$lifecycle_gate_log" \
+  SLEY_GIT_COMMIT_GATE="$mock_bin/custom-gate" \
+  _lifecycle_git commit -q -m ordinary
+_assert_file_content "Git lifecycle: ordinary commit invokes pre-commit gate" \
+  "pre-commit:" "$lifecycle_gate_log"
+
+: >"$lifecycle_gate_log"
+_lifecycle_git config core.hooksPath "$lifecycle_sequencer_hooks"
+SLEY_TEST_HOOK_NAME=prepare-commit-msg \
+  SLEY_TEST_GATE_LOG="$lifecycle_gate_log" \
+  SLEY_GIT_COMMIT_GATE="$mock_bin/custom-gate" \
+  _lifecycle_git cherry-pick "$lifecycle_sequencer_commit" >/dev/null
+_assert_file_content "Git lifecycle: sequencer invokes prepare-commit-msg gate" \
+  "prepare-commit-msg:" "$lifecycle_gate_log"
 
 echo "=== sley: generic Git commit-message hook ==="
 
