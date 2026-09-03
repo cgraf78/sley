@@ -19,13 +19,15 @@ _sley_shell_source_path() {
 }
 
 _sley_shell_dir() {
-  local source path
+  # In zsh, lowercase `path` is tied to PATH. Localizing that name would hide
+  # every executable while the subshell's cd runs any registered chpwd hooks.
+  local source source_dir
   source=$(_sley_shell_source_path) || return 1
   case "$source" in
-    */*) path="${source%/*}" ;;
-    *) path="." ;;
+    */*) source_dir="${source%/*}" ;;
+    *) source_dir="." ;;
   esac
-  (cd -P -- "$path" 2>/dev/null && pwd)
+  (cd -P -- "$source_dir" 2>/dev/null && pwd)
 }
 
 _sley_verify_schema_default() {

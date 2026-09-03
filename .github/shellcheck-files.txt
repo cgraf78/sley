@@ -31,6 +31,7 @@ program	test/suites/message-validation-test
 program	test/suites/nvim-test
 program	test/suites/ready-cancellation-test
 program	test/suites/secrets-cancellation-test
+program	test/suites/shell-test
 program	test/suites/sley-behavior-test
 program	test/suites/sley-performance-test
 program	test/suites/timeout-test
