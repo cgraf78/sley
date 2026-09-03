@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# shell-test — cross-shell integration behavior.
+
+set -euo pipefail
+
+test_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
+root="${test_dir%/test}"
+# shellcheck source=test/helpers.sh
+. "$test_dir/helpers.sh"
+
+if command -v zsh >/dev/null 2>&1; then
+  path_log=$(_tmpdir)/chpwd-paths
+  original_path=$PATH
+  output=$(
+    PATH="$original_path" SLEY_VERIFY_SCHEMA='' zsh -f -c '
+      path_log=$1
+      integration=$2
+      capture_chpwd_path() {
+        print -r -- "$PATH" >>"$path_log"
+      }
+      chpwd_functions=(capture_chpwd_path)
+      . "$integration"
+      print -r -- "$PATH"
+    ' _ "$path_log" "$root/share/sley/shell.sh"
+  )
+
+  _assert_eq "zsh integration: directory hooks retain PATH" \
+    "$original_path" "$(<"$path_log")"
+  _assert_eq "zsh integration: sourcing retains PATH" \
+    "$original_path" "$output"
+else
+  _pass "zsh integration: skipped without zsh"
+fi
+
+_test_summary
