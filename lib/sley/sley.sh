@@ -1052,10 +1052,14 @@ _sley_secrets_parallel_record_signal() {
 
 _sley_secrets_parallel_stop_children() {
   local attempt index pid any_running sleep_executable=""
+  local poll_attempts=5 poll_delay=0.05
 
   # Fractional sleep is not a Bash builtin. Resolve the real utility once so a
   # sourced caller's `sleep` function cannot collapse or extend the 250 ms
-  # cooperative grace period. If unavailable, skip directly to bounded KILL.
+  # cooperative grace period. Keep the polling interval coarse enough that
+  # process startup on an emulated platform cannot turn that grace period into
+  # an unbounded sequence of expensive forks. If sleep is unavailable, skip
+  # directly to bounded KILL.
   sleep_executable=$(builtin type -P sleep 2>/dev/null || true)
 
   # The operation owns only direct scanner children. Keep their unreaped slots
@@ -1069,7 +1073,7 @@ _sley_secrets_parallel_stop_children() {
     fi
   done
 
-  for ((attempt = 0; attempt < 25; attempt++)); do
+  for ((attempt = 0; attempt < poll_attempts; attempt++)); do
     any_running=0
     for index in "${!_sley_secrets_parallel_pids[@]}"; do
       pid=${_sley_secrets_parallel_pids[$index]}
@@ -1081,7 +1085,7 @@ _sley_secrets_parallel_stop_children() {
     done
     [[ "$any_running" == 1 ]] || break
     [[ -n "$sleep_executable" ]] || break
-    "$sleep_executable" 0.01 || break
+    "$sleep_executable" "$poll_delay" || break
   done
 
   for index in "${!_sley_secrets_parallel_pids[@]}"; do
@@ -1400,6 +1404,7 @@ _sley_secrets_scan_parallel() {
   local _sley_secrets_parallel_rm=""
   local _sley_secrets_parallel_rmdir=""
   local _sley_secrets_parallel_scratch_dir=""
+  local _sley_secrets_parallel_monitor_enabled=0
   local -a items=("$@")
   local -a _sley_secrets_parallel_pids=()
   local -a _sley_secrets_parallel_output_files=()
@@ -1471,6 +1476,15 @@ _sley_secrets_scan_parallel() {
   trap '_sley_secrets_parallel_record_signal 129 2>/dev/null' HUP
   trap '_sley_secrets_parallel_record_signal 130 2>/dev/null' INT
   trap '_sley_secrets_parallel_record_signal 143 2>/dev/null' TERM
+  # Background jobs created while an interactive caller has monitor mode on
+  # receive their own process groups and can leave a delayed Bash completion
+  # notice for the next prompt even after an exact PID wait. Keep the parent
+  # and its temporary scanners in the terminal's foreground process group, then
+  # restore the caller's option after every owned child has been reaped.
+  if [[ "$-" == *m* ]]; then
+    _sley_secrets_parallel_monitor_enabled=1
+    builtin set +m
+  fi
 
   if ! _sley_secrets_parallel_allocate_directory \
     _sley_secrets_parallel_scratch_dir "${TMPDIR:-/tmp}/sley-secrets" "$scratch_slots"; then
@@ -1542,6 +1556,9 @@ _sley_secrets_scan_parallel() {
     [[ "$rc" -ge 2 ]] || rc=2
   fi
 
+  if [[ "$_sley_secrets_parallel_monitor_enabled" -eq 1 ]]; then
+    builtin set -m
+  fi
   eval "${_sley_secrets_parallel_saved_hup:-trap - HUP}"
   eval "${_sley_secrets_parallel_saved_int:-trap - INT}"
   eval "${_sley_secrets_parallel_saved_term:-trap - TERM}"
