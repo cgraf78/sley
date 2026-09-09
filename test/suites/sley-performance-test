@@ -338,6 +338,96 @@ _measure_perf_stats() {
   __PERF_MAX=$(tail -n 1 "$sorted_file")
 }
 
+_should_confirm_perf() {
+  local platform="$1" median_ms="$2" maximum_ms="$3"
+  local median_budget_ms="$4" maximum_budget_ms="$5"
+  [[ "$platform" == "Darwin" ]] &&
+    ((median_ms > median_budget_ms && maximum_ms <= maximum_budget_ms))
+}
+
+# Decide persistence by batch majority rather than by pooling raw samples.
+# Pooling lets the distributions overlap and can invert which batches passed.
+_combine_perf_batches() {
+  local runs_per_batch="$1" combined_file="$2"
+  shift 2
+  local batch_count="$#" total_runs sorted_file batch_file
+  local batch_sorted_file batch_medians_file batch_medians_sorted_file
+  total_runs=$((runs_per_batch * batch_count))
+  sorted_file="$combined_file.sorted"
+  batch_sorted_file="$combined_file.batch.sorted"
+  batch_medians_file="$combined_file.medians"
+  batch_medians_sorted_file="$batch_medians_file.sorted"
+  : >"$combined_file"
+  : >"$batch_medians_file"
+  for batch_file in "$@"; do
+    cat "$batch_file" >>"$combined_file"
+    LC_ALL=C sort -n "$batch_file" >"$batch_sorted_file"
+    _median_ms "$runs_per_batch" <"$batch_sorted_file" \
+      >>"$batch_medians_file"
+  done
+  LC_ALL=C sort -n "$combined_file" >"$sorted_file"
+  LC_ALL=C sort -n "$batch_medians_file" >"$batch_medians_sorted_file"
+  __PERF_MEDIAN=$(_median_ms "$batch_count" <"$batch_medians_sorted_file")
+  __PERF_MAX=$(tail -n 1 "$sorted_file")
+  __PERF_RUNS="$total_runs"
+}
+
+echo "=== sley: performance confirmation policy ==="
+
+if _should_confirm_perf Darwin 4156 4747 3500 12000; then
+  _pass "perf confirmation: Darwin median-only breach confirms"
+else
+  _fail "perf confirmation: Darwin median-only breach confirms"
+fi
+if ! _should_confirm_perf Darwin 4156 13000 3500 12000; then
+  _pass "perf confirmation: maximum breach remains final"
+else
+  _fail "perf confirmation: maximum breach remains final"
+fi
+if ! _should_confirm_perf Linux 4156 4747 3500 12000; then
+  _pass "perf confirmation: non-Darwin breach remains final"
+else
+  _fail "perf confirmation: non-Darwin breach remains final"
+fi
+
+confirmation_policy_dir=$(_tmpdir)
+for _ in $(seq 1 7); do
+  printf '4000\n' >>"$confirmation_policy_dir/slow"
+  printf '3000\n' >>"$confirmation_policy_dir/healthy"
+done
+printf '3000\n3000\n3000\n4000\n4000\n4000\n4000\n' \
+  >"$confirmation_policy_dir/slow-mixed"
+printf '3000\n3000\n3000\n3000\n4000\n4000\n4000\n' \
+  >"$confirmation_policy_dir/healthy-mixed"
+_combine_perf_batches 7 "$confirmation_policy_dir/combined" \
+  "$confirmation_policy_dir/slow" \
+  "$confirmation_policy_dir/healthy-mixed" \
+  "$confirmation_policy_dir/healthy-mixed"
+_assert_eq "perf confirmation: one slow batch is outvoted" \
+  "3000" "$__PERF_MEDIAN"
+_assert_eq "perf confirmation: combined run count is odd" \
+  "21" "$__PERF_RUNS"
+_assert_eq "perf confirmation: combined maximum is preserved" \
+  "4000" "$__PERF_MAX"
+
+_combine_perf_batches 7 "$confirmation_policy_dir/combined" \
+  "$confirmation_policy_dir/slow-mixed" \
+  "$confirmation_policy_dir/slow-mixed" \
+  "$confirmation_policy_dir/healthy"
+_assert_eq "perf confirmation: two slow batches remain a breach" \
+  "4000" "$__PERF_MEDIAN"
+
+for _ in $(seq 1 6); do
+  printf '3200\n' >>"$confirmation_policy_dir/spiky"
+done
+printf '13000\n' >>"$confirmation_policy_dir/spiky"
+_combine_perf_batches 7 "$confirmation_policy_dir/combined" \
+  "$confirmation_policy_dir/healthy" \
+  "$confirmation_policy_dir/healthy-mixed" \
+  "$confirmation_policy_dir/spiky"
+_assert_eq "perf confirmation: confirmation maximum remains visible" \
+  "13000" "$__PERF_MAX"
+
 _write_changed_tree() {
   local repo="$1" count="$2" i dir file
   dir="$repo/packages/app/src/generated/deep/nested"
@@ -517,31 +607,40 @@ discovery_report_runs="$SLEY_PERF_RUNS"
 # Hosted macOS runners can occasionally sustain contention across an entire
 # seven-sample batch. Confirm only that narrow case: a command failure or a
 # coarse-maximum breach remains immediately fatal, while a median-only breach
-# gets one fresh batch on the same already-warm fixture. Retain the first batch
-# and evaluate all 14 samples together so confirmation preserves the slow
-# evidence and applies the unchanged median and maximum budgets to the whole.
-if [[ "$(uname -s)" == "Darwin" ]] &&
-  ((discovery_median > discovery_median_budget && \
-  discovery_max <= discovery_max_budget)); then
+# gets two fresh batches on the same already-warm fixture. The median of three
+# batch medians lets one transient slow batch be outvoted while two slow batches
+# remain a failure. The maximum still covers all 21 observed samples.
+if _should_confirm_perf \
+  "$(uname -s)" \
+  "$discovery_median" \
+  "$discovery_max" \
+  "$discovery_median_budget" \
+  "$discovery_max_budget"; then
   discovery_initial_median="$discovery_median"
   discovery_initial_max="$discovery_max"
   discovery_initial_durations="$repo/.sley-perf-durations.initial"
   cp "$repo/.sley-perf-durations" "$discovery_initial_durations"
+  discovery_confirmation_files=()
 
-  echo "  PERF: verify discovery median-only breach; collecting one confirmation batch"
-  _measure_perf_stats "verify perf: large shared subtree confirmation" 15 \
-    "$repo" "$SLEY_PERF_RUNS" verify --json
-  cat "$discovery_initial_durations" >>"$repo/.sley-perf-durations"
-  LC_ALL=C sort -n "$repo/.sley-perf-durations" \
-    >"$repo/.sley-perf-durations.sorted"
-  discovery_combined_runs=$((SLEY_PERF_RUNS * 2))
-  discovery_report_runs="$discovery_combined_runs"
-  discovery_median=$(
-    _median_ms "$discovery_combined_runs" \
-      <"$repo/.sley-perf-durations.sorted"
-  )
-  discovery_max=$(tail -n 1 "$repo/.sley-perf-durations.sorted")
-  echo "  PERF: verify discovery initial median ${discovery_initial_median}ms, maximum ${discovery_initial_max}ms; combined ${discovery_combined_runs}-sample median ${discovery_median}ms, maximum ${discovery_max}ms"
+  echo "  PERF: verify discovery median-only breach; collecting two confirmation batches"
+  for discovery_confirmation_batch in 1 2; do
+    _measure_perf_stats "verify perf: large shared subtree confirmation" 15 \
+      "$repo" "$SLEY_PERF_RUNS" verify --json
+    discovery_confirmation_file="$repo/.sley-perf-durations.confirmation-$discovery_confirmation_batch"
+    cp "$repo/.sley-perf-durations" "$discovery_confirmation_file"
+    discovery_confirmation_files+=("$discovery_confirmation_file")
+    echo "  PERF: verify discovery confirmation ${discovery_confirmation_batch} median ${__PERF_MEDIAN}ms, maximum ${__PERF_MAX}ms"
+  done
+
+  _combine_perf_batches \
+    "$SLEY_PERF_RUNS" \
+    "$repo/.sley-perf-durations.combined" \
+    "$discovery_initial_durations" \
+    "${discovery_confirmation_files[@]}"
+  discovery_report_runs="$__PERF_RUNS"
+  discovery_median="$__PERF_MEDIAN"
+  discovery_max="$__PERF_MAX"
+  echo "  PERF: verify discovery initial median ${discovery_initial_median}ms, maximum ${discovery_initial_max}ms; three-batch median ${discovery_median}ms, maximum across ${discovery_report_runs} samples ${discovery_max}ms"
 fi
 
 echo "  PERF: verify discovery median ${discovery_median}ms / ${discovery_median_budget}ms, maximum ${discovery_max}ms / ${discovery_max_budget}ms (files ${SLEY_PERF_CHANGED_FILES}, runs ${discovery_report_runs})"
