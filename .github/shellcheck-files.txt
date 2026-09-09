@@ -35,5 +35,6 @@ program	test/suites/shell-test
 program	test/suites/sley-behavior-test
 program	test/suites/sley-performance-test
 program	test/suites/timeout-test
+program	test/suites/vscode-vocab-sync-test
 program	test/suites/vscode-test
 program	test/suites/xdg-paths-test
