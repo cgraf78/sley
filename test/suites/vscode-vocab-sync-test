@@ -1,0 +1,126 @@
+#!/usr/bin/env bash
+# vscode-vocab-sync-test — the VS Code manifest's contributed languages must
+# match Checkrun's canonical filetype vocabulary.
+#
+# Checkrun owns filetype inference and editor language-ID aliases
+# (share/checkrun/registry.json). Sley's VS Code extension consumes that
+# vocabulary dynamically at runtime, but VS Code requires statically
+# contributed languages to assign a languageId to files Checkrun recognizes
+# and VS Code does not natively know. That static copy drifts whenever the
+# registry gains, renames, or drops a mapped extension or filename, so this
+# suite asserts each contributed language declares exactly the extensions
+# and filenames the registry maps to its filetype set.
+#
+# Scope: per-language extension/filename sync only. Registry glob patterns
+# are handled at runtime by extension.js and cannot be expressed in a VS
+# Code manifest, and the choice of which languages need contributing stays
+# a product decision (VS Code-native ids need no entry).
+#
+# The Checkrun checkout is resolved without adding a cross-repo build
+# dependency: SLEY_TEST_CHECKRUN_ROOT wins when set, otherwise a sibling
+# `checkrun` checkout next to the Sley repo root is used. Ordinary CI has
+# neither and skips, matching checkrun-cancellation-integration-test.
+
+set -euo pipefail
+
+SLEY_TEST_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
+SLEY_REPO_ROOT="$(cd -- "$SLEY_TEST_DIR/.." && pwd -P)"
+extension_path="$SLEY_REPO_ROOT/share/sley/vscode/sley-tools-0.0.1"
+
+# shellcheck source=../helpers.sh
+. "$SLEY_TEST_DIR/helpers.sh"
+
+echo "=== sley: VS Code vocab sync ==="
+
+checkrun_root=${SLEY_TEST_CHECKRUN_ROOT:-}
+if [[ -z "$checkrun_root" ]]; then
+  candidate="$SLEY_REPO_ROOT/../checkrun"
+  if [[ -f "$candidate/share/checkrun/registry.json" ]]; then
+    checkrun_root="$candidate"
+  else
+    echo "  SKIP: vscode vocab sync needs a Checkrun checkout (set SLEY_TEST_CHECKRUN_ROOT)"
+    exit 0
+  fi
+fi
+registry_path="$checkrun_root/share/checkrun/registry.json"
+if [[ ! -f "$registry_path" ]]; then
+  echo "vscode vocab sync: SLEY_TEST_CHECKRUN_ROOT must name a Checkrun checkout" >&2
+  exit 1
+fi
+command -v python3 >/dev/null 2>&1 || {
+  echo "vscode vocab sync: missing dependency: python3" >&2
+  exit 1
+}
+
+manifest_path="$extension_path/package.json"
+_assert_file_exists "vscode vocab sync: manifest is published" "$manifest_path"
+
+sync_output=""
+sync_status=0
+sync_output=$(
+  python3 - "$registry_path" "$manifest_path" <<'PY'
+import json
+import sys
+
+registry_path, manifest_path = sys.argv[1], sys.argv[2]
+registry = json.load(open(registry_path, encoding="utf-8"))
+manifest = json.load(open(manifest_path, encoding="utf-8"))
+
+extension_map = registry["filetypes"]["extension"]
+filename_map = registry["filetypes"]["filename"]
+vscode_ids = registry["editorLanguageIds"]["vscode"]
+
+filetypes = set(extension_map.values()) | set(filename_map.values())
+for rule in registry["filetypes"].get("patterns", []):
+    filetypes.add(rule["filetype"])
+for rule in registry["filetypes"].get("shebangs", []):
+    filetypes.add(rule["filetype"])
+
+
+def ids_for(filetype):
+    return vscode_ids.get(filetype, [filetype])
+
+
+failures = []
+for language in manifest["contributes"]["languages"]:
+    language_id = language["id"]
+    mapped = sorted(ft for ft in filetypes if language_id in ids_for(ft))
+    if not mapped:
+        failures.append(f"{language_id}: unknown to checkrun registry")
+        continue
+    wanted_extensions = sorted(
+        ext for ext, ft in extension_map.items() if ft in mapped
+    )
+    declared_extensions = sorted(
+        ext[1:] if ext.startswith(".") else ext
+        for ext in language.get("extensions", [])
+    )
+    if wanted_extensions != declared_extensions:
+        failures.append(
+            f"{language_id}: extensions want {wanted_extensions}, "
+            f"manifest declares {declared_extensions}"
+        )
+    wanted_filenames = sorted(
+        name for name, ft in filename_map.items() if ft in mapped
+    )
+    declared_filenames = sorted(language.get("filenames", []))
+    if wanted_filenames != declared_filenames:
+        failures.append(
+            f"{language_id}: filenames want {wanted_filenames}, "
+            f"manifest declares {declared_filenames}"
+        )
+
+if failures:
+    print("\n".join(failures))
+    sys.exit(1)
+print(f"languages in sync: {len(manifest['contributes']['languages'])}")
+PY
+) || sync_status=$?
+
+if [[ "$sync_status" -eq 0 ]]; then
+  _pass "vscode vocab sync: contributed languages match checkrun registry ($sync_output)"
+else
+  _fail "vscode vocab sync: manifest drifted from checkrun registry ($sync_output)"
+fi
+
+_test_summary

@@ -16,6 +16,10 @@ When touching the deployable VS Code integration, update
 `test/suites/vscode-test`. That suite validates both the versioned package
 contract consumed through shdeps and the extension's formatting, diagnostics,
 capability refresh, concurrency, cancellation, and exclusion behavior.
+`test/suites/vscode-vocab-sync-test` keeps the manifest's contributed
+languages in sync with Checkrun's canonical registry. It resolves a
+sibling `checkrun` checkout, or `SLEY_TEST_CHECKRUN_ROOT` when set, and
+skips when neither is available so ordinary CI stays independent.
 
 `test/suites/commit-hooks-test` owns the generic Git and Sapling launcher
 behavior shipped under `share/sley/hooks/`. Consumer repositories should keep
