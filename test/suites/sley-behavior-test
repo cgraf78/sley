@@ -5174,6 +5174,34 @@ _assert_contains "secrets message: keeps real message body" "realtitle body" "$(
 _assert_contains "secrets message: scans kept # comment lines (no fail-open)" "commentkept" "$(cat "$MOCK_STDIN")"
 _assert_not_contains "secrets message: strips commit -v scissors region" "scissorsdropped" "$(cat "$MOCK_STDIN")"
 
+# --- message cleaning: only git's exact scissors line cuts, not any `>8` ----
+# A `#` line merely containing `>8` is committed verbatim by git (verified
+# against `git commit --cleanup=scissors -F`), so it and everything after it
+# MUST still be scanned; only the exact 24-dash marker cuts (no fail-open).
+repo=$(_new_repo)
+mockbin=$(_mock_bin)
+ext=$(_tmpdir) # no extra config; assert cleaned stdin content
+export MOCK_LOG="$repo/gl.log" MOCK_STDIN="$repo/gl.stdin" MOCK_LEAK_CONFIG="/nope"
+: >"$MOCK_LOG"
+: >"$MOCK_STDIN"
+_emc_write_mock "$mockbin"
+printf 'realtitle body\n\n# not-real scissors >8 marker\ntailscanned diff\n' >"$repo/msg"
+__EMC_OUT=$(cd "$repo" && GIT_CONFIG_GLOBAL="$repo/.gitconfig-test" SLEY_EXTENSION_DIR="$ext" PATH="$mockbin:$PATH" "$SLEY" secrets --message-file "$repo/msg" 2>&1)
+__EMC_RC=$?
+_assert_exit "secrets message: fake scissors marker scans clean" 0 "$__EMC_RC"
+_assert_contains "secrets message: scans fake scissors marker line (no fail-open)" \
+  "not-real scissors >8 marker" "$(cat "$MOCK_STDIN")"
+_assert_contains "secrets message: scans content after fake scissors marker" \
+  "tailscanned" "$(cat "$MOCK_STDIN")"
+
+: >"$MOCK_STDIN"
+printf 'realtitle body\n\n# ---------- >8 ----------\nshortdashes tail\n' >"$repo/msg"
+__EMC_OUT=$(cd "$repo" && GIT_CONFIG_GLOBAL="$repo/.gitconfig-test" SLEY_EXTENSION_DIR="$ext" PATH="$mockbin:$PATH" "$SLEY" secrets --message-file "$repo/msg" 2>&1)
+__EMC_RC=$?
+_assert_exit "secrets message: short-dash marker scans clean" 0 "$__EMC_RC"
+_assert_contains "secrets message: scans short-dash marker content (no fail-open)" \
+  "shortdashes tail" "$(cat "$MOCK_STDIN")"
+
 # --- base gitleaks config finding blocks the message ------------------------
 repo=$(_new_repo)
 mockbin=$(_mock_bin)
@@ -5249,7 +5277,7 @@ MOCK
 chmod +x "$mockbin/gitleaks"
 export MOCK_LOG="$repo/gl.log" MOCK_CAPTURE="$capture"
 : >"$MOCK_LOG"
-printf 'message body\n\n# kept comment\n# ---------- >8 ----------\nignored diff\n' >"$repo/msg"
+printf 'message body\n\n# kept comment\n# ------------------------ >8 ------------------------\nignored diff\n' >"$repo/msg"
 printf 'message body\n\n# kept comment\n' >"$repo/expected-input"
 __EMC_OUT=$(cd "$repo" && GIT_CONFIG_GLOBAL="$repo/.gitconfig-test" \
   SLEY_EXTENSION_DIR="$ext" PATH="$mockbin:$PATH" \

@@ -910,16 +910,24 @@ _sley_gitleaks_scan_text() {
 }
 
 # Prepare a commit message for scanning. Only the `commit -v` scissors region
-# (`# ... >8 ...` and everything after) is removed — Git always strips that, and
-# its diff is already covered by the staged-content scan. Comment (`#`) lines are
-# deliberately KEPT: Git's non-interactive cleanup (`git commit -m`/`-F`, and the
-# message a `commit-msg` hook receives) is `whitespace`, which commits `#` lines
-# verbatim — so stripping them would let a secret on a committed `#` line slip
-# the scan (a fail-open). Scanning the retained comments of an editor commit
-# (where Git would `strip` them) is at worst a rare, safe false positive.
+# is removed: Git cuts everything from its exact scissors line (`#` + space +
+# 24 dashes + ` >8 ` + 24 dashes, optional trailing whitespace) and keeps
+# anything else — even a `#` line containing `>8`. Match that line exactly: a
+# broader pattern would exclude committed content from the scan (a fail-open).
+# The cut region's diff is already covered by the staged-content scan.
+# Comment (`#`) lines are deliberately KEPT: Git's non-interactive cleanup
+# (`git commit -m`/`-F`, and the message a `commit-msg` hook receives) is
+# `whitespace`, which commits `#` lines verbatim — so stripping them would let
+# a secret on a committed `#` line slip the scan (a fail-open). Scanning the
+# retained comments of an editor commit (where Git would `strip` them) is at
+# worst a rare, safe false positive.
 _sley_clean_commit_message() {
   local file="$1"
-  sed '/^#.*>8/,$d' "$file"
+  # Trailing matcher is space/tab only (literal tab: BSD sed lacks `\t`).
+  # `[[:space:]]` would also cut on trailing VT/FF, which git keeps — a
+  # fail-open divergence. A trailing CR (CRLF file) now scans instead of
+  # cutting: safe direction (harmless false positive).
+  sed '/^# ------------------------ >8 ------------------------[ 	]*$/,$d' "$file"
 }
 
 # `sley secrets --message-file <path>`: scan a (to-be-committed) commit message
