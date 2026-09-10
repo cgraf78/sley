@@ -481,6 +481,40 @@ _sley_verify_registry_commands() {
   done
 }
 
+# Validate extension JSON lines before they reach command grouping. Registry
+# files pass `_sley_verify_validate_config`, but extension output used to be
+# concatenated unchecked: one malformed line made grouping fail with empty
+# output, which the required-command runner read as "no required
+# verification" and passed vacuously. python3 is already required for
+# `sley verify`, so this adds no new dependency.
+_sley_verify_validate_extension_output() {
+  python3 - 3<&0 <<'PY'
+import json, os, sys
+TIERS = {"fast", "slow", "full", "suggested"}
+for line in os.fdopen(3):
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        item = json.loads(line)
+    except ValueError:
+        sys.exit(1)
+    if not isinstance(item, dict):
+        sys.exit(1)
+    if not isinstance(item.get("command"), str) or not item["command"]:
+        sys.exit(1)
+    # The grouper dereferences `kind` unconditionally, so it is required
+    # here; its value stays free-form like registry kinds (`test`,
+    # `typecheck`, `security`, ...).
+    if not isinstance(item.get("kind"), str) or not item["kind"]:
+        sys.exit(1)
+    if "tier" in item and (not isinstance(item["tier"], str) or item["tier"] not in TIERS):
+        sys.exit(1)
+    if "required" in item and not isinstance(item["required"], bool):
+        sys.exit(1)
+PY
+}
+
 _sley_verify_extension_commands() {
   local files="$1" output
   output=$(sley_ext_verify_commands "$files") || {
@@ -491,7 +525,12 @@ _sley_verify_extension_commands() {
 
   # Environment extensions emit the same JSON-line command items as registry
   # files. Keep the contract generic here; repo/tool-specific detection belongs
-  # in the extension, not in base sley.
+  # in the extension, not in base sley. Fail closed on malformed lines: the
+  # caller aborts verify when this returns nonzero.
+  if ! printf '%s\n' "$output" | _sley_verify_validate_extension_output; then
+    echo "sley verify: invalid extension command" >&2
+    return 1
+  fi
   printf '%s\n' "$output"
 }
 
@@ -820,7 +859,10 @@ _sley_verify_run_required_impl() {
   required=$(
     printf '%s\n' "$commands" |
       _sley_verify_group_python required-jsonl
-  )
+  ) || {
+    echo "sley verify: failed to group required verification commands" >&2
+    return 1
+  }
 
   if [[ -z "$required" ]]; then
     if [[ "$json" == "1" ]]; then

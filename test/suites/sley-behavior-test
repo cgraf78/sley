@@ -2732,6 +2732,81 @@ _assert_contains "verify extension: running mapped command" \
   "running required fast command: ./tests/verify-ext.sh" "$__SLEY_OUT"
 _assert_file_exists "verify extension: required command ran" "$repo/tests/verify-ext-ran"
 
+# --- verify extension: malformed lines fail closed, never a vacuous pass ----
+# One bad extension line used to collapse command grouping to empty output,
+# which `--run-required` read as "no required verification" and passed with
+# rc 0 — dropping even valid required commands. Every variant below must fail
+# closed instead.
+repo=$(_new_repo)
+home=$(_tmpdir)
+_copy_sley_libs "$home"
+mkdir -p "$home/.config/sley/extensions.d" "$repo/src" "$repo/tests"
+cat >"$repo/src/app.py" <<'EOF'
+print("initial")
+EOF
+cat >"$repo/tests/verify-ext.sh" <<'EOF'
+#!/usr/bin/env bash
+set -u
+echo ok > tests/verify-ext-ran
+EOF
+chmod +x "$repo/tests/verify-ext.sh"
+(cd "$repo" && git add . && git commit -q -m "seed verify extension")
+echo "print('changed')" >>"$repo/src/app.py"
+cat >"$home/.config/sley/extensions.d/80-verify-extension.sh" <<'WORK'
+sley_ext_verify_commands() {
+  local files="${1:-}"
+  case "$files" in
+    *src/app.py*)
+      printf '%s\n' '{"command":"./tests/verify-ext.sh","kind":"typecheck","required":true,"tier":"fast","sources":["verify-extension"],"source_contexts":[{"source":"verify-extension","context":"extension"}]}'
+      echo "some stray warning from extension"
+      ;;
+  esac
+}
+WORK
+HOME="$home" _run_sley "$repo" verify --run-required
+_assert_exit "verify extension: stray line fails closed" 1 "$__SLEY_RC"
+_assert_contains "verify extension: stray line reports invalid extension command" \
+  "sley verify: invalid extension command" "$__SLEY_OUT"
+_assert_not_contains "verify extension: stray line is not a vacuous pass" \
+  "no required verification commands mapped" "$__SLEY_OUT"
+
+HOME="$home" _run_sley "$repo" verify --json
+_assert_exit "verify extension --json: stray line fails closed" 1 "$__SLEY_RC"
+_assert_contains "verify extension --json: stray line reports invalid extension command" \
+  "sley verify: invalid extension command" "$__SLEY_OUT"
+
+cat >"$home/.config/sley/extensions.d/80-verify-extension.sh" <<'WORK'
+sley_ext_verify_commands() {
+  local files="${1:-}"
+  case "$files" in
+    *src/app.py*)
+      printf '%s\n' '{"kind":"typecheck","required":true,"tier":"fast"}'
+      ;;
+  esac
+}
+WORK
+HOME="$home" _run_sley "$repo" verify --run-required
+_assert_exit "verify extension: missing command fails closed" 1 "$__SLEY_RC"
+_assert_contains "verify extension: missing command reports invalid extension command" \
+  "sley verify: invalid extension command" "$__SLEY_OUT"
+_assert_not_contains "verify extension: missing command is not a vacuous pass" \
+  "no required verification commands mapped" "$__SLEY_OUT"
+
+cat >"$home/.config/sley/extensions.d/80-verify-extension.sh" <<'WORK'
+sley_ext_verify_commands() {
+  local files="${1:-}"
+  case "$files" in
+    *src/app.py*)
+      printf '%s\n' '{"command":"./tests/verify-ext.sh","kind":"typecheck","required":true,"tier":"warp"}'
+      ;;
+  esac
+}
+WORK
+HOME="$home" _run_sley "$repo" verify --run-required
+_assert_exit "verify extension: unknown tier fails closed" 1 "$__SLEY_RC"
+_assert_contains "verify extension: unknown tier reports invalid extension command" \
+  "sley verify: invalid extension command" "$__SLEY_OUT"
+
 repo=$(_new_repo)
 mkdir -p "$repo/src" "$repo/.sley"
 cat >"$repo/src/app.txt" <<'EOF'
