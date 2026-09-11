@@ -1254,4 +1254,96 @@ else
 fi
 unset SLEY_PERF_GIT_LOG SLEY_PERF_MOCKBIN MOCK_SL_ROOT
 
+echo "=== sley perf: hook path avoids verify/ready parse and launcher probe ==="
+
+# Sourcing the library must not define verify/ready entry points; the
+# wrappers load them on first use (proven functionally by the lazy behavior
+# block). No wall-clock assertions — definition presence is the signal.
+lazy_perf_defined=$(
+  SLEY_REPO_ROOT="$SLEY_REPO_ROOT" bash -c '
+    source "$SLEY_REPO_ROOT/lib/sley/sley.sh" || exit 3
+    echo "verify=$(declare -F _sley_verify)"
+    echo "ready=$(declare -F _sley_ready)"
+    echo "hook=$(declare -F _sley_hook_format_file)"
+  '
+)
+_assert_contains "lazy perf: sourcing leaves _sley_verify undefined" \
+  "verify=" "$lazy_perf_defined"
+_assert_not_contains "lazy perf: sourcing defines no _sley_verify body" \
+  "_sley_verify" "$lazy_perf_defined"
+_assert_contains "lazy perf: sourcing leaves _sley_ready undefined" \
+  "ready=" "$lazy_perf_defined"
+_assert_not_contains "lazy perf: sourcing defines no _sley_ready body" \
+  "_sley_ready" "$lazy_perf_defined"
+_assert_contains "lazy perf: sourcing still defines hook entry points" \
+  "_sley_hook_format_file" "$lazy_perf_defined"
+
+# With a caller `_REPO_TYPE` override the launcher hint is never consumed,
+# so the legacy path probes twice (launcher + hook-init). The skip must cut
+# that to one probe; with bare env configured the legacy double probe stays.
+_perf_hook_probe_counts() {
+  local repo="$1" file="$2" outside="$3" mockbin="$4" gitlog="$5" slcount="$6"
+  shift 6
+  export SLEY_PERF_HOOK_GIT_LOG="$gitlog" SLEY_PERF_HOOK_MOCKBIN="$mockbin"
+  export SLEY_PERF_HOOK_SL_COUNT="$slcount"
+  printf '0\n' >"$slcount"
+  : >"$gitlog"
+  cat >"$mockbin/git" <<'MOCK'
+#!/usr/bin/env bash
+printf 'git %s\n' "$*" >>"$SLEY_PERF_HOOK_GIT_LOG"
+PATH=":$PATH:"
+PATH="${PATH//:$SLEY_PERF_HOOK_MOCKBIN:/:}"
+PATH="${PATH#:}"
+PATH="${PATH%:}"
+export PATH
+exec git "$@"
+MOCK
+  cat >"$mockbin/sl" <<'MOCK'
+#!/usr/bin/env bash
+count=$(cat "$SLEY_PERF_HOOK_SL_COUNT")
+printf '%s\n' "$((count + 1))" >"$SLEY_PERF_HOOK_SL_COUNT"
+exit 1
+MOCK
+  cat >"$mockbin/autoformat" <<'MOCK'
+#!/usr/bin/env bash
+exit 0
+MOCK
+  chmod +x "$mockbin/git" "$mockbin/sl" "$mockbin/autoformat"
+  (cd "$outside" && PATH="$mockbin:$PATH" "$@" \
+    XDG_CONFIG_HOME="$repo/.xdg-config" XDG_CACHE_HOME="$repo/.xdg-cache" \
+    GIT_CONFIG_GLOBAL="$repo/.gitconfig-test" \
+    "$SLEY" hook format-file "$file" >/dev/null 2>&1) || true
+}
+
+hook_perf_repo=$(_new_perf_repo)
+printf 'x = 1\n' >"$hook_perf_repo/hook.py"
+(cd "$hook_perf_repo" && git add hook.py && git commit -qm "seed hook probe perf")
+hook_perf_outside=$(_tmpdir)
+hook_perf_mock=$(_mock_bin)
+hook_perf_gitlog=$(_tmpdir)/hook-git.log
+hook_perf_slcount=$(_tmpdir)/hook-sl-count.txt
+# Isolate from ambient bare-repo env (dotfiles hosts export it): the skip
+# applies only when no bare fallback could engage.
+_perf_hook_probe_counts "$hook_perf_repo" "$hook_perf_repo/hook.py" \
+  "$hook_perf_outside" "$hook_perf_mock" "$hook_perf_gitlog" "$hook_perf_slcount" \
+  env -u SLEY_BARE_REPO_GIT_DIR -u SLEY_BARE_REPO_WORK_TREE _REPO_TYPE=git
+hook_perf_git_probes=$(grep -c "rev-parse --show-toplevel" "$hook_perf_gitlog" || true)
+_assert_eq "hook perf: override probes git exactly once (launcher skip)" \
+  "1" "$hook_perf_git_probes"
+_assert_eq "hook perf: override never probes sl" \
+  "0" "$(cat "$hook_perf_slcount")"
+
+hook_perf_bare=$(_tmpdir)
+git init -q --bare "$hook_perf_bare/bare.git"
+_perf_hook_probe_counts "$hook_perf_repo" "$hook_perf_repo/hook.py" \
+  "$hook_perf_outside" "$hook_perf_mock" "$hook_perf_gitlog" "$hook_perf_slcount" \
+  env _REPO_TYPE=git SLEY_BARE_REPO_GIT_DIR="$hook_perf_bare/bare.git" \
+  SLEY_BARE_REPO_WORK_TREE="$hook_perf_bare"
+hook_perf_bare_probes=$(grep -c "rev-parse --show-toplevel" "$hook_perf_gitlog" || true)
+_assert_eq "hook perf: bare env keeps legacy launcher probe (two total)" \
+  "2" "$hook_perf_bare_probes"
+_assert_eq "hook perf: bare env never probes sl" \
+  "0" "$(cat "$hook_perf_slcount")"
+unset SLEY_PERF_HOOK_GIT_LOG SLEY_PERF_HOOK_MOCKBIN SLEY_PERF_HOOK_SL_COUNT
+
 _test_summary

@@ -22,12 +22,29 @@ source "$_SLEY_LIB_DIR/scope.sh"
 # shellcheck source=hooks.sh
 # shellcheck disable=SC1091 # sibling module resolved from this file's dir.
 source "$_SLEY_LIB_DIR/hooks.sh"
-# shellcheck source=verify.sh
-# shellcheck disable=SC1091 # sibling module resolved from this file's dir.
-source "$_SLEY_LIB_DIR/verify.sh"
-# shellcheck source=ready.sh
-# shellcheck disable=SC1091 # sibling module resolved from this file's dir.
-source "$_SLEY_LIB_DIR/ready.sh"
+# verify.sh (local verification) and ready.sh (aggregate readiness) load on
+# demand: hook hot paths (`hook format-file`/`lint-file`, the sourced hook
+# API) never need them, and parsing ~3200 lines costs ~10ms per invocation.
+# Only the `sley_verify` / `sley_ready` public wrappers call these loaders,
+# so sourced and CLI consumers share one loading contract. verify.sh stays
+# directly sourceable for unit tests that exercise it standalone. The loaded
+# marker is keyed by library directory so re-sourcing from a second sley
+# copy reloads instead of running a stale copy's functions.
+_sley_ensure_verify() {
+  [[ "${_SLEY_VERIFY_LOADED_DIR:-}" == "$_SLEY_LIB_DIR" ]] && return 0
+  # shellcheck source=verify.sh
+  # shellcheck disable=SC1091 # sibling module resolved from this file's dir.
+  source "$_SLEY_LIB_DIR/verify.sh"
+  _SLEY_VERIFY_LOADED_DIR="$_SLEY_LIB_DIR"
+}
+
+_sley_ensure_ready() {
+  [[ "${_SLEY_READY_LOADED_DIR:-}" == "$_SLEY_LIB_DIR" ]] && return 0
+  # shellcheck source=ready.sh
+  # shellcheck disable=SC1091 # sibling module resolved from this file's dir.
+  source "$_SLEY_LIB_DIR/ready.sh"
+  _SLEY_READY_LOADED_DIR="$_SLEY_LIB_DIR"
+}
 
 # ---------------------------------------------------------------------------
 # Public API — stable interface for CLIs, hooks, tests, and local extensions
@@ -118,6 +135,7 @@ sley_secrets() {
 sley_verify() {
   local -
   set -u
+  _sley_ensure_verify
   _sley_run_with_cwd_restore _sley_verify "$@"
 }
 
@@ -126,6 +144,7 @@ sley_verify() {
 sley_ready() {
   local -
   set -u
+  _sley_ensure_ready
   _sley_run_with_cwd_restore _sley_ready "$@"
 }
 

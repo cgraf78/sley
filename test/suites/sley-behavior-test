@@ -5759,4 +5759,82 @@ unset MOCK_SL_ROOT
 detect_mockbin=""
 detect_hint_mock=""
 
+echo "=== sley: verify/ready load on demand; hook file path needs neither ==="
+
+# The `verify`/`ready` libraries load when their public wrappers run — never
+# as a side effect of sourcing `sley.sh` for hook work. These pin the
+# consumer-visible contract: sourced hook flows work, and sourced
+# verify/ready flows load transparently (including repeated calls).
+lazy_repo=$(_new_repo)
+printf 'x = 1\n' >"$lazy_repo/hook.py"
+(cd "$lazy_repo" && git add hook.py && git commit -qm "seed lazy loading fixture")
+printf 'y = 2\n' >>"$lazy_repo/hook.py"
+(cd "$lazy_repo" && git add hook.py)
+lazy_bin=$(_mock_bin)
+lazy_log="$lazy_repo/lazy.log"
+cat >"$lazy_bin/autoformat" <<'MOCK'
+#!/usr/bin/env bash
+printf 'cwd=%s args=%s\n' "$PWD" "$*" >>"$MOCK_LOG"
+MOCK
+chmod +x "$lazy_bin/autoformat"
+export MOCK_LOG="$lazy_log"
+lazy_sourced_out=$(
+  cd "$lazy_repo" &&
+    HOME="$lazy_repo" PATH="$lazy_bin:$PATH" bash -c '
+      source "$SLEY_REPO_ROOT/lib/sley/sley.sh"
+      sley_hook_init
+      sley_hook_format_file hook.py
+    ' 2>&1
+)
+lazy_sourced_rc=$?
+_assert_exit "lazy: sourced hook format-file succeeds" 0 "$lazy_sourced_rc"
+_assert_eq "lazy: sourced hook format-file delegates" \
+  "cwd=$lazy_repo args=-- hook.py" "$(cat "$lazy_log")"
+_assert_eq "lazy: sourced hook flow is quiet" "" "$lazy_sourced_out"
+
+lazy_verify_out=$(
+  cd "$lazy_repo" &&
+    HOME="$lazy_repo" PATH="$lazy_bin:$PATH" bash -c '
+      source "$SLEY_REPO_ROOT/lib/sley/sley.sh"
+      sley_verify
+      sley_verify --json
+    ' 2>&1
+)
+lazy_verify_rc=$?
+_assert_exit "lazy: sourced sley_verify runs repeatedly" 0 "$lazy_verify_rc"
+_assert_contains "lazy: sourced sley_verify discovers commands" \
+  "checkrun verify" "$lazy_verify_out"
+
+lazy_ready_out=$(
+  cd "$lazy_repo" &&
+    HOME="$lazy_repo" PATH="$lazy_bin:$PATH" bash -c '
+      source "$SLEY_REPO_ROOT/lib/sley/sley.sh"
+      sley_ready --help
+    ' 2>&1
+)
+lazy_ready_rc=$?
+_assert_exit "lazy: sourced sley_ready --help succeeds" 0 "$lazy_ready_rc"
+_assert_contains "lazy: sourced sley_ready prints usage" \
+  "Usage:" "$lazy_ready_out"
+unset MOCK_LOG
+
+# `hook format-file` on an absolute git path from outside the repo keeps
+# working when the launcher skips its own probe: hook-init detects from the
+# buffer directory instead. (Bare-worktree fallback preservation is pinned
+# by the existing bare hook test above; the bare env must keep forcing the
+# legacy launcher path.)
+lazy_outside=$(_tmpdir)
+lazy_outside_log="$lazy_repo/outside.log"
+export MOCK_LOG="$lazy_outside_log"
+lazy_outside_out=$(
+  cd "$lazy_outside" &&
+    HOME="$lazy_repo" PATH="$lazy_bin:$PATH" "$SLEY" hook format-file "$lazy_repo/hook.py" 2>&1
+)
+lazy_outside_rc=$?
+_assert_exit "lazy: hook format-file from outside succeeds" 0 "$lazy_outside_rc"
+_assert_eq "lazy: hook format-file from outside uses buffer dir" \
+  "cwd=$lazy_repo args=-- $lazy_repo/hook.py" "$(cat "$lazy_outside_log")"
+_assert_eq "lazy: hook format-file from outside is quiet" "" "$lazy_outside_out"
+unset MOCK_LOG
+
 _test_summary

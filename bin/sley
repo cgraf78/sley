@@ -60,6 +60,21 @@ _sley_run() {
   exit $?
 }
 
+_sley_skip_probe_for_hook_file() {
+  [[ "${1:-}" == "hook" ]] || return 1
+  case "${2:-}" in
+    format-file | lint-file) ;;
+    *) return 1 ;;
+  esac
+  # The bare-repo fallback decides from the probe outcome, so keep the legacy
+  # path whenever it could engage. An explicit skip or an unset bare dir
+  # makes the fallback a provable no-op and the probe safely skippable:
+  # hook-init re-detects from the (already cd'd) buffer directory anyway.
+  [[ "${SLEY_SKIP_BARE_REPO_FALLBACK:-0}" == "1" ]] && return 0
+  [[ -z "${SLEY_BARE_REPO_GIT_DIR:-}" ]] && return 0
+  return 1
+}
+
 _sley_apply_bare_repo_fallback() {
   local git_dir="${SLEY_BARE_REPO_GIT_DIR:-}"
   local work_tree="${SLEY_BARE_REPO_WORK_TREE:-${HOME:-}}"
@@ -114,6 +129,16 @@ esac
 # Honor explicit Git context. Callers that set either variable are already
 # choosing a repository, including bare Git worktrees.
 if [[ -n "${GIT_DIR:-}" || -n "${GIT_WORK_TREE:-}" ]]; then
+  _sley_run "$@"
+fi
+
+# Single-file hook commands re-detect in hook-init from the buffer directory
+# the launcher already entered above. Skip the launcher probe when the hint
+# it would publish is provably useless (caller override, failed probe) or
+# simply moved (hook-init runs the same single probe instead) — but never
+# when the bare-repo fallback below could engage, since it needs the probe
+# outcome to decide between the normal repo and the configured worktree.
+if _sley_skip_probe_for_hook_file "$@"; then
   _sley_run "$@"
 fi
 
