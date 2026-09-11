@@ -5779,6 +5779,10 @@ cat >"$lazy_bin/autoformat" <<'MOCK'
 printf 'cwd=%s args=%s\n' "$PWD" "$*" >>"$MOCK_LOG"
 MOCK
 chmod +x "$lazy_bin/autoformat"
+# Discovery needs a `checkrun` binary; without this mock the test passes
+# only where a real checkrun happens to be installed (devservers) and
+# fails in CI with "no local verification commands detected".
+_mock_checkrun_verify "$lazy_bin"
 export MOCK_LOG="$lazy_log"
 lazy_sourced_out=$(
   cd "$lazy_repo" &&

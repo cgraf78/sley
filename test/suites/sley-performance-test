@@ -1474,13 +1474,19 @@ exec "$SLEY_PERF_VCACHE_REAL_JQ" "$@"
 MOCK
 chmod +x "$vcache_perf_mock/python3" "$vcache_perf_mock/git" "$vcache_perf_mock/jq"
 vcache_perf_cache=$(_tmpdir)/vcache-fresh
+vcache_perf_out="$vcache_perf_state/run.out"
 vcache_perf_rc=0
 (cd "$vcache_perf_repo" && PATH="$vcache_perf_mock:$PATH" HOME="$vcache_perf_repo/.home" \
   XDG_CONFIG_HOME="$vcache_perf_repo/.xdg-config" XDG_CACHE_HOME="$vcache_perf_repo/.xdg-cache" \
   GIT_CONFIG_GLOBAL="$vcache_perf_repo/.gitconfig-test" \
   SLEY_VERIFY_CACHE_DIR="$vcache_perf_cache" \
-  "$SLEY" verify --run-required >/dev/null 2>&1) || vcache_perf_rc=$?
+  "$SLEY" verify --run-required >"$vcache_perf_out" 2>&1) || vcache_perf_rc=$?
 _assert_exit "vcache perf: miss run exits 0" 0 "$vcache_perf_rc"
+if [[ "$vcache_perf_rc" != "0" ]]; then
+  echo "--- vcache inner output (miss run rc=$vcache_perf_rc) ---"
+  cat "$vcache_perf_out"
+  echo "--- end vcache inner output ---"
+fi
 _assert_eq "vcache perf: miss executes command once" \
   "1" "$(cat "$vcache_perf_repo/tests/count")"
 vcache_perf_lookups=$(grep -c "verify-cache.py lookup" "$SLEY_PERF_VCACHE_PY_LOG" || true)
