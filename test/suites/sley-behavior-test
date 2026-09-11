@@ -5554,4 +5554,209 @@ _assert_exit "secrets message: missing path is a usage error" 2 "$__EMC_RC"
 
 unset MOCK_LOG MOCK_STDIN MOCK_LEAK_CONFIG MOCK_RC1_CONFIG MOCK_RC2_CONFIG MOCK_CAPTURE
 
+echo "=== sley: repo detection contract (VCS discovery characterization) ==="
+
+# Pin `_repo_detect` semantics ahead of the pure-bash upward-scan fast path.
+# Every case must resolve identically with and without subprocess skipping,
+# so these run against sourced repo.sh directly and assert exact type+root.
+_detect_type_root() {
+  # $1: dir to detect in; $2: mockbin prepended to PATH ("" for none);
+  # remaining args: VAR=VAL exports for the probe (presets, hints, ceilings).
+  local dir="$1" mockbin="$2"
+  shift 2
+  (
+    cd "$dir" || exit 3
+    [[ -z "$mockbin" ]] || PATH="$mockbin:$PATH"
+    unset _REPO_TYPE _REPO_ROOT
+    unset _SLEY_LAUNCH_REPO_TYPE _SLEY_LAUNCH_REPO_ROOT _SLEY_LAUNCH_REPO_CWD
+    unset GIT_DIR GIT_WORK_TREE
+    local kv
+    for kv in ${1+"$@"}; do
+      # shellcheck disable=SC2163 # kv is always a VAR=VAL pair by contract.
+      export "$kv" || exit 3
+    done
+    # shellcheck disable=SC1091 # suite resolves the repo under test.
+    source "$SLEY_REPO_ROOT/lib/sley/repo.sh"
+    _repo_detect
+    printf '%s|%s' "$_REPO_TYPE" "$_REPO_ROOT"
+  )
+}
+
+_mock_sl_root() {
+  # Mock `sl` honoring MOCK_SL_ROOT for `root` (only when the probe cwd is
+  # at or under that root, like the real tool) and failing everything else.
+  cat >"$1/sl" <<'MOCK'
+#!/usr/bin/env bash
+if [[ "${1:-}" == "root" ]]; then
+  [[ -n "${MOCK_SL_ROOT:-}" ]] || exit 1
+  phys=$(pwd -P 2>/dev/null || printf '%s' "$PWD")
+  case "$phys" in
+    "$MOCK_SL_ROOT" | "$MOCK_SL_ROOT"/*)
+      printf '%s\n' "$MOCK_SL_ROOT"
+      exit 0
+      ;;
+    *) exit 1 ;;
+  esac
+fi
+echo "mock sl: unexpected args: $*" >&2
+exit 1
+MOCK
+  chmod +x "$1/sl"
+}
+
+# NOTE: assign MOCK_SL_ROOT with plain `export`, never as an inline
+# `VAR=... var=$(...)` prefix: without a command word the "temporary"
+# assignment persists in the suite shell and leaks into later cases.
+detect_mockbin=$(_mock_bin)
+_mock_sl_root "$detect_mockbin"
+export MOCK_SL_ROOT=""
+
+detect_repo=$(_new_repo)
+mkdir -p "$detect_repo/a/b"
+detect_git_root=$(cd "$detect_repo" && git rev-parse --show-toplevel)
+_assert_eq "detect: git subdir resolves type+root" \
+  "git|$detect_git_root" "$(_detect_type_root "$detect_repo/a/b" "$detect_mockbin")"
+
+detect_plain=$(_tmpdir)
+_assert_eq "detect: non-repo resolves empty" \
+  "|" "$(_detect_type_root "$detect_plain" "$detect_mockbin")"
+
+detect_outer=$(_tmpdir)
+mkdir -p "$detect_outer/.sl" "$detect_outer/inner"
+(cd "$detect_outer/inner" && git init -q && git config user.email t@t && git config user.name t)
+detect_outer_phys=$(cd "$detect_outer" && pwd -P)
+detect_inner_root=$(cd "$detect_outer/inner" && git rev-parse --show-toplevel)
+export MOCK_SL_ROOT="$detect_outer_phys"
+detect_nested_inner=$(_detect_type_root "$detect_outer/inner" "$detect_mockbin")
+_assert_eq "detect: git nested in sl picks nearest (git)" \
+  "git|$detect_inner_root" "$detect_nested_inner"
+detect_nested_outer=$(_detect_type_root "$detect_outer" "$detect_mockbin")
+_assert_eq "detect: outer sl resolves when cwd leaves nested git" \
+  "sl|$detect_outer_phys" "$detect_nested_outer"
+export MOCK_SL_ROOT=""
+
+detect_git_outer=$(_new_repo)
+mkdir -p "$detect_git_outer/sub/.sl"
+detect_git_outer_phys=$(cd "$detect_git_outer" && pwd -P)
+detect_sl_inner_phys=$(cd "$detect_git_outer/sub" && pwd -P)
+export MOCK_SL_ROOT="$detect_sl_inner_phys"
+detect_sl_nested=$(_detect_type_root "$detect_git_outer/sub" "$detect_mockbin")
+_assert_eq "detect: sl nested in git picks nearest (sl)" \
+  "sl|$detect_sl_inner_phys" "$detect_sl_nested"
+detect_git_outer_hit=$(_detect_type_root "$detect_git_outer" "$detect_mockbin")
+_assert_eq "detect: outer git resolves when cwd leaves nested sl" \
+  "git|$detect_git_outer_phys" "$detect_git_outer_hit"
+export MOCK_SL_ROOT=""
+
+detect_sl_only=$(_tmpdir)
+mkdir -p "$detect_sl_only/.sl"
+detect_sl_only_phys=$(cd "$detect_sl_only" && pwd -P)
+export MOCK_SL_ROOT="$detect_sl_only_phys"
+detect_sl_only_hit=$(_detect_type_root "$detect_sl_only" "$detect_mockbin")
+_assert_eq "detect: sl-only dir resolves sl" \
+  "sl|$detect_sl_only_phys" "$detect_sl_only_hit"
+export MOCK_SL_ROOT=""
+
+detect_bare_parent=$(_tmpdir)
+git init -q --bare "$detect_bare_parent/bare.git"
+mkdir -p "$detect_bare_parent/work/.sl"
+detect_bare_work_phys=$(cd "$detect_bare_parent/work" && pwd -P)
+detect_bare_expected=$(cd "$detect_bare_work_phys" && GIT_DIR="$detect_bare_parent/bare.git" GIT_WORK_TREE="$detect_bare_work_phys" git rev-parse --show-toplevel)
+export MOCK_SL_ROOT="$detect_bare_work_phys"
+detect_bare_hit=$(_detect_type_root "$detect_bare_work_phys" "$detect_mockbin" \
+  "GIT_DIR=$detect_bare_parent/bare.git" "GIT_WORK_TREE=$detect_bare_work_phys")
+_assert_eq "detect: explicit git env wins over ambient sl" \
+  "git|$detect_bare_expected" "$detect_bare_hit"
+export MOCK_SL_ROOT=""
+
+export MOCK_SL_ROOT="$detect_sl_only_phys"
+detect_preset_git_miss=$(_detect_type_root "$detect_sl_only" "$detect_mockbin" "_REPO_TYPE=git")
+_assert_eq "detect: git preset in sl-only dir resolves empty" \
+  "|" "$detect_preset_git_miss"
+export MOCK_SL_ROOT=""
+detect_preset_sl_miss=$(_detect_type_root "$detect_repo" "$detect_mockbin" "_REPO_TYPE=sl")
+_assert_eq "detect: sl preset with failing sl probe resolves empty" \
+  "|" "$detect_preset_sl_miss"
+detect_nometa_parent=$(_tmpdir)
+mkdir -p "$detect_nometa_parent/claimed/sub"
+detect_nometa_phys=$(cd "$detect_nometa_parent/claimed" && pwd -P)
+export MOCK_SL_ROOT="$detect_nometa_phys"
+detect_preset_sl_hit=$(_detect_type_root "$detect_nometa_parent/claimed/sub" "$detect_mockbin" "_REPO_TYPE=sl")
+_assert_eq "detect: sl preset trusts probe root without metadata check" \
+  "sl|$detect_nometa_phys" "$detect_preset_sl_hit"
+export MOCK_SL_ROOT=""
+
+detect_wt_parent=$(_tmpdir)
+detect_wt_seed=$(_new_repo)
+echo seed >"$detect_wt_seed/file.txt"
+(cd "$detect_wt_seed" && git add file.txt && git commit -qm "seed worktree base")
+(cd "$detect_wt_seed" && git worktree add "$detect_wt_parent/wt" -b wt-branch >/dev/null 2>&1)
+if [[ -f "$detect_wt_parent/wt/.git" && ! -d "$detect_wt_parent/wt/.git" ]]; then
+  _pass "detect: worktree fixture uses a .git file"
+else
+  _fail "detect: worktree fixture uses a .git file"
+fi
+detect_wt_root=$(cd "$detect_wt_parent/wt" && git rev-parse --show-toplevel)
+mkdir -p "$detect_wt_parent/wt/nested"
+_assert_eq "detect: linked worktree (.git file) resolves git" \
+  "git|$detect_wt_root" "$(_detect_type_root "$detect_wt_parent/wt/nested" "$detect_mockbin")"
+
+detect_corrupt=$(_tmpdir)
+mkdir -p "$detect_corrupt/.git"
+_assert_eq "detect: empty .git dir resolves empty" \
+  "|" "$(_detect_type_root "$detect_corrupt" "$detect_mockbin")"
+detect_gitfile=$(_tmpdir)
+printf 'not-a-gitlink\n' >"$detect_gitfile/.git"
+_assert_eq "detect: garbage .git file resolves empty" \
+  "|" "$(_detect_type_root "$detect_gitfile" "$detect_mockbin")"
+
+detect_hint_mock=$(_mock_bin)
+detect_hint_calls=$(_tmpdir)/hint-calls.log
+: >"$detect_hint_calls"
+export DETECT_HINT_CALLS="$detect_hint_calls"
+cat >"$detect_hint_mock/git" <<'MOCK'
+#!/usr/bin/env bash
+printf 'git %s\n' "$*" >>"$DETECT_HINT_CALLS"
+exit 1
+MOCK
+cat >"$detect_hint_mock/sl" <<'MOCK'
+#!/usr/bin/env bash
+printf 'sl %s\n' "$*" >>"$DETECT_HINT_CALLS"
+exit 1
+MOCK
+chmod +x "$detect_hint_mock/git" "$detect_hint_mock/sl"
+detect_hint_cwd=$(cd "$detect_repo" && pwd -P)
+detect_hint_hit=$(_detect_type_root "$detect_repo" "$detect_hint_mock" \
+  "_SLEY_LAUNCH_REPO_TYPE=git" "_SLEY_LAUNCH_REPO_ROOT=$detect_git_root" "_SLEY_LAUNCH_REPO_CWD=$detect_hint_cwd")
+_assert_eq "detect: launcher hint resolves without probing" \
+  "git|$detect_git_root" "$detect_hint_hit"
+_assert_eq "detect: launcher hint spawns no VCS probes" \
+  "" "$(cat "$detect_hint_calls")"
+unset DETECT_HINT_CALLS
+
+# A hint recorded for another cwd is rejected and detection re-probes.
+detect_hint_moved=$(_detect_type_root "$detect_repo" "$detect_mockbin" \
+  "_SLEY_LAUNCH_REPO_TYPE=git" "_SLEY_LAUNCH_REPO_ROOT=$detect_git_root" "_SLEY_LAUNCH_REPO_CWD=/elsewhere")
+_assert_eq "detect: moved cwd rejects hint and re-probes" \
+  "git|$detect_git_root" "$detect_hint_moved"
+
+detect_ceiling_hit=$(_detect_type_root "$detect_repo/a/b" "$detect_mockbin" \
+  "GIT_CEILING_DIRECTORIES=$detect_repo/a")
+_assert_eq "detect: git ceiling above .git resolves empty" \
+  "|" "$detect_ceiling_hit"
+
+detect_slfile_repo=$(_new_repo)
+: >"$detect_slfile_repo/.sl"
+detect_slfile_phys=$(cd "$detect_slfile_repo" && pwd -P)
+export MOCK_SL_ROOT="$detect_slfile_phys"
+detect_slfile_hit=$(_detect_type_root "$detect_slfile_repo" "$detect_mockbin")
+export MOCK_SL_ROOT=""
+detect_slfile_root=$(cd "$detect_slfile_repo" && git rev-parse --show-toplevel)
+_assert_eq "detect: stray .sl file does not steal git detection" \
+  "git|$detect_slfile_root" "$detect_slfile_hit"
+
+unset MOCK_SL_ROOT
+detect_mockbin=""
+detect_hint_mock=""
+
 _test_summary

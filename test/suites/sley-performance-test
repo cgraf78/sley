@@ -1150,4 +1150,108 @@ _assert_eq "ready --fix mixed perf: formatter invocation count" \
 _assert_contains "ready --fix mixed perf: partial worktree edit survives" \
   "unstaged work" "$(cat "$repo/staged/file-1.txt")"
 
+echo "=== sley perf: VCS discovery skips impossible probes ==="
+
+# The upward metadata scan must remove subprocesses, not just time: count
+# probe invocations with logging mocks. No wall-clock assertions here — these
+# hold under any load.
+_perf_detect_git_spawns_sl() {
+  local git_repo="$1" mockbin="$2" count_file="$3" out rc
+  export SLEY_PERF_SL_COUNT_FILE="$count_file"
+  printf '0\n' >"$count_file"
+  cat >"$mockbin/sl" <<'MOCK'
+#!/usr/bin/env bash
+count=$(cat "$SLEY_PERF_SL_COUNT_FILE")
+printf '%s\n' "$((count + 1))" >"$SLEY_PERF_SL_COUNT_FILE"
+exit 1
+MOCK
+  chmod +x "$mockbin/sl"
+  out=""
+  rc=0
+  out=$(cd "$git_repo" && PATH="$mockbin:$PATH" \
+    XDG_CONFIG_HOME="$git_repo/.xdg-config" XDG_CACHE_HOME="$git_repo/.xdg-cache" \
+    GIT_CONFIG_GLOBAL="$git_repo/.gitconfig-test" "$SLEY" status 2>&1) || rc=$?
+  printf '%s\n%s' "$rc" "$out"
+}
+
+detect_perf_repo=$(_new_perf_repo)
+(cd "$detect_perf_repo" && echo one >file.txt && git add file.txt && git commit -qm "seed detect perf")
+detect_perf_mock=$(_mock_bin)
+detect_perf_sl_count=$(_tmpdir)/sl-count.txt
+detect_perf_status=$(_perf_detect_git_spawns_sl "$detect_perf_repo" "$detect_perf_mock" "$detect_perf_sl_count")
+detect_perf_rc=$(printf '%s\n' "$detect_perf_status" | head -1)
+_assert_exit "detect perf: status in git-only repo exits 0" 0 "$detect_perf_rc"
+_assert_eq "detect perf: status in git-only repo never probes sl" \
+  "0" "$(cat "$detect_perf_sl_count")"
+unset SLEY_PERF_SL_COUNT_FILE
+
+detect_perf_empty=$(_tmpdir)
+detect_perf_nomock=$(_mock_bin)
+detect_perf_probes=$(_tmpdir)/norepo-probes.log
+: >"$detect_perf_probes"
+export SLEY_PERF_PROBE_LOG="$detect_perf_probes"
+cat >"$detect_perf_nomock/git" <<'MOCK'
+#!/usr/bin/env bash
+printf 'git %s\n' "$*" >>"$SLEY_PERF_PROBE_LOG"
+exit 1
+MOCK
+cat >"$detect_perf_nomock/sl" <<'MOCK'
+#!/usr/bin/env bash
+printf 'sl %s\n' "$*" >>"$SLEY_PERF_PROBE_LOG"
+exit 1
+MOCK
+chmod +x "$detect_perf_nomock/git" "$detect_perf_nomock/sl"
+detect_perf_norepo_out=""
+detect_perf_norepo_rc=0
+detect_perf_norepo_out=$(cd "$detect_perf_empty" && PATH="$detect_perf_nomock:$PATH" \
+  XDG_CONFIG_HOME="$detect_perf_empty/.xdg-config" XDG_CACHE_HOME="$detect_perf_empty/.xdg-cache" \
+  "$SLEY" status 2>&1) || detect_perf_norepo_rc=$?
+_assert_exit "detect perf: status outside repos exits 2" 2 "$detect_perf_norepo_rc"
+_assert_contains "detect perf: status outside repos reports unsupported repo" \
+  "unsupported repo" "$detect_perf_norepo_out"
+_assert_eq "detect perf: status outside repos spawns no VCS probes" \
+  "" "$(cat "$detect_perf_probes")"
+unset SLEY_PERF_PROBE_LOG
+
+# sl-only detection (direct probe: the CLI path needs full `sl status`
+# surface mocks, while the skip decision lives in `_repo_detect`).
+detect_perf_slroot=$(_tmpdir)
+mkdir -p "$detect_perf_slroot/.sl"
+detect_perf_slroot_phys=$(cd "$detect_perf_slroot" && pwd -P)
+detect_perf_slmock=$(_mock_bin)
+detect_perf_gitlog=$(_tmpdir)/slonly-git.log
+: >"$detect_perf_gitlog"
+export SLEY_PERF_GIT_LOG="$detect_perf_gitlog" SLEY_PERF_MOCKBIN="$detect_perf_slmock"
+export MOCK_SL_ROOT="$detect_perf_slroot_phys"
+cat >"$detect_perf_slmock/git" <<'MOCK'
+#!/usr/bin/env bash
+printf 'git %s\n' "$*" >>"$SLEY_PERF_GIT_LOG"
+# Strip this mock's own directory before delegating: PATH-resolving `git`
+# launchers re-scan PATH at their runtime and would otherwise re-pick this
+# mock as the "real" git and recurse.
+PATH=":$PATH:"
+PATH="${PATH//:$SLEY_PERF_MOCKBIN:/:}"
+PATH="${PATH#:}"
+PATH="${PATH%:}"
+export PATH
+exec git "$@"
+MOCK
+cat >"$detect_perf_slmock/sl" <<'MOCK'
+#!/usr/bin/env bash
+[[ "${1:-}" == "root" ]] || exit 1
+printf '%s\n' "$MOCK_SL_ROOT"
+MOCK
+chmod +x "$detect_perf_slmock/git" "$detect_perf_slmock/sl"
+detect_perf_slonly_hit=$(cd "$detect_perf_slroot" && PATH="$detect_perf_slmock:$PATH" \
+  SLEY_REPO_ROOT="$SLEY_REPO_ROOT" \
+  bash -c 'source "$SLEY_REPO_ROOT/lib/sley/repo.sh"; _repo_detect; printf "%s|%s" "$_REPO_TYPE" "$_REPO_ROOT"')
+_assert_eq "detect perf: sl-only probe still resolves sl" \
+  "sl|$detect_perf_slroot_phys" "$detect_perf_slonly_hit"
+if grep -q "show-toplevel" "$detect_perf_gitlog"; then
+  _fail "detect perf: sl-only probe never runs git rev-parse (saw: $(cat "$detect_perf_gitlog"))"
+else
+  _pass "detect perf: sl-only probe never runs git rev-parse"
+fi
+unset SLEY_PERF_GIT_LOG SLEY_PERF_MOCKBIN MOCK_SL_ROOT
+
 _test_summary
