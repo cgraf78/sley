@@ -5977,4 +5977,120 @@ HOME="$shell_login_home" _run_sley "$shell_group_repo" verify --json
 _assert_contains "shell default: discovery carries shell through" \
   '"shell":"login"' "$__SLEY_OUT"
 
+echo "=== sley: verify cache receipt validation edges ==="
+
+# A receipt that is a symlink must miss exactly like a corrupt receipt:
+# the post-lock fast path reimplements this validation in shell, so both
+# shapes are pinned before the change.
+cache_edge_repo=$(_new_repo)
+mkdir -p "$cache_edge_repo/src" "$cache_edge_repo/tests" "$cache_edge_repo/.sley"
+printf 'initial\n' >"$cache_edge_repo/src/app.txt"
+cat >"$cache_edge_repo/tests/run.sh" <<'EOF'
+#!/usr/bin/env bash
+count=0
+[[ -f tests/count ]] && count=$(cat tests/count)
+printf '%s\n' "$((count + 1))" > tests/count
+EOF
+chmod +x "$cache_edge_repo/tests/run.sh"
+cat >"$cache_edge_repo/.sley/verify.json" <<'EOF'
+{"rules": [{"paths": ["src/**"], "commands": [{"cmd": "./tests/run.sh", "required": true, "cache": {"enabled": true, "salt": "symlink-receipt-test"}}]}]}
+EOF
+(cd "$cache_edge_repo" && git add . && git commit -qm "seed symlink receipt verify")
+printf 'changed\n' >>"$cache_edge_repo/src/app.txt"
+
+_run_sley "$cache_edge_repo" verify --run-required --json --explain-cache
+_assert_exit "cache edge: symlink setup run exits 0" 0 "$__SLEY_RC"
+_assert_contains "cache edge: symlink setup passes" '"status":"passed"' "$__SLEY_OUT"
+cache_edge_receipt=$(printf '%s\n' "$__SLEY_OUT" | sed -n 's/^sley verify: cache receipt: //p' | head -1)
+if [[ -f "$cache_edge_receipt" && ! -L "$cache_edge_receipt" ]]; then
+  _pass "cache edge: setup wrote a regular receipt file"
+else
+  _fail "cache edge: setup wrote a regular receipt file (got '$cache_edge_receipt')"
+fi
+mv "$cache_edge_receipt" "$cache_edge_receipt.real"
+ln -s "$cache_edge_receipt.real" "$cache_edge_receipt"
+
+_run_sley "$cache_edge_repo" verify --run-required --json
+_assert_exit "cache edge: symlinked receipt exits 0" 0 "$__SLEY_RC"
+_assert_contains "cache edge: symlinked receipt reruns command" '"status":"passed"' "$__SLEY_OUT"
+_assert_not_contains "cache edge: symlinked receipt is not a hit" '"status":"cached-pass"' "$__SLEY_OUT"
+_assert_eq "cache edge: symlinked receipt increments count" "2" "$(cat "$cache_edge_repo/tests/count")"
+rm -f "$cache_edge_receipt" "$cache_edge_receipt.real"
+
+echo "=== sley: verify cache post-lock hit ==="
+
+# A receipt that lands while this run waits on the cache lock must satisfy
+# the run without re-executing the command. The holder releases only after
+# the run's own `--explain-cache` output proves the pre-lock lookup missed,
+# so no fixed sleeps gate the injection.
+cache_race_repo=$(_new_repo)
+mkdir -p "$cache_race_repo/src" "$cache_race_repo/tests" "$cache_race_repo/.sley"
+printf 'initial\n' >"$cache_race_repo/src/app.txt"
+cat >"$cache_race_repo/tests/run.sh" <<'EOF'
+#!/usr/bin/env bash
+count=0
+[[ -f tests/count ]] && count=$(cat tests/count)
+printf '%s\n' "$((count + 1))" > tests/count
+EOF
+chmod +x "$cache_race_repo/tests/run.sh"
+cat >"$cache_race_repo/.sley/verify.json" <<'EOF'
+{"rules": [{"paths": ["src/**"], "commands": [{"cmd": "./tests/run.sh", "required": true, "cache": {"enabled": true, "salt": "post-lock-hit-test"}}]}]}
+EOF
+(cd "$cache_race_repo" && git add . && git commit -qm "seed post-lock verify")
+printf 'changed\n' >>"$cache_race_repo/src/app.txt"
+
+_run_sley "$cache_race_repo" verify --run-required --json --explain-cache
+_assert_exit "cache race: setup run exits 0" 0 "$__SLEY_RC"
+cache_race_receipt=$(printf '%s\n' "$__SLEY_OUT" | sed -n 's/^sley verify: cache receipt: //p' | head -1)
+cache_race_saved=$(_tmpdir)/saved-receipt.json
+cp "$cache_race_receipt" "$cache_race_saved"
+rm -f "$cache_race_receipt"
+cache_race_lock_root="$(dirname "$(dirname "$cache_race_receipt")")/locks"
+cache_race_lock_dir="$cache_race_lock_root/$(basename "$cache_race_receipt").lock"
+mkdir -p "$cache_race_lock_root"
+mkdir "$cache_race_lock_dir"
+cache_race_fifo=$(_tmpdir)/release-fifo
+mkfifo "$cache_race_fifo"
+# Holder: keep the lock until the main flow signals release, then remove it.
+(
+  read -r _ <"$cache_race_fifo"
+  rmdir "$cache_race_lock_dir"
+) &
+cache_race_holder=$!
+cache_race_out=$(_tmpdir)/race-out.txt
+: >"$cache_race_out"
+(cd "$cache_race_repo" &&
+  XDG_CONFIG_HOME="$(_sley_test_xdg_config_home)" \
+  XDG_CACHE_HOME="$SLEY_TEST_XDG_CACHE_HOME" \
+  GIT_CONFIG_GLOBAL="$cache_race_repo/.gitconfig-test" \
+    "$SLEY" verify --run-required --explain-cache >"$cache_race_out" 2>&1) &
+cache_race_pid=$!
+cache_race_seen=0
+for ((cache_race_i = 0; cache_race_i < 300; cache_race_i++)); do
+  if grep -q "cache decision: miss" "$cache_race_out" 2>/dev/null; then
+    cache_race_seen=1
+    break
+  fi
+  # Fail fast instead of idling the full budget when the waiter is gone.
+  kill -0 "$cache_race_pid" 2>/dev/null || break
+  sleep 0.1
+done
+if [[ "$cache_race_seen" == "1" ]]; then
+  _pass "cache race: waiter reached the lock on a pre-lock miss"
+else
+  _fail "cache race: waiter reached the lock on a pre-lock miss (output: $(cat "$cache_race_out"))"
+fi
+# Another agent's receipt lands mid-wait; then release the lock.
+cp "$cache_race_saved" "$cache_race_receipt"
+printf 'go\n' >"$cache_race_fifo"
+wait "$cache_race_holder"
+wait "$cache_race_pid"
+cache_race_rc=$?
+_assert_exit "cache race: waiter exits 0" 0 "$cache_race_rc"
+_assert_contains "cache race: waiter reports cached pass" \
+  "cached pass" "$(cat "$cache_race_out")"
+_assert_eq "cache race: waiter does not rerun command" \
+  "1" "$(cat "$cache_race_repo/tests/count")"
+rm -rf "$cache_race_lock_dir" 2>/dev/null || true
+
 _test_summary

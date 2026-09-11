@@ -133,6 +133,13 @@ def sl_output(args: list[str], cwd: Path) -> str | None:
 
 
 def repo_identity(payload: dict[str, Any], root: Path) -> dict[str, Any]:
+    override = payload.get("repo_identity")
+    if isinstance(override, dict):
+        # Gate-computed identity from the shell caller: the same VCS queries
+        # this function would run, evaluated once per gate instead of once
+        # per helper invocation. Trusted as internal input; the shell builds
+        # it from the same commands with identical failure mapping.
+        return dict(override)
     repo_type = payload["repo_type"]
     ident: dict[str, Any] = {
         "type": repo_type,
@@ -146,30 +153,39 @@ def repo_identity(payload: dict[str, Any], root: Path) -> dict[str, Any]:
     return ident
 
 
-def git_base_identity(root: Path, policy: str) -> dict[str, Any]:
-    upstream = git_output(
-        ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"], root
-    )
-    upstream_tip = git_output(["rev-parse", "--verify", "--quiet", "@{upstream}"], root)
-    head = git_output(["rev-parse", "--verify", "--quiet", "HEAD"], root)
-    merge_base = None
-    if upstream_tip and head:
-        merge_base = git_output(["merge-base", upstream_tip, head], root)
-        if merge_base == head:
-            # A branch with no semantic delta from upstream should not get a
-            # stronger base identity than an actually changed branch. The
-            # selected-content policy can still opt out of base identity.
-            merge_base = None
+def git_base_identity(
+    root: Path, policy: str, override: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    if override is not None:
+        metadata = {
+            "upstream_ref": override.get("upstream_ref"),
+            "upstream_tip": override.get("upstream_tip"),
+            "merge_base": override.get("merge_base"),
+        }
+    else:
+        upstream = git_output(
+            ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"], root
+        )
+        upstream_tip = git_output(["rev-parse", "--verify", "--quiet", "@{upstream}"], root)
+        head = git_output(["rev-parse", "--verify", "--quiet", "HEAD"], root)
+        merge_base = None
+        if upstream_tip and head:
+            merge_base = git_output(["merge-base", upstream_tip, head], root)
+            if merge_base == head:
+                # A branch with no semantic delta from upstream should not get a
+                # stronger base identity than an actually changed branch. The
+                # selected-content policy can still opt out of base identity.
+                merge_base = None
+        metadata = {
+            "upstream_ref": upstream,
+            "upstream_tip": upstream_tip,
+            "merge_base": merge_base,
+        }
     key: dict[str, Any] = {"policy": policy}
-    metadata = {
-        "upstream_ref": upstream,
-        "upstream_tip": upstream_tip,
-        "merge_base": merge_base,
-    }
     if policy == "upstream-tip":
         key.update(metadata)
     elif policy == "merge-base":
-        key["merge_base"] = merge_base
+        key["merge_base"] = metadata["merge_base"]
     elif policy == "selected-content":
         pass
     else:
@@ -177,19 +193,28 @@ def git_base_identity(root: Path, policy: str) -> dict[str, Any]:
     return {"key": key, "metadata": metadata}
 
 
-def sl_base_identity(root: Path, policy: str) -> dict[str, Any]:
-    public_ancestor = sl_output(["log", "-r", "last(public() & ::.)", "-T", "{node}"], root)
-    public_tip = sl_output(["log", "-r", "last(public())", "-T", "{node}"], root)
-    # Draft node ids are conservative for v1: metadata-only amends may miss the
-    # cache, but they cannot create a false hit. A future patch-id based Sapling
-    # key can relax this after it is tested against stacked draft workflows.
-    draft_text = sl_output(["log", "-r", "sort(draft() & ::., topo)", "-T", "{node}\\n"], root)
-    draft_chain = [line for line in (draft_text or "").splitlines() if line]
-    metadata = {
-        "public_ancestor": public_ancestor,
-        "public_tip": public_tip,
-        "draft_chain": draft_chain,
-    }
+def sl_base_identity(
+    root: Path, policy: str, override: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    if override is not None:
+        metadata = {
+            "public_ancestor": override.get("public_ancestor"),
+            "public_tip": override.get("public_tip"),
+            "draft_chain": override.get("draft_chain") or [],
+        }
+    else:
+        public_ancestor = sl_output(["log", "-r", "last(public() & ::.)", "-T", "{node}"], root)
+        public_tip = sl_output(["log", "-r", "last(public())", "-T", "{node}"], root)
+        # Draft node ids are conservative for v1: metadata-only amends may miss the
+        # cache, but they cannot create a false hit. A future patch-id based Sapling
+        # key can relax this after it is tested against stacked draft workflows.
+        draft_text = sl_output(["log", "-r", "sort(draft() & ::., topo)", "-T", "{node}\\n"], root)
+        draft_chain = [line for line in (draft_text or "").splitlines() if line]
+        metadata = {
+            "public_ancestor": public_ancestor,
+            "public_tip": public_tip,
+            "draft_chain": draft_chain,
+        }
     key: dict[str, Any] = {"policy": policy}
     if policy == "upstream-tip":
         key.update(metadata)
@@ -297,10 +322,13 @@ def key_material(payload: dict[str, Any], root: Path, cache_dir: Path) -> dict[s
     for identity_cmd in identity.get("commands", []) or []:
         command_identities.append(identity_output(str(identity_cmd), root, timeout, shell_mode))
 
+    base_override = payload.get("base_identity")
+    if not isinstance(base_override, dict):
+        base_override = None
     if payload["repo_type"] == "git":
-        base = git_base_identity(root, str(policy))
+        base = git_base_identity(root, str(policy), base_override)
     elif payload["repo_type"] == "sl":
-        base = sl_base_identity(root, str(policy))
+        base = sl_base_identity(root, str(policy), base_override)
     else:
         raise ValueError(f"unsupported repo_type: {payload['repo_type']}")
     # Content hashing is intentionally based on the selected worktree files,
@@ -466,6 +494,45 @@ def prune(root: Path, keep: Path | None = None) -> None:
             pass
 
 
+def write_if_same_generation(
+    payload: dict[str, Any], expected_key: str | None
+) -> tuple[dict[str, Any], int]:
+    """Recompute the key and write a receipt only if it still matches.
+
+    This folds the shell's old post-run lookup plus write into one helper
+    invocation. Outcomes mirror the old two-call sequence exactly:
+    - key matches (and is non-empty): write the receipt, like `write`.
+    - key differs, key missing, or identity inputs fail: report `changed`
+      (the old post-run lookup yielded an empty/different key in exactly
+      these cases, and the shell failed closed with the same message).
+    - recompute/write operational failure: report `error` with the phase
+      so the shell keeps its distinct diagnostics.
+    Returns (result, exit_code); errors exit nonzero like `write` does.
+    """
+    try:
+        key, _material, _root = compute(payload)
+    except IdentityInputError:
+        return (
+            {"status": "changed", "key": None, "expected": expected_key},
+            0,
+        )
+    except Exception as exc:
+        return (
+            {"status": "error", "phase": "recompute", "error": str(exc)},
+            1,
+        )
+    if not expected_key or key != expected_key:
+        return ({"status": "changed", "key": key, "expected": expected_key}, 0)
+    try:
+        result = write(payload)
+    except Exception as exc:
+        return (
+            {"status": "error", "phase": "write", "error": str(exc)},
+            1,
+        )
+    return (result, 0)
+
+
 def stats() -> dict[str, Any]:
     root = cache_root()
     receipts = root / "receipts"
@@ -487,7 +554,8 @@ def stats() -> dict[str, Any]:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("action", choices=["lookup", "write", "stats"])
+    parser.add_argument("action", choices=["lookup", "write", "stats", "write-if-same-generation"])
+    parser.add_argument("expected_key", nargs="?")
     args = parser.parse_args()
     try:
         if args.action == "stats":
@@ -504,6 +572,10 @@ def main() -> int:
                 result = {"status": "identity-error", "error": str(exc)}
         elif args.action == "write":
             result = write(payload)
+        elif args.action == "write-if-same-generation":
+            result, verb_rc = write_if_same_generation(payload, args.expected_key)
+            print(json.dumps(result, separators=(",", ":")))
+            return verb_rc
     except Exception as exc:  # noqa: BLE001 - shell caller needs one message.
         print(json.dumps({"status": "error", "error": str(exc)}, separators=(",", ":")))
         return 1

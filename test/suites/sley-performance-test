@@ -1382,4 +1382,116 @@ _assert_eq "shell perf: no login shells spawned" \
 unset SLEY_PERF_CHECKRUN_COUNT_FILE SLEY_PERF_CHECKRUN_ARGS_PREFIX
 unset SLEY_PERF_CHECKRUN_HOME_PREFIX SLEY_PERF_LOGIN_COUNT_FILE
 
+echo "=== sley perf: verify cache pays identity once, three helper calls ==="
+
+# A cached-command miss must invoke the helper exactly three times (two
+# lookups bracketing the lock plus one post-run write-if-same-generation),
+# compute gate VCS identity exactly once, and batch its jq. Logging shims
+# prove the shape with no wall-clock assertions.
+vcache_perf_repo=$(_new_perf_repo)
+mkdir -p "$vcache_perf_repo/src" "$vcache_perf_repo/tests" "$vcache_perf_repo/.sley"
+printf 'initial\n' >"$vcache_perf_repo/src/app.txt"
+cat >"$vcache_perf_repo/tests/run.sh" <<'EOF'
+#!/usr/bin/env bash
+count=0
+[[ -f tests/count ]] && count=$(cat tests/count)
+printf '%s\n' "$((count + 1))" > tests/count
+EOF
+chmod +x "$vcache_perf_repo/tests/run.sh"
+cat >"$vcache_perf_repo/.sley/verify.json" <<'EOF'
+{"rules": [{"paths": ["src/**"], "commands": [{"cmd": "./tests/run.sh", "required": true, "cache": {"enabled": true, "salt": "vcache-perf-shape"}}]}]}
+EOF
+(cd "$vcache_perf_repo" && git add . && git commit -qm "seed vcache perf shape")
+printf 'changed\n' >>"$vcache_perf_repo/src/app.txt"
+(cd "$vcache_perf_repo" && git add src/app.txt)
+vcache_perf_mock=$(_mock_bin)
+vcache_perf_state=$(_tmpdir)
+export SLEY_PERF_VCACHE_MOCKBIN="$vcache_perf_mock"
+SLEY_PERF_VCACHE_REAL_PY="$(command -v python3)"
+SLEY_PERF_VCACHE_REAL_JQ="$(command -v jq)"
+export SLEY_PERF_VCACHE_REAL_PY SLEY_PERF_VCACHE_REAL_JQ
+export SLEY_PERF_VCACHE_PY_LOG="$vcache_perf_state/python.log"
+export SLEY_PERF_VCACHE_GIT_LOG="$vcache_perf_state/git.log"
+export SLEY_PERF_VCACHE_JQ_COUNT="$vcache_perf_state/jq-count.log"
+export SLEY_PERF_VCACHE_JQ_ARGS="$vcache_perf_state/jq-args.log"
+: >"$SLEY_PERF_VCACHE_PY_LOG"
+: >"$SLEY_PERF_VCACHE_GIT_LOG"
+: >"$SLEY_PERF_VCACHE_JQ_COUNT"
+: >"$SLEY_PERF_VCACHE_JQ_ARGS"
+export SLEY_PERF_CHECKRUN_COUNT_FILE="$vcache_perf_state/checkrun-count"
+export SLEY_PERF_CHECKRUN_ARGS_PREFIX="$vcache_perf_state/checkrun-args"
+export SLEY_PERF_CHECKRUN_HOME_PREFIX="$vcache_perf_state/checkrun-home"
+printf '0\n' >"$SLEY_PERF_CHECKRUN_COUNT_FILE"
+cat >"$vcache_perf_mock/python3" <<'MOCK'
+#!/usr/bin/env bash
+printf 'python3 %s\n' "$*" >>"$SLEY_PERF_VCACHE_PY_LOG"
+# Delegate by absolute path with PATH untouched: stripping this mockbin
+# would also hide the sibling git/jq mocks from python's grandchildren
+# (the cache helper's VCS calls must stay visible).
+exec "$SLEY_PERF_VCACHE_REAL_PY" "$@"
+MOCK
+cat >"$vcache_perf_mock/git" <<'MOCK'
+#!/usr/bin/env bash
+printf 'git %s\n' "$*" >>"$SLEY_PERF_VCACHE_GIT_LOG"
+# Unlike python3/jq above, git delegates via PATH *with* a strip:
+# PATH-resolving `git` launchers re-scan PATH at their runtime and would
+# otherwise re-pick this mock as the "real" git and recurse. Git's own
+# children need no sibling mocks, so hiding the mockbin from them is safe.
+PATH=":$PATH:"
+PATH="${PATH//:$SLEY_PERF_VCACHE_MOCKBIN:/:}"
+PATH="${PATH#:}"
+PATH="${PATH%:}"
+export PATH
+exec git "$@"
+MOCK
+cat >"$vcache_perf_mock/jq" <<'MOCK'
+#!/usr/bin/env bash
+# One tick per call: multi-line jq programs would otherwise inflate a
+# line count. Full argv goes to a separate args log for content checks.
+printf 'call\n' >>"$SLEY_PERF_VCACHE_JQ_COUNT"
+printf 'jq %s\n' "$*" >>"$SLEY_PERF_VCACHE_JQ_ARGS"
+# Absolute-path delegation (see the python3 mock above): no PATH strip.
+exec "$SLEY_PERF_VCACHE_REAL_JQ" "$@"
+MOCK
+chmod +x "$vcache_perf_mock/python3" "$vcache_perf_mock/git" "$vcache_perf_mock/jq"
+vcache_perf_cache=$(_tmpdir)/vcache-fresh
+vcache_perf_rc=0
+(cd "$vcache_perf_repo" && PATH="$vcache_perf_mock:$PATH" HOME="$vcache_perf_repo/.home" \
+  XDG_CONFIG_HOME="$vcache_perf_repo/.xdg-config" XDG_CACHE_HOME="$vcache_perf_repo/.xdg-cache" \
+  GIT_CONFIG_GLOBAL="$vcache_perf_repo/.gitconfig-test" \
+  SLEY_VERIFY_CACHE_DIR="$vcache_perf_cache" \
+  "$SLEY" verify --run-required >/dev/null 2>&1) || vcache_perf_rc=$?
+_assert_exit "vcache perf: miss run exits 0" 0 "$vcache_perf_rc"
+_assert_eq "vcache perf: miss executes command once" \
+  "1" "$(cat "$vcache_perf_repo/tests/count")"
+vcache_perf_lookups=$(grep -c "verify-cache.py lookup" "$SLEY_PERF_VCACHE_PY_LOG" || true)
+vcache_perf_commits=$(grep -c "verify-cache.py write-if-same-generation" "$SLEY_PERF_VCACHE_PY_LOG" || true)
+_assert_eq "vcache perf: exactly two cache lookups" "2" "$vcache_perf_lookups"
+_assert_eq "vcache perf: exactly one post-run commit" "1" "$vcache_perf_commits"
+if grep -q "verify-cache.py write$" "$SLEY_PERF_VCACHE_PY_LOG"; then
+  _fail "vcache perf: no standalone cache writes"
+else
+  _pass "vcache perf: no standalone cache writes"
+fi
+vcache_perf_gitdir=$(grep -c "rev-parse --absolute-git-dir" "$SLEY_PERF_VCACHE_GIT_LOG" || true)
+vcache_perf_upstream=$(grep -c "rev-parse --abbrev-ref --symbolic-full-name" "$SLEY_PERF_VCACHE_GIT_LOG" || true)
+_assert_eq "vcache perf: repo identity computed once" "1" "$vcache_perf_gitdir"
+_assert_eq "vcache perf: base identity computed once" "1" "$vcache_perf_upstream"
+vcache_perf_jq_total=$(wc -l <"$SLEY_PERF_VCACHE_JQ_COUNT" | tr -d ' ')
+if [[ "$vcache_perf_jq_total" -le 22 ]]; then
+  _pass "vcache perf: jq stays batched (total $vcache_perf_jq_total <= 22)"
+else
+  _fail "vcache perf: jq stays batched (total $vcache_perf_jq_total <= 22)"
+fi
+if grep -q -- "--rawfile" "$SLEY_PERF_VCACHE_JQ_ARGS"; then
+  _pass "vcache perf: payload built in one jq call"
+else
+  _fail "vcache perf: payload built in one jq call"
+fi
+unset SLEY_PERF_VCACHE_MOCKBIN SLEY_PERF_VCACHE_PY_LOG
+unset SLEY_PERF_VCACHE_GIT_LOG SLEY_PERF_VCACHE_JQ_COUNT
+unset SLEY_PERF_VCACHE_JQ_ARGS SLEY_PERF_CHECKRUN_COUNT_FILE
+unset SLEY_PERF_CHECKRUN_ARGS_PREFIX SLEY_PERF_CHECKRUN_HOME_PREFIX
+unset SLEY_PERF_VCACHE_REAL_PY SLEY_PERF_VCACHE_REAL_JQ
+
 _test_summary

@@ -632,18 +632,131 @@ _sley_verify_cache_helper() {
   python3 "$helper_dir/verify-cache.py" "$@"
 }
 
-_sley_verify_json_array_from_lines() {
-  jq -Rsc 'split("\n") | map(select(length > 0))'
+# Gate-memoized VCS identity for cache keys: the exact `repo_identity` /
+# base-identity values `verify-cache.py` would compute itself, evaluated
+# once per gate instead of once per helper invocation (a miss path used to
+# pay 4× ~5 VCS spawns per cached command). Values mirror the helper
+# precisely — same commands, same working directory, same failure-to-null
+# mapping (a null flag per value, since success-with-empty-output and
+# failure must stay distinct), same merge_base==head normalization. Reset
+# per `_sley_verify_run_required_impl` call; staleness within a gate is
+# safe (keys are self-describing, so a moved base only causes misses).
+_sley_verify_cache_identity_json() {
+  if [[ -n "${_SLEY_VERIFY_CACHE_IDENTITY_JSON:-}" ]]; then
+    printf '%s\n' "$_SLEY_VERIFY_CACHE_IDENTITY_JSON"
+    return 0
+  fi
+  local identity=""
+  if [[ "$_REPO_TYPE" == "git" ]]; then
+    local git_dir="" git_dir_null=1 remote="" remote_null=1
+    local upstream="" upstream_null=1 upstream_tip="" upstream_tip_null=1
+    local head="" merge_base="" merge_base_null=1
+    if git_dir=$(git -C "$_REPO_ROOT" rev-parse --absolute-git-dir 2>/dev/null); then
+      git_dir_null=0
+    else
+      git_dir=""
+    fi
+    if remote=$(git -C "$_REPO_ROOT" config --get remote.origin.url 2>/dev/null); then
+      remote_null=0
+    else
+      remote=""
+    fi
+    if upstream=$(git -C "$_REPO_ROOT" rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' 2>/dev/null); then
+      upstream_null=0
+    else
+      upstream=""
+    fi
+    if upstream_tip=$(git -C "$_REPO_ROOT" rev-parse --verify --quiet '@{upstream}' 2>/dev/null); then
+      upstream_tip_null=0
+    else
+      upstream_tip=""
+    fi
+    # `head` only gates the merge-base query below (as in the helper); it is
+    # not part of the identity itself, so no null flag is needed.
+    head=$(git -C "$_REPO_ROOT" rev-parse --verify --quiet HEAD 2>/dev/null || true)
+    if [[ -n "$upstream_tip" && -n "$head" ]]; then
+      if merge_base=$(git -C "$_REPO_ROOT" merge-base "$upstream_tip" "$head" 2>/dev/null) &&
+        [[ "$merge_base" != "$head" ]]; then
+        merge_base_null=0
+      else
+        merge_base=""
+      fi
+    fi
+    identity=$(jq -cn \
+      --arg root "$_REPO_ROOT" \
+      --arg git_dir "$git_dir" --argjson git_dir_null "$git_dir_null" \
+      --arg remote "$remote" --argjson remote_null "$remote_null" \
+      --arg upstream "$upstream" --argjson upstream_null "$upstream_null" \
+      --arg upstream_tip "$upstream_tip" --argjson upstream_tip_null "$upstream_tip_null" \
+      --arg merge_base "$merge_base" --argjson merge_base_null "$merge_base_null" \
+      '{
+        repo_identity: {
+          type: "git",
+          root: $root,
+          git_dir: (if $git_dir_null == 1 then null else $git_dir end),
+          remote: (if $remote_null == 1 then null else $remote end)
+        },
+        base_identity: {
+          upstream_ref: (if $upstream_null == 1 then null else $upstream end),
+          upstream_tip: (if $upstream_tip_null == 1 then null else $upstream_tip end),
+          merge_base: (if $merge_base_null == 1 then null else $merge_base end)
+        }
+      }') || return 1
+  elif [[ "$_REPO_TYPE" == "sl" ]]; then
+    local public_ancestor="" public_ancestor_null=1 public_tip="" public_tip_null=1
+    local draft_text="" sl_store="" sl_store_null=1
+    # The helper runs these with cwd=repo root; match it exactly (a bare
+    # `sl` from a subdirectory usually discovers the same repo, but nested
+    # checkouts at discovery boundaries could differ).
+    if public_ancestor=$(cd "$_REPO_ROOT" && sl log -r 'last(public() & ::.)' -T '{node}' 2>/dev/null); then
+      public_ancestor_null=0
+    else
+      public_ancestor=""
+    fi
+    if public_tip=$(cd "$_REPO_ROOT" && sl log -r 'last(public())' -T '{node}' 2>/dev/null); then
+      public_tip_null=0
+    else
+      public_tip=""
+    fi
+    draft_text=$(cd "$_REPO_ROOT" && sl log -r 'sort(draft() & ::., topo)' -T '{node}\n' 2>/dev/null || true)
+    # Same exists-check the helper performs (a plain `-e`, `.sl` only).
+    if [[ -e "$_REPO_ROOT/.sl" ]]; then
+      sl_store="$_REPO_ROOT/.sl"
+      sl_store_null=0
+    fi
+    identity=$(jq -cn \
+      --arg root "$_REPO_ROOT" \
+      --arg sl_store "$sl_store" --argjson sl_store_null "$sl_store_null" \
+      --arg public_ancestor "$public_ancestor" --argjson public_ancestor_null "$public_ancestor_null" \
+      --arg public_tip "$public_tip" --argjson public_tip_null "$public_tip_null" \
+      --arg draft "$draft_text" \
+      '{
+        repo_identity: {
+          type: "sl",
+          root: $root,
+          sl_store: (if $sl_store_null == 1 then null else $sl_store end)
+        },
+        base_identity: {
+          public_ancestor: (if $public_ancestor_null == 1 then null else $public_ancestor end),
+          public_tip: (if $public_tip_null == 1 then null else $public_tip end),
+          draft_chain: ($draft | split("\n") | map(select(length > 0)))
+        }
+      }') || return 1
+  else
+    return 1
+  fi
+  _SLEY_VERIFY_CACHE_IDENTITY_JSON="$identity"
+  printf '%s\n' "$identity"
 }
 
 _sley_verify_cache_payload() {
-  local files="$1" command_item="$2" paths files_json paths_json include_untracked repo_wide
+  local files="$1" command_item="$2" paths include_untracked repo_wide identity_json
   paths=$(_sley_path_filters) || return $?
+  identity_json=$(_sley_verify_cache_identity_json) || return 1
   # Keep the cache helper's input as JSON. The selected-file stream is still
   # line-oriented because the rest of sley exposes it that way, but once we
   # cross into cache-key construction we avoid shell string framing entirely.
-  files_json=$(printf '%s\n' "$files" | _sley_verify_json_array_from_lines) || return 1
-  paths_json=$(printf '%s\n' "$paths" | _sley_verify_json_array_from_lines) || return 1
+  # `--rawfile` feeds both streams into one jq call instead of three.
   [[ "$_SLEY_SCOPE_INCLUDE_UNTRACKED" == "1" ]] && include_untracked=true || include_untracked=false
   [[ "$_SLEY_SCOPE_REPO_WIDE" == "1" ]] && repo_wide=true || repo_wide=false
   jq -cn \
@@ -652,19 +765,38 @@ _sley_verify_cache_payload() {
     --arg scope_change "$_SLEY_SCOPE_CHANGE" \
     --argjson include_untracked "$include_untracked" \
     --argjson repo_wide "$repo_wide" \
-    --argjson files "$files_json" \
-    --argjson paths "$paths_json" \
+    --rawfile files_text <(printf '%s\n' "$files") \
+    --rawfile paths_text <(printf '%s\n' "$paths") \
     --argjson command "$command_item" \
+    --argjson identity "$identity_json" \
     '{
       repo_type: $repo_type,
       repo_root: $repo_root,
       scope_change: $scope_change,
       include_untracked: $include_untracked,
       repo_wide: $repo_wide,
-      files: $files,
-      paths: $paths,
-      command: $command
+      files: ($files_text | split("\n") | map(select(length > 0))),
+      paths: ($paths_text | split("\n") | map(select(length > 0))),
+      command: $command,
+      repo_identity: $identity.repo_identity,
+      base_identity: $identity.base_identity
     }'
+}
+
+# Parse one helper lookup document into cache_status/receipt/pre_key. One jq
+# call (used to be three per lookup, six per cached command); `@sh` quoting
+# keeps this exact for arbitrary paths. Plain assignments land in the
+# caller's locals via dynamic scope — the run-required loop pre-declares
+# all three. Defaults are pre-set so malformed input behaves exactly like
+# the old per-field extraction (empty status, treated as a miss below).
+_sley_verify_cache_parse_lookup() {
+  cache_status=""
+  receipt=""
+  pre_key=""
+  if lookup_assignments=$(printf '%s' "$1" | jq -r \
+    '"cache_status=\(.status|@sh)", "receipt=\(.receipt // ""|@sh)", "pre_key=\(.key // ""|@sh)"'); then
+    eval "$lookup_assignments"
+  fi
 }
 
 _sley_verify_cache_lock_acquire() {
@@ -834,9 +966,13 @@ _sley_verify_emit_cache_hit() {
 _sley_verify_run_required_impl() {
   local commands="$1" files="$2" full="$3" json="$4" force="$5" explain_cache="$6"
   local required command_item command tier exit_code failed=0 status result_status
-  local results_json="" first=1 cache_enabled payload lookup cache_status receipt pre_key post_lookup post_key write_result lock_dir
+  local results_json="" first=1 cache_enabled payload lookup cache_status receipt pre_key write_result write_status write_phase lock_dir
   local passed_count=0 cached_count=0 failed_count=0 skipped_slow_count=0
   local shell_mode shell_flag shell_field
+  local cached_raw top_shell cache_shell field_assignments lookup_assignments
+  # Fresh VCS identity per gate run; the first cached command computes it and
+  # the rest of the gate reuses it via `_sley_verify_cache_identity_json`.
+  _SLEY_VERIFY_CACHE_IDENTITY_JSON=""
 
   # Cleanup-on-signal traps. Normal control flow releases `lock_dir` at every
   # branch below, but a SIGINT (Ctrl-C), SIGTERM, or SIGHUP between the
@@ -892,8 +1028,22 @@ _sley_verify_run_required_impl() {
   while IFS= read -r command_item; do
     [[ -n "$command_item" ]] || continue
     lock_dir=""
-    command=$(printf '%s' "$command_item" | jq -r '.command')
-    tier=$(printf '%s' "$command_item" | jq -r '.tier // "fast"')
+    # One jq call extracts every per-command field this loop needs (it used
+    # to be up to four). `@sh` quoting round-trips arbitrary command text
+    # exactly — quotes, newlines, tabs, backslashes, unicode — because the
+    # assignment names are literals in this program and only values come
+    # from data. Defaults are pre-set so a malformed item behaves exactly
+    # like the old per-field extraction (empty command, skipped below).
+    command="" tier="fast" cached_raw="false" top_shell="default" cache_shell="default"
+    field_assignments=""
+    if field_assignments=$(printf '%s' "$command_item" | jq -r \
+      '"command=\(.command|@sh)",
+        "tier=\(.tier // "fast"|@sh)",
+        "cached_raw=\(.cache.enabled == true)",
+        "top_shell=\(.shell // "default"|@sh)",
+        "cache_shell=\(.cache.shell // "default"|@sh)"'); then
+      eval "$field_assignments"
+    fi
     [[ -n "$command" ]] || continue
     cache_enabled=0
     # Required commands run under `bash -c` with the gate's inherited
@@ -902,11 +1052,11 @@ _sley_verify_run_required_impl() {
     # `cache.shell` knob; non-cached commands use the top-level `shell`
     # field. When both are present on a cached command, `cache.shell`
     # wins: it is the historical knob and also feeds the cache key.
-    shell_mode=$(printf '%s' "$command_item" | jq -r '.shell // "default"')
+    shell_mode="$top_shell"
     shell_field="shell"
-    if printf '%s' "$command_item" | jq -e '.cache.enabled == true' >/dev/null 2>&1; then
+    if [[ "$cached_raw" == "true" ]]; then
       cache_enabled=1
-      shell_mode=$(printf '%s' "$command_item" | jq -r '.cache.shell // "default"')
+      shell_mode="$cache_shell"
       shell_field="cache.shell"
       payload=$(_sley_verify_cache_payload "$files" "$command_item") || {
         echo "sley verify: failed to build cache key input for command: $command" >&2
@@ -917,9 +1067,7 @@ _sley_verify_run_required_impl() {
         printf '%s\n' "$lookup" >&2
         return 1
       }
-      cache_status=$(printf '%s' "$lookup" | jq -r '.status')
-      receipt=$(printf '%s' "$lookup" | jq -r '.receipt // empty')
-      pre_key=$(printf '%s' "$lookup" | jq -r '.key // empty')
+      _sley_verify_cache_parse_lookup "$lookup"
       if [[ "$explain_cache" == "1" ]]; then
         if [[ "$force" == "1" ]]; then
           echo "sley verify: cache decision: force $tier: $command"
@@ -954,9 +1102,7 @@ _sley_verify_run_required_impl() {
           printf '%s\n' "$lookup" >&2
           return 1
         }
-        cache_status=$(printf '%s' "$lookup" | jq -r '.status')
-        receipt=$(printf '%s' "$lookup" | jq -r '.receipt // empty')
-        pre_key=$(printf '%s' "$lookup" | jq -r '.key // empty')
+        _sley_verify_cache_parse_lookup "$lookup"
         if [[ "$cache_status" == "identity-error" ]]; then
           _sley_verify_cache_lock_release "$lock_dir"
           lock_dir=""
@@ -1019,28 +1165,34 @@ _sley_verify_run_required_impl() {
       if [[ "$cache_enabled" == "1" ]]; then
         # Recompute the key after the command succeeds. If the selected content
         # changed while the test was running, the success no longer proves the
-        # current input and must not be written as a receipt.
-        post_lookup=$(printf '%s\n' "$payload" | _sley_verify_cache_helper lookup) || {
+        # current input and must not be written as a receipt. One helper call
+        # folds the old post-run lookup plus write; outcomes (including the
+        # identity-error → changed mapping and the distinct recompute/write
+        # diagnostics) match the old two-call sequence exactly.
+        write_result=$(printf '%s\n' "$payload" | _sley_verify_cache_helper write-if-same-generation "$pre_key") || {
           _sley_verify_cache_lock_release "$lock_dir"
           lock_dir=""
-          echo "sley verify: failed to recompute cache key for command: $command" >&2
-          printf '%s\n' "$post_lookup" >&2
+          write_phase=$(printf '%s' "$write_result" | jq -r '.phase // "recompute"')
+          if [[ "$write_phase" == "write" ]]; then
+            echo "sley verify: failed to write success receipt for command: $command" >&2
+          else
+            echo "sley verify: failed to recompute cache key for command: $command" >&2
+          fi
+          printf '%s\n' "$write_result" >&2
           return 1
         }
-        post_key=$(printf '%s' "$post_lookup" | jq -r '.key // empty')
-        if [[ -z "$pre_key" || "$post_key" != "$pre_key" ]]; then
+        write_status=$(printf '%s' "$write_result" | jq -r '.status')
+        if [[ "$write_status" == "changed" ]]; then
           echo "sley verify: changes changed during required command; not caching receipt: $command" >&2
           failed=1
           failed_count=$((failed_count + 1))
           result_status="failed"
-        else
-          write_result=$(printf '%s\n' "$payload" | _sley_verify_cache_helper write) || {
-            _sley_verify_cache_lock_release "$lock_dir"
-            lock_dir=""
-            echo "sley verify: failed to write success receipt for command: $command" >&2
-            printf '%s\n' "$write_result" >&2
-            return 1
-          }
+        elif [[ "$write_status" != "written" ]]; then
+          _sley_verify_cache_lock_release "$lock_dir"
+          lock_dir=""
+          echo "sley verify: failed to write success receipt for command: $command" >&2
+          printf '%s\n' "$write_result" >&2
+          return 1
         fi
       fi
     else
