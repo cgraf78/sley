@@ -119,6 +119,11 @@
               "type": "string",
               "enum": ["fast", "slow", "full", "suggested"]
             },
+            "shell": {
+              "type": "string",
+              "enum": ["default", "login"],
+              "description": "Execution shell for non-cached commands: default runs bash -c with the inherited environment, login runs bash -lc. Cached commands use cache.shell instead."
+            },
             "cache": { "$ref": "#/$defs/cache" }
           }
         },
@@ -148,6 +153,11 @@
             "tier": {
               "type": "string",
               "enum": ["fast", "slow", "full", "suggested"]
+            },
+            "shell": {
+              "type": "string",
+              "enum": ["default", "login"],
+              "description": "Execution shell for non-cached commands: default runs bash -c with the inherited environment, login runs bash -lc. Cached commands use cache.shell instead."
             },
             "cache": { "$ref": "#/$defs/cache" }
           }

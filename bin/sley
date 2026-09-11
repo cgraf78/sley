@@ -30,6 +30,12 @@ _bin_dir=$(_sley_script_dir "${BASH_SOURCE[0]}") ||
   _sley_die "cannot resolve executable path"
 _sley_dir="$_bin_dir/../lib/sley"
 
+# Defer the heavy verify/ready modules: CLI hot paths (`hook format-file`,
+# `status`, ...) skip ~10ms of parse, and the `verify`/`ready` commands
+# load their module on first use. Sourced consumers keep eager loading
+# (the default) so the full API is defined immediately after sourcing.
+# A preset value (e.g. `SLEY_LAZY_MODULES=0` for debugging) is honored.
+SLEY_LAZY_MODULES="${SLEY_LAZY_MODULES:-1}"
 # shellcheck disable=SC1091 # resolved relative to this executable.
 source "$_sley_dir/sley.sh"
 
@@ -58,6 +64,21 @@ _sley_auto_path_ok() {
 _sley_run() {
   sley_main "$@"
   exit $?
+}
+
+_sley_skip_probe_for_hook_file() {
+  [[ "${1:-}" == "hook" ]] || return 1
+  case "${2:-}" in
+    format-file | lint-file) ;;
+    *) return 1 ;;
+  esac
+  # The bare-repo fallback decides from the probe outcome, so keep the legacy
+  # path whenever it could engage. An explicit skip or an unset bare dir
+  # makes the fallback a provable no-op and the probe safely skippable:
+  # hook-init re-detects from the (already cd'd) buffer directory anyway.
+  [[ "${SLEY_SKIP_BARE_REPO_FALLBACK:-0}" == "1" ]] && return 0
+  [[ -z "${SLEY_BARE_REPO_GIT_DIR:-}" ]] && return 0
+  return 1
 }
 
 _sley_apply_bare_repo_fallback() {
@@ -114,6 +135,16 @@ esac
 # Honor explicit Git context. Callers that set either variable are already
 # choosing a repository, including bare Git worktrees.
 if [[ -n "${GIT_DIR:-}" || -n "${GIT_WORK_TREE:-}" ]]; then
+  _sley_run "$@"
+fi
+
+# Single-file hook commands re-detect in hook-init from the buffer directory
+# the launcher already entered above. Skip the launcher probe when the hint
+# it would publish is provably useless (caller override, failed probe) or
+# simply moved (hook-init runs the same single probe instead) — but never
+# when the bare-repo fallback below could engage, since it needs the probe
+# outcome to decide between the normal repo and the configured worktree.
+if _sley_skip_probe_for_hook_file "$@"; then
   _sley_run "$@"
 fi
 

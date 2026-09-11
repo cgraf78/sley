@@ -5554,4 +5554,589 @@ _assert_exit "secrets message: missing path is a usage error" 2 "$__EMC_RC"
 
 unset MOCK_LOG MOCK_STDIN MOCK_LEAK_CONFIG MOCK_RC1_CONFIG MOCK_RC2_CONFIG MOCK_CAPTURE
 
+echo "=== sley: repo detection contract (VCS discovery characterization) ==="
+
+# Pin `_repo_detect` semantics ahead of the pure-bash upward-scan fast path.
+# Every case must resolve identically with and without subprocess skipping,
+# so these run against sourced repo.sh directly and assert exact type+root.
+_detect_type_root() {
+  # $1: dir to detect in; $2: mockbin prepended to PATH ("" for none);
+  # remaining args: VAR=VAL exports for the probe (presets, hints, ceilings).
+  local dir="$1" mockbin="$2"
+  shift 2
+  (
+    cd "$dir" || exit 3
+    [[ -z "$mockbin" ]] || PATH="$mockbin:$PATH"
+    unset _REPO_TYPE _REPO_ROOT
+    unset _SLEY_LAUNCH_REPO_TYPE _SLEY_LAUNCH_REPO_ROOT _SLEY_LAUNCH_REPO_CWD
+    unset GIT_DIR GIT_WORK_TREE
+    local kv
+    for kv in ${1+"$@"}; do
+      # shellcheck disable=SC2163 # kv is always a VAR=VAL pair by contract.
+      export "$kv" || exit 3
+    done
+    # shellcheck disable=SC1091 # suite resolves the repo under test.
+    source "$SLEY_REPO_ROOT/lib/sley/repo.sh"
+    _repo_detect
+    printf '%s|%s' "$_REPO_TYPE" "$_REPO_ROOT"
+  )
+}
+
+_mock_sl_root() {
+  # Mock `sl` honoring MOCK_SL_ROOT for `root` (only when the probe cwd is
+  # at or under that root, like the real tool) and failing everything else.
+  cat >"$1/sl" <<'MOCK'
+#!/usr/bin/env bash
+if [[ "${1:-}" == "root" ]]; then
+  [[ -n "${MOCK_SL_ROOT:-}" ]] || exit 1
+  phys=$(pwd -P 2>/dev/null || printf '%s' "$PWD")
+  case "$phys" in
+    "$MOCK_SL_ROOT" | "$MOCK_SL_ROOT"/*)
+      printf '%s\n' "$MOCK_SL_ROOT"
+      exit 0
+      ;;
+    *) exit 1 ;;
+  esac
+fi
+echo "mock sl: unexpected args: $*" >&2
+exit 1
+MOCK
+  chmod +x "$1/sl"
+}
+
+# NOTE: assign MOCK_SL_ROOT with plain `export`, never as an inline
+# `VAR=... var=$(...)` prefix: without a command word the "temporary"
+# assignment persists in the suite shell and leaks into later cases.
+detect_mockbin=$(_mock_bin)
+_mock_sl_root "$detect_mockbin"
+export MOCK_SL_ROOT=""
+
+detect_repo=$(_new_repo)
+mkdir -p "$detect_repo/a/b"
+detect_git_root=$(cd "$detect_repo" && git rev-parse --show-toplevel)
+_assert_eq "detect: git subdir resolves type+root" \
+  "git|$detect_git_root" "$(_detect_type_root "$detect_repo/a/b" "$detect_mockbin")"
+
+detect_plain=$(_tmpdir)
+_assert_eq "detect: non-repo resolves empty" \
+  "|" "$(_detect_type_root "$detect_plain" "$detect_mockbin")"
+
+detect_outer=$(_tmpdir)
+mkdir -p "$detect_outer/.sl" "$detect_outer/inner"
+(cd "$detect_outer/inner" && git init -q && git config user.email t@t && git config user.name t)
+detect_outer_phys=$(cd "$detect_outer" && pwd -P)
+detect_inner_root=$(cd "$detect_outer/inner" && git rev-parse --show-toplevel)
+export MOCK_SL_ROOT="$detect_outer_phys"
+detect_nested_inner=$(_detect_type_root "$detect_outer/inner" "$detect_mockbin")
+_assert_eq "detect: git nested in sl picks nearest (git)" \
+  "git|$detect_inner_root" "$detect_nested_inner"
+detect_nested_outer=$(_detect_type_root "$detect_outer" "$detect_mockbin")
+_assert_eq "detect: outer sl resolves when cwd leaves nested git" \
+  "sl|$detect_outer_phys" "$detect_nested_outer"
+export MOCK_SL_ROOT=""
+
+detect_git_outer=$(_new_repo)
+mkdir -p "$detect_git_outer/sub/.sl"
+detect_git_outer_phys=$(cd "$detect_git_outer" && pwd -P)
+detect_sl_inner_phys=$(cd "$detect_git_outer/sub" && pwd -P)
+export MOCK_SL_ROOT="$detect_sl_inner_phys"
+detect_sl_nested=$(_detect_type_root "$detect_git_outer/sub" "$detect_mockbin")
+_assert_eq "detect: sl nested in git picks nearest (sl)" \
+  "sl|$detect_sl_inner_phys" "$detect_sl_nested"
+detect_git_outer_hit=$(_detect_type_root "$detect_git_outer" "$detect_mockbin")
+_assert_eq "detect: outer git resolves when cwd leaves nested sl" \
+  "git|$detect_git_outer_phys" "$detect_git_outer_hit"
+export MOCK_SL_ROOT=""
+
+detect_sl_only=$(_tmpdir)
+mkdir -p "$detect_sl_only/.sl"
+detect_sl_only_phys=$(cd "$detect_sl_only" && pwd -P)
+export MOCK_SL_ROOT="$detect_sl_only_phys"
+detect_sl_only_hit=$(_detect_type_root "$detect_sl_only" "$detect_mockbin")
+_assert_eq "detect: sl-only dir resolves sl" \
+  "sl|$detect_sl_only_phys" "$detect_sl_only_hit"
+export MOCK_SL_ROOT=""
+
+detect_bare_parent=$(_tmpdir)
+git init -q --bare "$detect_bare_parent/bare.git"
+mkdir -p "$detect_bare_parent/work/.sl"
+detect_bare_work_phys=$(cd "$detect_bare_parent/work" && pwd -P)
+detect_bare_expected=$(cd "$detect_bare_work_phys" && GIT_DIR="$detect_bare_parent/bare.git" GIT_WORK_TREE="$detect_bare_work_phys" git rev-parse --show-toplevel)
+export MOCK_SL_ROOT="$detect_bare_work_phys"
+detect_bare_hit=$(_detect_type_root "$detect_bare_work_phys" "$detect_mockbin" \
+  "GIT_DIR=$detect_bare_parent/bare.git" "GIT_WORK_TREE=$detect_bare_work_phys")
+_assert_eq "detect: explicit git env wins over ambient sl" \
+  "git|$detect_bare_expected" "$detect_bare_hit"
+export MOCK_SL_ROOT=""
+
+export MOCK_SL_ROOT="$detect_sl_only_phys"
+detect_preset_git_miss=$(_detect_type_root "$detect_sl_only" "$detect_mockbin" "_REPO_TYPE=git")
+_assert_eq "detect: git preset in sl-only dir resolves empty" \
+  "|" "$detect_preset_git_miss"
+export MOCK_SL_ROOT=""
+detect_preset_sl_miss=$(_detect_type_root "$detect_repo" "$detect_mockbin" "_REPO_TYPE=sl")
+_assert_eq "detect: sl preset with failing sl probe resolves empty" \
+  "|" "$detect_preset_sl_miss"
+detect_nometa_parent=$(_tmpdir)
+mkdir -p "$detect_nometa_parent/claimed/sub"
+detect_nometa_phys=$(cd "$detect_nometa_parent/claimed" && pwd -P)
+export MOCK_SL_ROOT="$detect_nometa_phys"
+detect_preset_sl_hit=$(_detect_type_root "$detect_nometa_parent/claimed/sub" "$detect_mockbin" "_REPO_TYPE=sl")
+_assert_eq "detect: sl preset trusts probe root without metadata check" \
+  "sl|$detect_nometa_phys" "$detect_preset_sl_hit"
+export MOCK_SL_ROOT=""
+
+detect_wt_parent=$(_tmpdir)
+detect_wt_seed=$(_new_repo)
+echo seed >"$detect_wt_seed/file.txt"
+(cd "$detect_wt_seed" && git add file.txt && git commit -qm "seed worktree base")
+(cd "$detect_wt_seed" && git worktree add "$detect_wt_parent/wt" -b wt-branch >/dev/null 2>&1)
+if [[ -f "$detect_wt_parent/wt/.git" && ! -d "$detect_wt_parent/wt/.git" ]]; then
+  _pass "detect: worktree fixture uses a .git file"
+else
+  _fail "detect: worktree fixture uses a .git file"
+fi
+detect_wt_root=$(cd "$detect_wt_parent/wt" && git rev-parse --show-toplevel)
+mkdir -p "$detect_wt_parent/wt/nested"
+_assert_eq "detect: linked worktree (.git file) resolves git" \
+  "git|$detect_wt_root" "$(_detect_type_root "$detect_wt_parent/wt/nested" "$detect_mockbin")"
+
+detect_corrupt=$(_tmpdir)
+mkdir -p "$detect_corrupt/.git"
+_assert_eq "detect: empty .git dir resolves empty" \
+  "|" "$(_detect_type_root "$detect_corrupt" "$detect_mockbin")"
+detect_gitfile=$(_tmpdir)
+printf 'not-a-gitlink\n' >"$detect_gitfile/.git"
+_assert_eq "detect: garbage .git file resolves empty" \
+  "|" "$(_detect_type_root "$detect_gitfile" "$detect_mockbin")"
+
+detect_hint_mock=$(_mock_bin)
+detect_hint_calls=$(_tmpdir)/hint-calls.log
+: >"$detect_hint_calls"
+export DETECT_HINT_CALLS="$detect_hint_calls"
+cat >"$detect_hint_mock/git" <<'MOCK'
+#!/usr/bin/env bash
+printf 'git %s\n' "$*" >>"$DETECT_HINT_CALLS"
+exit 1
+MOCK
+cat >"$detect_hint_mock/sl" <<'MOCK'
+#!/usr/bin/env bash
+printf 'sl %s\n' "$*" >>"$DETECT_HINT_CALLS"
+exit 1
+MOCK
+chmod +x "$detect_hint_mock/git" "$detect_hint_mock/sl"
+detect_hint_cwd=$(cd "$detect_repo" && pwd -P)
+detect_hint_hit=$(_detect_type_root "$detect_repo" "$detect_hint_mock" \
+  "_SLEY_LAUNCH_REPO_TYPE=git" "_SLEY_LAUNCH_REPO_ROOT=$detect_git_root" "_SLEY_LAUNCH_REPO_CWD=$detect_hint_cwd")
+_assert_eq "detect: launcher hint resolves without probing" \
+  "git|$detect_git_root" "$detect_hint_hit"
+_assert_eq "detect: launcher hint spawns no VCS probes" \
+  "" "$(cat "$detect_hint_calls")"
+unset DETECT_HINT_CALLS
+
+# A hint recorded for another cwd is rejected and detection re-probes.
+detect_hint_moved=$(_detect_type_root "$detect_repo" "$detect_mockbin" \
+  "_SLEY_LAUNCH_REPO_TYPE=git" "_SLEY_LAUNCH_REPO_ROOT=$detect_git_root" "_SLEY_LAUNCH_REPO_CWD=/elsewhere")
+_assert_eq "detect: moved cwd rejects hint and re-probes" \
+  "git|$detect_git_root" "$detect_hint_moved"
+
+detect_ceiling_hit=$(_detect_type_root "$detect_repo/a/b" "$detect_mockbin" \
+  "GIT_CEILING_DIRECTORIES=$detect_repo/a")
+_assert_eq "detect: git ceiling above .git resolves empty" \
+  "|" "$detect_ceiling_hit"
+
+detect_slfile_repo=$(_new_repo)
+: >"$detect_slfile_repo/.sl"
+detect_slfile_phys=$(cd "$detect_slfile_repo" && pwd -P)
+export MOCK_SL_ROOT="$detect_slfile_phys"
+detect_slfile_hit=$(_detect_type_root "$detect_slfile_repo" "$detect_mockbin")
+export MOCK_SL_ROOT=""
+detect_slfile_root=$(cd "$detect_slfile_repo" && git rev-parse --show-toplevel)
+_assert_eq "detect: stray .sl file does not steal git detection" \
+  "git|$detect_slfile_root" "$detect_slfile_hit"
+
+unset MOCK_SL_ROOT
+detect_mockbin=""
+detect_hint_mock=""
+
+echo "=== sley: verify/ready load on demand; hook file path needs neither ==="
+
+# With `SLEY_LAZY_MODULES=1` (as the CLI sets), the `verify`/`ready`
+# libraries load when their public wrappers run — never as a side effect of
+# sourcing `sley.sh` for hook work. These pin the consumer-visible lazy
+# contract: sourced hook flows work, and sourced verify/ready flows load
+# transparently (including repeated calls). Without the flag, sourcing is
+# eager (the white-box suites pin that by driving privates directly).
+lazy_repo=$(_new_repo)
+printf 'x = 1\n' >"$lazy_repo/hook.py"
+(cd "$lazy_repo" && git add hook.py && git commit -qm "seed lazy loading fixture")
+printf 'y = 2\n' >>"$lazy_repo/hook.py"
+(cd "$lazy_repo" && git add hook.py)
+lazy_bin=$(_mock_bin)
+lazy_log="$lazy_repo/lazy.log"
+cat >"$lazy_bin/autoformat" <<'MOCK'
+#!/usr/bin/env bash
+printf 'cwd=%s args=%s\n' "$PWD" "$*" >>"$MOCK_LOG"
+MOCK
+chmod +x "$lazy_bin/autoformat"
+# Discovery needs a `checkrun` binary; without this mock the test passes
+# only where a real checkrun happens to be installed (devservers) and
+# fails in CI with "no local verification commands detected".
+_mock_checkrun_verify "$lazy_bin"
+export MOCK_LOG="$lazy_log"
+lazy_sourced_out=$(
+  cd "$lazy_repo" &&
+    HOME="$lazy_repo" PATH="$lazy_bin:$PATH" SLEY_LAZY_MODULES=1 bash -c '
+      source "$SLEY_REPO_ROOT/lib/sley/sley.sh"
+      sley_hook_init
+      sley_hook_format_file hook.py
+    ' 2>&1
+)
+lazy_sourced_rc=$?
+_assert_exit "lazy: sourced hook format-file succeeds" 0 "$lazy_sourced_rc"
+_assert_eq "lazy: sourced hook format-file delegates" \
+  "cwd=$lazy_repo args=-- hook.py" "$(cat "$lazy_log")"
+_assert_eq "lazy: sourced hook flow is quiet" "" "$lazy_sourced_out"
+
+lazy_verify_out=$(
+  cd "$lazy_repo" &&
+    HOME="$lazy_repo" PATH="$lazy_bin:$PATH" SLEY_LAZY_MODULES=1 bash -c '
+      source "$SLEY_REPO_ROOT/lib/sley/sley.sh"
+      sley_verify
+      sley_verify --json
+    ' 2>&1
+)
+lazy_verify_rc=$?
+_assert_exit "lazy: sourced sley_verify runs repeatedly" 0 "$lazy_verify_rc"
+_assert_contains "lazy: sourced sley_verify discovers commands" \
+  "checkrun verify" "$lazy_verify_out"
+
+lazy_ready_out=$(
+  cd "$lazy_repo" &&
+    HOME="$lazy_repo" PATH="$lazy_bin:$PATH" SLEY_LAZY_MODULES=1 bash -c '
+      source "$SLEY_REPO_ROOT/lib/sley/sley.sh"
+      sley_ready --help
+    ' 2>&1
+)
+lazy_ready_rc=$?
+_assert_exit "lazy: sourced sley_ready --help succeeds" 0 "$lazy_ready_rc"
+_assert_contains "lazy: sourced sley_ready prints usage" \
+  "Usage:" "$lazy_ready_out"
+unset MOCK_LOG
+
+# `hook format-file` on an absolute git path from outside the repo keeps
+# working when the launcher skips its own probe: hook-init detects from the
+# buffer directory instead. (Bare-worktree fallback preservation is pinned
+# by the existing bare hook test above; the bare env must keep forcing the
+# legacy launcher path.)
+lazy_outside=$(_tmpdir)
+lazy_outside_log="$lazy_repo/outside.log"
+export MOCK_LOG="$lazy_outside_log"
+lazy_outside_out=$(
+  cd "$lazy_outside" &&
+    HOME="$lazy_repo" PATH="$lazy_bin:$PATH" "$SLEY" hook format-file "$lazy_repo/hook.py" 2>&1
+)
+lazy_outside_rc=$?
+_assert_exit "lazy: hook format-file from outside succeeds" 0 "$lazy_outside_rc"
+_assert_eq "lazy: hook format-file from outside uses buffer dir" \
+  "cwd=$lazy_repo args=-- $lazy_repo/hook.py" "$(cat "$lazy_outside_log")"
+_assert_eq "lazy: hook format-file from outside is quiet" "" "$lazy_outside_out"
+unset MOCK_LOG
+
+echo "=== sley: non-cached verify commands inherit the gate environment ==="
+
+# Characterization ahead of the login-shell default flip: with a mock HOME
+# (no startup files) a non-cached required command must observe the exact
+# inherited environment — exit codes, stdout, env vars, and PATH resolution
+# — identically before and after the change.
+shell_env_home=$(_tmpdir)
+mkdir -p "$shell_env_home/.local/bin"
+_copy_sley_libs "$shell_env_home"
+shell_env_repo=$(_new_repo)
+mkdir -p "$shell_env_repo/src" "$shell_env_repo/tests" "$shell_env_repo/.sley"
+printf 'initial\n' >"$shell_env_repo/src/app.txt"
+cat >"$shell_env_repo/.sley/verify.json" <<'EOF'
+{"rules": [{"paths": ["src/**"], "commands": ["./tests/dump.sh"]}, {"paths": ["src/other.txt"], "commands": ["./tests/exit3.sh"]}]}
+EOF
+cat >"$shell_env_repo/tests/dump.sh" <<'EOF'
+#!/usr/bin/env bash
+printf 'marker=%s\n' "${SLEY_PROBE_MARKER:-<unset>}"
+printf 'tool=%s\n' "$(command -v sley-probe-tool)"
+EOF
+cat >"$shell_env_repo/tests/exit3.sh" <<'EOF'
+#!/usr/bin/env bash
+echo hello-stdout
+exit 3
+EOF
+chmod +x "$shell_env_repo/tests/dump.sh" "$shell_env_repo/tests/exit3.sh"
+(cd "$shell_env_repo" && git add . && git commit -qm "seed shell env verify")
+printf 'changed\n' >>"$shell_env_repo/src/app.txt"
+shell_env_bin=$(_mock_bin)
+printf '#!/usr/bin/env bash\nexit 0\n' >"$shell_env_bin/sley-probe-tool"
+chmod +x "$shell_env_bin/sley-probe-tool"
+
+HOME="$shell_env_home" SLEY_PROBE_MARKER=hello PATH="$shell_env_bin:$PATH" \
+  _run_sley "$shell_env_repo" verify --run-required
+_assert_exit "shell env: non-cached command exits 0" 0 "$__SLEY_RC"
+_assert_contains "shell env: child inherits exported vars" \
+  "marker=hello" "$__SLEY_OUT"
+_assert_contains "shell env: child resolves inherited PATH" \
+  "tool=$shell_env_bin/sley-probe-tool" "$__SLEY_OUT"
+
+HOME="$shell_env_home" PATH="$shell_env_bin:$PATH" \
+  _run_sley "$shell_env_repo" verify --run-required --json
+_assert_exit "shell env: json run exits 0" 0 "$__SLEY_RC"
+_assert_contains "shell env: json reports passed with exit code" \
+  '"status":"passed","exit_code":0' "$__SLEY_OUT"
+
+printf 'other\n' >"$shell_env_repo/src/other.txt"
+(cd "$shell_env_repo" && git add src/other.txt && git commit -qm "seed exit3 fixture")
+printf 'changed\n' >>"$shell_env_repo/src/other.txt"
+HOME="$shell_env_home" PATH="$shell_env_bin:$PATH" \
+  _run_sley "$shell_env_repo" verify --run-required
+_assert_exit "shell env: failing command blocks" 1 "$__SLEY_RC"
+_assert_contains "shell env: stdout passes through" \
+  "hello-stdout" "$__SLEY_OUT"
+_assert_contains "shell env: exit code recorded" \
+  "exit code: 3" "$__SLEY_OUT"
+
+echo "=== sley: non-cached verify shell default with login opt-in ==="
+
+# Non-cached required commands run under `bash -c` with the inherited
+# environment; `"shell": "login"` opts a command back into startup files.
+# The mock HOME below marks login shells via `.bash_profile`.
+shell_login_home=$(_tmpdir)
+mkdir -p "$shell_login_home/.local/bin"
+_copy_sley_libs "$shell_login_home"
+cat >"$shell_login_home/.bash_profile" <<'EOF'
+export SLEY_LOGIN_MARKER=from-login-profile
+EOF
+shell_login_repo=$(_new_repo)
+mkdir -p "$shell_login_repo/src" "$shell_login_repo/tests" "$shell_login_repo/.sley"
+printf 'initial\n' >"$shell_login_repo/src/app.txt"
+cat >"$shell_login_repo/tests/shell-mode.sh" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "${SLEY_LOGIN_MARKER:-default-shell}" > tests/shell-mode
+EOF
+chmod +x "$shell_login_repo/tests/shell-mode.sh"
+cat >"$shell_login_repo/.sley/verify.json" <<'EOF'
+{"rules": [{"paths": ["src/**"], "commands": [{"cmd": "./tests/shell-mode.sh", "required": true}]}]}
+EOF
+(cd "$shell_login_repo" && git add . && git commit -qm "seed non-cached shell default")
+printf 'changed\n' >>"$shell_login_repo/src/app.txt"
+
+HOME="$shell_login_home" _run_sley "$shell_login_repo" verify --run-required
+_assert_exit "shell default: plain command exits 0" 0 "$__SLEY_RC"
+_assert_eq "shell default: plain command skips login startup" \
+  "default-shell" "$(cat "$shell_login_repo/tests/shell-mode")"
+
+cat >"$shell_login_repo/.sley/verify.json" <<'EOF'
+{"rules": [{"paths": ["src/**"], "commands": [{"cmd": "./tests/shell-mode.sh", "required": true, "shell": "login"}]}]}
+EOF
+(cd "$shell_login_repo" && git add .sley/verify.json && git commit -qm "opt into login shell")
+rm -f "$shell_login_repo/tests/shell-mode"
+printf 'changed again\n' >>"$shell_login_repo/src/app.txt"
+
+HOME="$shell_login_home" _run_sley "$shell_login_repo" verify --run-required
+_assert_exit "shell default: login opt-in exits 0" 0 "$__SLEY_RC"
+_assert_eq "shell default: login opt-in sources startup files" \
+  "from-login-profile" "$(cat "$shell_login_repo/tests/shell-mode")"
+
+cat >"$shell_login_repo/.sley/verify.json" <<'EOF'
+{"rules": [{"paths": ["src/**"], "commands": [{"cmd": "./tests/shell-mode.sh", "required": true, "shell": "fish"}]}]}
+EOF
+(cd "$shell_login_repo" && git add .sley/verify.json && git commit -qm "seed invalid shell")
+printf 'changed once more\n' >>"$shell_login_repo/src/app.txt"
+
+HOME="$shell_login_home" _run_sley "$shell_login_repo" verify --run-required
+_assert_exit "shell default: invalid shell value blocks" 1 "$__SLEY_RC"
+_assert_contains "shell default: invalid shell reports source" \
+  "invalid verify registry" "$__SLEY_OUT"
+
+# Same command text with different shells must not merge into one grouped
+# execution: the shell is part of the grouping identity.
+shell_group_repo=$(_new_repo)
+mkdir -p "$shell_group_repo/src" "$shell_group_repo/tests" "$shell_group_repo/.sley"
+printf 'initial\n' >"$shell_group_repo/src/app.txt"
+cat >"$shell_group_repo/tests/count.sh" <<'EOF'
+#!/usr/bin/env bash
+count=0
+[[ -f tests/count ]] && count=$(cat tests/count)
+printf '%s\n' "$((count + 1))" > tests/count
+EOF
+chmod +x "$shell_group_repo/tests/count.sh"
+cat >"$shell_group_repo/.sley/verify.json" <<'EOF'
+{"rules": [
+  {"paths": ["src/**"], "commands": [{"cmd": "./tests/count.sh", "required": true}]},
+  {"paths": ["src/**"], "commands": [{"cmd": "./tests/count.sh", "required": true, "shell": "login"}]}
+]}
+EOF
+(cd "$shell_group_repo" && git add . && git commit -qm "seed shell grouping")
+printf 'changed\n' >>"$shell_group_repo/src/app.txt"
+
+HOME="$shell_login_home" _run_sley "$shell_group_repo" verify --run-required
+_assert_exit "shell default: differing shells both run" 0 "$__SLEY_RC"
+_assert_eq "shell default: differing shells do not merge" \
+  "2" "$(cat "$shell_group_repo/tests/count")"
+
+HOME="$shell_login_home" _run_sley "$shell_group_repo" verify --json
+_assert_contains "shell default: discovery carries shell through" \
+  '"shell":"login"' "$__SLEY_OUT"
+
+echo "=== sley: verify cache receipt validation edges ==="
+
+# A receipt that is a symlink must miss exactly like a corrupt receipt:
+# the post-lock fast path reimplements this validation in shell, so both
+# shapes are pinned before the change.
+cache_edge_repo=$(_new_repo)
+mkdir -p "$cache_edge_repo/src" "$cache_edge_repo/tests" "$cache_edge_repo/.sley"
+printf 'initial\n' >"$cache_edge_repo/src/app.txt"
+cat >"$cache_edge_repo/tests/run.sh" <<'EOF'
+#!/usr/bin/env bash
+count=0
+[[ -f tests/count ]] && count=$(cat tests/count)
+printf '%s\n' "$((count + 1))" > tests/count
+EOF
+chmod +x "$cache_edge_repo/tests/run.sh"
+cat >"$cache_edge_repo/.sley/verify.json" <<'EOF'
+{"rules": [{"paths": ["src/**"], "commands": [{"cmd": "./tests/run.sh", "required": true, "cache": {"enabled": true, "salt": "symlink-receipt-test"}}]}]}
+EOF
+(cd "$cache_edge_repo" && git add . && git commit -qm "seed symlink receipt verify")
+printf 'changed\n' >>"$cache_edge_repo/src/app.txt"
+
+_run_sley "$cache_edge_repo" verify --run-required --json --explain-cache
+_assert_exit "cache edge: symlink setup run exits 0" 0 "$__SLEY_RC"
+_assert_contains "cache edge: symlink setup passes" '"status":"passed"' "$__SLEY_OUT"
+cache_edge_receipt=$(printf '%s\n' "$__SLEY_OUT" | sed -n 's/^sley verify: cache receipt: //p' | head -1)
+if [[ -f "$cache_edge_receipt" && ! -L "$cache_edge_receipt" ]]; then
+  _pass "cache edge: setup wrote a regular receipt file"
+else
+  _fail "cache edge: setup wrote a regular receipt file (got '$cache_edge_receipt')"
+fi
+mv "$cache_edge_receipt" "$cache_edge_receipt.real"
+ln -s "$cache_edge_receipt.real" "$cache_edge_receipt"
+
+_run_sley "$cache_edge_repo" verify --run-required --json
+_assert_exit "cache edge: symlinked receipt exits 0" 0 "$__SLEY_RC"
+_assert_contains "cache edge: symlinked receipt reruns command" '"status":"passed"' "$__SLEY_OUT"
+_assert_not_contains "cache edge: symlinked receipt is not a hit" '"status":"cached-pass"' "$__SLEY_OUT"
+_assert_eq "cache edge: symlinked receipt increments count" "2" "$(cat "$cache_edge_repo/tests/count")"
+rm -f "$cache_edge_receipt" "$cache_edge_receipt.real"
+
+echo "=== sley: verify cache machine identity without hardlinks ==="
+
+# Android's Python lacks os.link and Android has no /etc/machine-id, so
+# machine-id generation must not depend on hardlinks (Termux CI crashed
+# the first cache lookup with "module 'os' has no attribute 'link'").
+# Simulate both conditions and pin a stable, non-empty identity.
+cache_machine_out=$(
+  SLEY_HELPER="$SLEY_REPO_ROOT/lib/sley/verify-cache.py" \
+    CACHE_MACHINE_DIR="$(_tmpdir)" \
+    python3 - <<'PY'
+import importlib.util
+import os
+import sys
+
+spec = importlib.util.spec_from_file_location("sley_verify_cache", os.environ["SLEY_HELPER"])
+module = importlib.util.module_from_spec(spec)
+sys.modules["sley_verify_cache"] = module
+spec.loader.exec_module(module)
+
+# Simulate Android: os.link missing entirely.
+del os.link
+# Simulate Android: no /etc/machine-id.
+real_is_file = module.Path.is_file
+module.Path.is_file = lambda self: False if str(self) == "/etc/machine-id" else real_is_file(self)
+
+first = module.machine_id(module.Path(os.environ["CACHE_MACHINE_DIR"]))
+second = module.machine_id(module.Path(os.environ["CACHE_MACHINE_DIR"]))
+print("first=%s" % first)
+print("second=%s" % second)
+PY
+)
+cache_machine_rc=$?
+_assert_exit "cache edge: machine identity works without os.link" 0 "$cache_machine_rc"
+cache_machine_first=$(printf '%s\n' "$cache_machine_out" | sed -n 's/^first=//p')
+cache_machine_second=$(printf '%s\n' "$cache_machine_out" | sed -n 's/^second=//p')
+_assert_contains "cache edge: machine identity is non-empty without os.link" \
+  "sha256:" "$cache_machine_first"
+_assert_eq "cache edge: machine identity is stable without os.link" \
+  "$cache_machine_first" "$cache_machine_second"
+
+echo "=== sley: verify cache post-lock hit ==="
+
+# A receipt that lands while this run waits on the cache lock must satisfy
+# the run without re-executing the command. The holder releases only after
+# the run's own `--explain-cache` output proves the pre-lock lookup missed,
+# so no fixed sleeps gate the injection.
+cache_race_repo=$(_new_repo)
+mkdir -p "$cache_race_repo/src" "$cache_race_repo/tests" "$cache_race_repo/.sley"
+printf 'initial\n' >"$cache_race_repo/src/app.txt"
+cat >"$cache_race_repo/tests/run.sh" <<'EOF'
+#!/usr/bin/env bash
+count=0
+[[ -f tests/count ]] && count=$(cat tests/count)
+printf '%s\n' "$((count + 1))" > tests/count
+EOF
+chmod +x "$cache_race_repo/tests/run.sh"
+cat >"$cache_race_repo/.sley/verify.json" <<'EOF'
+{"rules": [{"paths": ["src/**"], "commands": [{"cmd": "./tests/run.sh", "required": true, "cache": {"enabled": true, "salt": "post-lock-hit-test"}}]}]}
+EOF
+(cd "$cache_race_repo" && git add . && git commit -qm "seed post-lock verify")
+printf 'changed\n' >>"$cache_race_repo/src/app.txt"
+
+_run_sley "$cache_race_repo" verify --run-required --json --explain-cache
+_assert_exit "cache race: setup run exits 0" 0 "$__SLEY_RC"
+cache_race_receipt=$(printf '%s\n' "$__SLEY_OUT" | sed -n 's/^sley verify: cache receipt: //p' | head -1)
+cache_race_saved=$(_tmpdir)/saved-receipt.json
+cp "$cache_race_receipt" "$cache_race_saved"
+rm -f "$cache_race_receipt"
+cache_race_lock_root="$(dirname "$(dirname "$cache_race_receipt")")/locks"
+cache_race_lock_dir="$cache_race_lock_root/$(basename "$cache_race_receipt").lock"
+mkdir -p "$cache_race_lock_root"
+mkdir "$cache_race_lock_dir"
+cache_race_fifo=$(_tmpdir)/release-fifo
+mkfifo "$cache_race_fifo"
+# Holder: keep the lock until the main flow signals release, then remove it.
+(
+  read -r _ <"$cache_race_fifo"
+  rmdir "$cache_race_lock_dir"
+) &
+cache_race_holder=$!
+cache_race_out=$(_tmpdir)/race-out.txt
+: >"$cache_race_out"
+(cd "$cache_race_repo" &&
+  XDG_CONFIG_HOME="$(_sley_test_xdg_config_home)" \
+  XDG_CACHE_HOME="$SLEY_TEST_XDG_CACHE_HOME" \
+  GIT_CONFIG_GLOBAL="$cache_race_repo/.gitconfig-test" \
+    "$SLEY" verify --run-required --explain-cache >"$cache_race_out" 2>&1) &
+cache_race_pid=$!
+cache_race_seen=0
+for ((cache_race_i = 0; cache_race_i < 300; cache_race_i++)); do
+  if grep -q "cache decision: miss" "$cache_race_out" 2>/dev/null; then
+    cache_race_seen=1
+    break
+  fi
+  # Fail fast instead of idling the full budget when the waiter is gone.
+  kill -0 "$cache_race_pid" 2>/dev/null || break
+  sleep 0.1
+done
+if [[ "$cache_race_seen" == "1" ]]; then
+  _pass "cache race: waiter reached the lock on a pre-lock miss"
+else
+  _fail "cache race: waiter reached the lock on a pre-lock miss (output: $(cat "$cache_race_out"))"
+fi
+# Another agent's receipt lands mid-wait; then release the lock.
+cp "$cache_race_saved" "$cache_race_receipt"
+printf 'go\n' >"$cache_race_fifo"
+wait "$cache_race_holder"
+wait "$cache_race_pid"
+cache_race_rc=$?
+_assert_exit "cache race: waiter exits 0" 0 "$cache_race_rc"
+_assert_contains "cache race: waiter reports cached pass" \
+  "cached pass" "$(cat "$cache_race_out")"
+_assert_eq "cache race: waiter does not rerun command" \
+  "1" "$(cat "$cache_race_repo/tests/count")"
+rm -rf "$cache_race_lock_dir" 2>/dev/null || true
+
 _test_summary

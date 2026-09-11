@@ -43,6 +43,34 @@ _repo_has_explicit_git_env() {
   [[ -n "${GIT_DIR:-}" || -n "${GIT_WORK_TREE:-}" ]]
 }
 
+# _repo_scan_upward_metadata <physical-dir>
+#   Pure-bash upward scan for VCS metadata, setting _REPO_SCAN_SEEN_GIT /
+#   _REPO_SCAN_SEEN_SL (1/0). This only ever SKIPS probes that cannot
+#   succeed; a sighting never asserts a repository — the surviving VCS
+#   probe still runs and owns the verdict, so ceilings, corrupt metadata,
+#   and missing binaries keep their exact legacy behavior. Early-outs once
+#   both markers are seen. Cost is ~3 stats per ancestor level (no forks).
+_repo_scan_upward_metadata() {
+  local dir="$1"
+  _REPO_SCAN_SEEN_GIT=0
+  _REPO_SCAN_SEEN_SL=0
+  [[ -n "$dir" ]] || return 1
+  while true; do
+    if [[ -e "$dir/.git" ]]; then
+      _REPO_SCAN_SEEN_GIT=1
+    fi
+    if [[ -e "$dir/.sl" || -e "$dir/.hg" ]]; then
+      _REPO_SCAN_SEEN_SL=1
+    fi
+    if [[ "$_REPO_SCAN_SEEN_GIT" == "1" && "$_REPO_SCAN_SEEN_SL" == "1" ]]; then
+      return 0
+    fi
+    [[ "$dir" == "/" ]] && return 0
+    dir="${dir%/*}"
+    [[ -z "$dir" ]] && dir="/"
+  done
+}
+
 _repo_consume_launcher_detection() {
   local hinted_type="${_SLEY_LAUNCH_REPO_TYPE:-}"
   local hinted_root="${_SLEY_LAUNCH_REPO_ROOT:-}"
@@ -108,6 +136,51 @@ _repo_detect() {
       return 0
       ;;
   esac
+
+  # Fast path: a pure-bash upward scan proves which VCS probes can succeed
+  # before spawning either tool. Explicit Git context disables the scan —
+  # GIT_DIR can select a repo with no discoverable on-disk metadata. Every
+  # fast branch still runs the real probe for the surviving VCS; only the
+  # provably impossible probe is skipped:
+  # - no metadata at all: both probes would fail (each success implies
+  #   discoverable metadata without explicit context).
+  # - git only: sl cannot pass `_repo_has_real_sl_metadata` (its root is
+  #   always an ancestor of the cwd, and no .sl/.hg exists above it).
+  # - sl only: git cannot succeed without .git above the cwd and no
+  #   explicit context.
+  # Both markers (nested/dual-managed checkouts) and an unresolvable cwd
+  # fall through to the legacy dual probe below.
+  if ! _repo_has_explicit_git_env; then
+    local scan_dir=""
+    scan_dir=$(pwd -P 2>/dev/null || true)
+    if [[ -n "$scan_dir" ]] && _repo_scan_upward_metadata "$scan_dir"; then
+      if [[ "$_REPO_SCAN_SEEN_GIT" == "0" && "$_REPO_SCAN_SEEN_SL" == "0" ]]; then
+        _REPO_TYPE=""
+        _REPO_ROOT=""
+        return 0
+      elif [[ "$_REPO_SCAN_SEEN_GIT" == "1" && "$_REPO_SCAN_SEEN_SL" == "0" ]]; then
+        _REPO_ROOT=$(_repo_git_root || true)
+        if [[ -n "$_REPO_ROOT" ]]; then
+          _REPO_TYPE="git"
+        else
+          _REPO_TYPE=""
+          _REPO_ROOT=""
+        fi
+        return 0
+      elif [[ "$_REPO_SCAN_SEEN_GIT" == "0" && "$_REPO_SCAN_SEEN_SL" == "1" ]]; then
+        local sl_only_root=""
+        sl_only_root=$(_repo_sl_root || true)
+        if [[ -n "$sl_only_root" ]] && _repo_has_real_sl_metadata "$sl_only_root"; then
+          _REPO_TYPE="sl"
+          _REPO_ROOT="$sl_only_root"
+        else
+          _REPO_TYPE=""
+          _REPO_ROOT=""
+        fi
+        return 0
+      fi
+    fi
+  fi
 
   local git_root
   git_root=$(_repo_git_root || true)

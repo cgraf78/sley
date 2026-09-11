@@ -772,8 +772,11 @@ PATH="$probe_bin:$PATH" _run_perf_sley_timed 5 "$outside_repo" \
 _assert_exit "hook format-file perf: absolute target exits 0" 0 "$__SLEY_RC"
 _assert_file_content "hook format-file perf: discovers target Git repo once" \
   "1" "$SLEY_PERF_GIT_PROBE_COUNT_FILE"
-_assert_file_content "hook format-file perf: checks Sapling precedence once" \
-  "1" "$SLEY_PERF_SL_PROBE_COUNT_FILE"
+# Git-only checkout: the upward metadata scan rules Sapling out without a
+# subprocess (dual/nested precedence still probes both — see the `detect:`
+# characterization block). This used to assert 1; the scan makes it 0.
+_assert_file_content "hook format-file perf: skips Sapling probe when no .sl/.hg above" \
+  "0" "$SLEY_PERF_SL_PROBE_COUNT_FILE"
 _assert_autoformat_invocations "hook format-file perf: absolute target delegation" \
   1 "$autoformat_state/expected-args"
 
@@ -826,8 +829,10 @@ PATH="$probe_bin:$PATH" _run_perf_sley_timed 5 "$outside_repo" \
 _assert_exit "hook lint-file perf: absolute target exits 0" 0 "$__SLEY_RC"
 _assert_file_content "hook lint-file perf: discovers target Git repo once" \
   "1" "$SLEY_PERF_GIT_PROBE_COUNT_FILE"
-_assert_file_content "hook lint-file perf: checks Sapling precedence once" \
-  "1" "$SLEY_PERF_SL_PROBE_COUNT_FILE"
+# Git-only checkout: the upward metadata scan rules Sapling out without a
+# subprocess (see the format-file note above).
+_assert_file_content "hook lint-file perf: skips Sapling probe when no .sl/.hg above" \
+  "0" "$SLEY_PERF_SL_PROBE_COUNT_FILE"
 _assert_autolint_invocations "hook lint-file perf: absolute target delegation" \
   1 "$autolint_state/expected-args"
 
@@ -1149,5 +1154,429 @@ _assert_eq "ready --fix mixed perf: formatter invocation count" \
   "$(cat "$SLEY_PERF_AUTOFORMAT_COUNT_FILE")"
 _assert_contains "ready --fix mixed perf: partial worktree edit survives" \
   "unstaged work" "$(cat "$repo/staged/file-1.txt")"
+
+echo "=== sley perf: VCS discovery skips impossible probes ==="
+
+# The upward metadata scan must remove subprocesses, not just time: count
+# probe invocations with logging mocks. No wall-clock assertions here — these
+# hold under any load.
+_perf_detect_git_spawns_sl() {
+  local git_repo="$1" mockbin="$2" count_file="$3" out rc
+  export SLEY_PERF_SL_COUNT_FILE="$count_file"
+  printf '0\n' >"$count_file"
+  cat >"$mockbin/sl" <<'MOCK'
+#!/usr/bin/env bash
+count=$(cat "$SLEY_PERF_SL_COUNT_FILE")
+printf '%s\n' "$((count + 1))" >"$SLEY_PERF_SL_COUNT_FILE"
+exit 1
+MOCK
+  chmod +x "$mockbin/sl"
+  out=""
+  rc=0
+  out=$(cd "$git_repo" && PATH="$mockbin:$PATH" \
+    XDG_CONFIG_HOME="$git_repo/.xdg-config" XDG_CACHE_HOME="$git_repo/.xdg-cache" \
+    GIT_CONFIG_GLOBAL="$git_repo/.gitconfig-test" "$SLEY" status 2>&1) || rc=$?
+  printf '%s\n%s' "$rc" "$out"
+}
+
+detect_perf_repo=$(_new_perf_repo)
+(cd "$detect_perf_repo" && echo one >file.txt && git add file.txt && git commit -qm "seed detect perf")
+detect_perf_mock=$(_mock_bin)
+detect_perf_sl_count=$(_tmpdir)/sl-count.txt
+detect_perf_status=$(_perf_detect_git_spawns_sl "$detect_perf_repo" "$detect_perf_mock" "$detect_perf_sl_count")
+detect_perf_rc=$(printf '%s\n' "$detect_perf_status" | head -1)
+_assert_exit "detect perf: status in git-only repo exits 0" 0 "$detect_perf_rc"
+_assert_eq "detect perf: status in git-only repo never probes sl" \
+  "0" "$(cat "$detect_perf_sl_count")"
+unset SLEY_PERF_SL_COUNT_FILE
+
+detect_perf_empty=$(_tmpdir)
+detect_perf_nomock=$(_mock_bin)
+detect_perf_probes=$(_tmpdir)/norepo-probes.log
+: >"$detect_perf_probes"
+export SLEY_PERF_PROBE_LOG="$detect_perf_probes"
+cat >"$detect_perf_nomock/git" <<'MOCK'
+#!/usr/bin/env bash
+printf 'git %s\n' "$*" >>"$SLEY_PERF_PROBE_LOG"
+exit 1
+MOCK
+cat >"$detect_perf_nomock/sl" <<'MOCK'
+#!/usr/bin/env bash
+printf 'sl %s\n' "$*" >>"$SLEY_PERF_PROBE_LOG"
+exit 1
+MOCK
+chmod +x "$detect_perf_nomock/git" "$detect_perf_nomock/sl"
+detect_perf_norepo_out=""
+detect_perf_norepo_rc=0
+detect_perf_norepo_out=$(cd "$detect_perf_empty" && PATH="$detect_perf_nomock:$PATH" \
+  XDG_CONFIG_HOME="$detect_perf_empty/.xdg-config" XDG_CACHE_HOME="$detect_perf_empty/.xdg-cache" \
+  "$SLEY" status 2>&1) || detect_perf_norepo_rc=$?
+_assert_exit "detect perf: status outside repos exits 2" 2 "$detect_perf_norepo_rc"
+_assert_contains "detect perf: status outside repos reports unsupported repo" \
+  "unsupported repo" "$detect_perf_norepo_out"
+_assert_eq "detect perf: status outside repos spawns no VCS probes" \
+  "" "$(cat "$detect_perf_probes")"
+unset SLEY_PERF_PROBE_LOG
+
+# sl-only detection (direct probe: the CLI path needs full `sl status`
+# surface mocks, while the skip decision lives in `_repo_detect`).
+detect_perf_slroot=$(_tmpdir)
+mkdir -p "$detect_perf_slroot/.sl"
+detect_perf_slroot_phys=$(cd "$detect_perf_slroot" && pwd -P)
+detect_perf_slmock=$(_mock_bin)
+detect_perf_gitlog=$(_tmpdir)/slonly-git.log
+: >"$detect_perf_gitlog"
+export SLEY_PERF_GIT_LOG="$detect_perf_gitlog" SLEY_PERF_MOCKBIN="$detect_perf_slmock"
+export MOCK_SL_ROOT="$detect_perf_slroot_phys"
+cat >"$detect_perf_slmock/git" <<'MOCK'
+#!/usr/bin/env bash
+printf 'git %s\n' "$*" >>"$SLEY_PERF_GIT_LOG"
+# Strip this mock's own directory before delegating: PATH-resolving `git`
+# launchers re-scan PATH at their runtime and would otherwise re-pick this
+# mock as the "real" git and recurse.
+PATH=":$PATH:"
+PATH="${PATH//:$SLEY_PERF_MOCKBIN:/:}"
+PATH="${PATH#:}"
+PATH="${PATH%:}"
+export PATH
+exec git "$@"
+MOCK
+cat >"$detect_perf_slmock/sl" <<'MOCK'
+#!/usr/bin/env bash
+[[ "${1:-}" == "root" ]] || exit 1
+printf '%s\n' "$MOCK_SL_ROOT"
+MOCK
+chmod +x "$detect_perf_slmock/git" "$detect_perf_slmock/sl"
+detect_perf_slonly_hit=$(cd "$detect_perf_slroot" && PATH="$detect_perf_slmock:$PATH" \
+  SLEY_REPO_ROOT="$SLEY_REPO_ROOT" \
+  bash -c 'source "$SLEY_REPO_ROOT/lib/sley/repo.sh"; _repo_detect; printf "%s|%s" "$_REPO_TYPE" "$_REPO_ROOT"')
+_assert_eq "detect perf: sl-only probe still resolves sl" \
+  "sl|$detect_perf_slroot_phys" "$detect_perf_slonly_hit"
+if grep -q "show-toplevel" "$detect_perf_gitlog"; then
+  _fail "detect perf: sl-only probe never runs git rev-parse (saw: $(cat "$detect_perf_gitlog"))"
+else
+  _pass "detect perf: sl-only probe never runs git rev-parse"
+fi
+unset SLEY_PERF_GIT_LOG SLEY_PERF_MOCKBIN MOCK_SL_ROOT
+
+echo "=== sley perf: hook path avoids verify/ready parse and launcher probe ==="
+
+# Sourcing the library with `SLEY_LAZY_MODULES=1` (as the CLI does) must
+# not define verify/ready entry points; the wrappers load them on first
+# use (proven functionally by the lazy behavior block). Without the flag,
+# sourcing defines everything eagerly (pinned by white-box suites).
+# No wall-clock assertions — definition presence is the signal.
+lazy_perf_defined=$(
+  SLEY_REPO_ROOT="$SLEY_REPO_ROOT" SLEY_LAZY_MODULES=1 bash -c '
+    source "$SLEY_REPO_ROOT/lib/sley/sley.sh" || exit 3
+    echo "verify=$(declare -F _sley_verify)"
+    echo "ready=$(declare -F _sley_ready)"
+    echo "hook=$(declare -F _sley_hook_format_file)"
+  '
+)
+lazy_perf_eager=$(
+  unset SLEY_LAZY_MODULES
+  SLEY_REPO_ROOT="$SLEY_REPO_ROOT" bash -c '
+    source "$SLEY_REPO_ROOT/lib/sley/sley.sh" || exit 3
+    echo "verify=$(declare -F _sley_verify)"
+    echo "ready=$(declare -F _sley_ready)"
+  '
+)
+_assert_eq "lazy perf: sourcing leaves _sley_verify undefined" \
+  "verify=" "$(printf '%s\n' "$lazy_perf_defined" | sed -n '1p')"
+_assert_not_contains "lazy perf: sourcing defines no _sley_verify body" \
+  "_sley_verify" "$lazy_perf_defined"
+_assert_eq "lazy perf: sourcing leaves _sley_ready undefined" \
+  "ready=" "$(printf '%s\n' "$lazy_perf_defined" | sed -n '2p')"
+_assert_not_contains "lazy perf: sourcing defines no _sley_ready body" \
+  "_sley_ready" "$lazy_perf_defined"
+_assert_contains "lazy perf: sourcing still defines hook entry points" \
+  "_sley_hook_format_file" "$lazy_perf_defined"
+_assert_contains "lazy perf: eager sourcing defines verify" \
+  "_sley_verify" "$lazy_perf_eager"
+_assert_contains "lazy perf: eager sourcing defines ready" \
+  "_sley_ready" "$lazy_perf_eager"
+
+# With a caller `_REPO_TYPE` override the launcher hint is never consumed,
+# so the legacy path probes twice (launcher + hook-init). The skip must cut
+# that to one probe; with bare env configured the legacy double probe stays.
+_perf_hook_probe_counts() {
+  local repo="$1" file="$2" outside="$3" mockbin="$4" gitlog="$5" slcount="$6"
+  shift 6
+  export SLEY_PERF_HOOK_GIT_LOG="$gitlog" SLEY_PERF_HOOK_MOCKBIN="$mockbin"
+  export SLEY_PERF_HOOK_SL_COUNT="$slcount"
+  printf '0\n' >"$slcount"
+  : >"$gitlog"
+  cat >"$mockbin/git" <<'MOCK'
+#!/usr/bin/env bash
+printf 'git %s\n' "$*" >>"$SLEY_PERF_HOOK_GIT_LOG"
+PATH=":$PATH:"
+PATH="${PATH//:$SLEY_PERF_HOOK_MOCKBIN:/:}"
+PATH="${PATH#:}"
+PATH="${PATH%:}"
+export PATH
+exec git "$@"
+MOCK
+  cat >"$mockbin/sl" <<'MOCK'
+#!/usr/bin/env bash
+count=$(cat "$SLEY_PERF_HOOK_SL_COUNT")
+printf '%s\n' "$((count + 1))" >"$SLEY_PERF_HOOK_SL_COUNT"
+exit 1
+MOCK
+  cat >"$mockbin/autoformat" <<'MOCK'
+#!/usr/bin/env bash
+exit 0
+MOCK
+  chmod +x "$mockbin/git" "$mockbin/sl" "$mockbin/autoformat"
+  (cd "$outside" && PATH="$mockbin:$PATH" "$@" \
+    XDG_CONFIG_HOME="$repo/.xdg-config" XDG_CACHE_HOME="$repo/.xdg-cache" \
+    GIT_CONFIG_GLOBAL="$repo/.gitconfig-test" \
+    "$SLEY" hook format-file "$file" >/dev/null 2>&1) || true
+}
+
+hook_perf_repo=$(_new_perf_repo)
+printf 'x = 1\n' >"$hook_perf_repo/hook.py"
+(cd "$hook_perf_repo" && git add hook.py && git commit -qm "seed hook probe perf")
+hook_perf_outside=$(_tmpdir)
+hook_perf_mock=$(_mock_bin)
+hook_perf_gitlog=$(_tmpdir)/hook-git.log
+hook_perf_slcount=$(_tmpdir)/hook-sl-count.txt
+# Isolate from ambient bare-repo env (dotfiles hosts export it): the skip
+# applies only when no bare fallback could engage.
+_perf_hook_probe_counts "$hook_perf_repo" "$hook_perf_repo/hook.py" \
+  "$hook_perf_outside" "$hook_perf_mock" "$hook_perf_gitlog" "$hook_perf_slcount" \
+  env -u SLEY_BARE_REPO_GIT_DIR -u SLEY_BARE_REPO_WORK_TREE _REPO_TYPE=git
+hook_perf_git_probes=$(grep -c "rev-parse --show-toplevel" "$hook_perf_gitlog" || true)
+_assert_eq "hook perf: override probes git exactly once (launcher skip)" \
+  "1" "$hook_perf_git_probes"
+_assert_eq "hook perf: override never probes sl" \
+  "0" "$(cat "$hook_perf_slcount")"
+
+hook_perf_bare=$(_tmpdir)
+git init -q --bare "$hook_perf_bare/bare.git"
+_perf_hook_probe_counts "$hook_perf_repo" "$hook_perf_repo/hook.py" \
+  "$hook_perf_outside" "$hook_perf_mock" "$hook_perf_gitlog" "$hook_perf_slcount" \
+  env _REPO_TYPE=git SLEY_BARE_REPO_GIT_DIR="$hook_perf_bare/bare.git" \
+  SLEY_BARE_REPO_WORK_TREE="$hook_perf_bare"
+hook_perf_bare_probes=$(grep -c "rev-parse --show-toplevel" "$hook_perf_gitlog" || true)
+_assert_eq "hook perf: bare env keeps legacy launcher probe (two total)" \
+  "2" "$hook_perf_bare_probes"
+_assert_eq "hook perf: bare env never probes sl" \
+  "0" "$(cat "$hook_perf_slcount")"
+unset SLEY_PERF_HOOK_GIT_LOG SLEY_PERF_HOOK_MOCKBIN SLEY_PERF_HOOK_SL_COUNT
+
+echo "=== sley perf: required commands avoid login shells unless asked ==="
+
+# A counting `.bash_profile` proves no `bash -lc` runs for default-shell
+# required commands. No wall-clock assertions — login-shell count is the
+# signal, and the bridge-executed assertion below guards vacuity.
+shell_perf_repo=$(_new_perf_repo)
+printf 'x = 1\n' >"$shell_perf_repo/file.txt"
+(cd "$shell_perf_repo" && git add file.txt && git commit -qm "seed shell perf")
+printf 'changed\n' >>"$shell_perf_repo/file.txt"
+(cd "$shell_perf_repo" && git add file.txt)
+shell_perf_state=$(_tmpdir)
+export SLEY_PERF_CHECKRUN_COUNT_FILE="$shell_perf_state/count"
+export SLEY_PERF_CHECKRUN_ARGS_PREFIX="$shell_perf_state/args"
+export SLEY_PERF_CHECKRUN_HOME_PREFIX="$shell_perf_state/home"
+printf '0\n' >"$SLEY_PERF_CHECKRUN_COUNT_FILE"
+shell_perf_home="$shell_perf_repo/.home"
+mkdir -p "$shell_perf_home"
+export SLEY_PERF_LOGIN_COUNT_FILE="$shell_perf_state/logins"
+printf '0\n' >"$SLEY_PERF_LOGIN_COUNT_FILE"
+cat >"$shell_perf_home/.bash_profile" <<'MOCK'
+count=$(cat "$SLEY_PERF_LOGIN_COUNT_FILE")
+printf '%s\n' "$((count + 1))" >"$SLEY_PERF_LOGIN_COUNT_FILE"
+MOCK
+shell_perf_rc=0
+(cd "$shell_perf_repo" && HOME="$shell_perf_home" \
+  XDG_CONFIG_HOME="$shell_perf_repo/.xdg-config" XDG_CACHE_HOME="$shell_perf_repo/.xdg-cache" \
+  GIT_CONFIG_GLOBAL="$shell_perf_repo/.gitconfig-test" \
+  "$SLEY" verify --run-required >/dev/null 2>&1) || shell_perf_rc=$?
+_assert_exit "shell perf: verify run exits 0" 0 "$shell_perf_rc"
+_assert_eq "shell perf: checkrun bridge executed" \
+  "1" "$(cat "$SLEY_PERF_CHECKRUN_COUNT_FILE")"
+_assert_eq "shell perf: no login shells spawned" \
+  "0" "$(cat "$SLEY_PERF_LOGIN_COUNT_FILE")"
+unset SLEY_PERF_CHECKRUN_COUNT_FILE SLEY_PERF_CHECKRUN_ARGS_PREFIX
+unset SLEY_PERF_CHECKRUN_HOME_PREFIX SLEY_PERF_LOGIN_COUNT_FILE
+
+echo "=== sley perf: verify cache pays identity once, three helper calls ==="
+
+# A cached-command miss must invoke the helper exactly three times (two
+# lookups bracketing the lock plus one post-run write-if-same-generation),
+# compute gate VCS identity exactly once, and batch its jq. Logging shims
+# prove the shape with no wall-clock assertions.
+vcache_perf_repo=$(_new_perf_repo)
+mkdir -p "$vcache_perf_repo/src" "$vcache_perf_repo/tests" "$vcache_perf_repo/.sley"
+printf 'initial\n' >"$vcache_perf_repo/src/app.txt"
+cat >"$vcache_perf_repo/tests/run.sh" <<'EOF'
+#!/usr/bin/env bash
+count=0
+[[ -f tests/count ]] && count=$(cat tests/count)
+printf '%s\n' "$((count + 1))" > tests/count
+EOF
+chmod +x "$vcache_perf_repo/tests/run.sh"
+cat >"$vcache_perf_repo/.sley/verify.json" <<'EOF'
+{"rules": [{"paths": ["src/**"], "commands": [{"cmd": "./tests/run.sh", "required": true, "cache": {"enabled": true, "salt": "vcache-perf-shape"}}]}]}
+EOF
+(cd "$vcache_perf_repo" && git add . && git commit -qm "seed vcache perf shape")
+printf 'changed\n' >>"$vcache_perf_repo/src/app.txt"
+(cd "$vcache_perf_repo" && git add src/app.txt)
+vcache_perf_mock=$(_mock_bin)
+vcache_perf_state=$(_tmpdir)
+export SLEY_PERF_VCACHE_MOCKBIN="$vcache_perf_mock"
+SLEY_PERF_VCACHE_REAL_PY="$(command -v python3)"
+SLEY_PERF_VCACHE_REAL_JQ="$(command -v jq)"
+export SLEY_PERF_VCACHE_REAL_PY SLEY_PERF_VCACHE_REAL_JQ
+export SLEY_PERF_VCACHE_PY_LOG="$vcache_perf_state/python.log"
+export SLEY_PERF_VCACHE_GIT_LOG="$vcache_perf_state/git.log"
+export SLEY_PERF_VCACHE_JQ_COUNT="$vcache_perf_state/jq-count.log"
+export SLEY_PERF_VCACHE_JQ_ARGS="$vcache_perf_state/jq-args.log"
+: >"$SLEY_PERF_VCACHE_PY_LOG"
+: >"$SLEY_PERF_VCACHE_GIT_LOG"
+: >"$SLEY_PERF_VCACHE_JQ_COUNT"
+: >"$SLEY_PERF_VCACHE_JQ_ARGS"
+export SLEY_PERF_CHECKRUN_COUNT_FILE="$vcache_perf_state/checkrun-count"
+export SLEY_PERF_CHECKRUN_ARGS_PREFIX="$vcache_perf_state/checkrun-args"
+export SLEY_PERF_CHECKRUN_HOME_PREFIX="$vcache_perf_state/checkrun-home"
+printf '0\n' >"$SLEY_PERF_CHECKRUN_COUNT_FILE"
+cat >"$vcache_perf_mock/python3" <<'MOCK'
+#!/usr/bin/env bash
+printf 'python3 %s\n' "$*" >>"$SLEY_PERF_VCACHE_PY_LOG"
+# Delegate by absolute path with PATH untouched: stripping this mockbin
+# would also hide the sibling git/jq mocks from python's grandchildren
+# (the cache helper's VCS calls must stay visible).
+exec "$SLEY_PERF_VCACHE_REAL_PY" "$@"
+MOCK
+cat >"$vcache_perf_mock/git" <<'MOCK'
+#!/usr/bin/env bash
+printf 'git %s\n' "$*" >>"$SLEY_PERF_VCACHE_GIT_LOG"
+# Unlike python3/jq above, git delegates via PATH *with* a strip:
+# PATH-resolving `git` launchers re-scan PATH at their runtime and would
+# otherwise re-pick this mock as the "real" git and recurse. Git's own
+# children need no sibling mocks, so hiding the mockbin from them is safe.
+PATH=":$PATH:"
+PATH="${PATH//:$SLEY_PERF_VCACHE_MOCKBIN:/:}"
+PATH="${PATH#:}"
+PATH="${PATH%:}"
+export PATH
+exec git "$@"
+MOCK
+cat >"$vcache_perf_mock/jq" <<'MOCK'
+#!/usr/bin/env bash
+# One tick per call: multi-line jq programs would otherwise inflate a
+# line count. Full argv goes to a separate args log for content checks.
+printf 'call\n' >>"$SLEY_PERF_VCACHE_JQ_COUNT"
+printf 'jq %s\n' "$*" >>"$SLEY_PERF_VCACHE_JQ_ARGS"
+# Absolute-path delegation (see the python3 mock above): no PATH strip.
+exec "$SLEY_PERF_VCACHE_REAL_JQ" "$@"
+MOCK
+chmod +x "$vcache_perf_mock/python3" "$vcache_perf_mock/git" "$vcache_perf_mock/jq"
+vcache_perf_cache=$(_tmpdir)/vcache-fresh
+vcache_perf_out="$vcache_perf_state/run.out"
+vcache_perf_rc=0
+(cd "$vcache_perf_repo" && PATH="$vcache_perf_mock:$PATH" HOME="$vcache_perf_repo/.home" \
+  XDG_CONFIG_HOME="$vcache_perf_repo/.xdg-config" XDG_CACHE_HOME="$vcache_perf_repo/.xdg-cache" \
+  GIT_CONFIG_GLOBAL="$vcache_perf_repo/.gitconfig-test" \
+  SLEY_VERIFY_CACHE_DIR="$vcache_perf_cache" \
+  "$SLEY" verify --run-required >"$vcache_perf_out" 2>&1) || vcache_perf_rc=$?
+_assert_exit "vcache perf: miss run exits 0" 0 "$vcache_perf_rc"
+if [[ "$vcache_perf_rc" != "0" ]]; then
+  echo "--- vcache inner output (miss run rc=$vcache_perf_rc) ---"
+  cat "$vcache_perf_out"
+  echo "--- end vcache inner output ---"
+fi
+_assert_eq "vcache perf: miss executes command once" \
+  "1" "$(cat "$vcache_perf_repo/tests/count")"
+vcache_perf_lookups=$(grep -c "verify-cache.py lookup" "$SLEY_PERF_VCACHE_PY_LOG" || true)
+vcache_perf_commits=$(grep -c "verify-cache.py write-if-same-generation" "$SLEY_PERF_VCACHE_PY_LOG" || true)
+_assert_eq "vcache perf: exactly two cache lookups" "2" "$vcache_perf_lookups"
+_assert_eq "vcache perf: exactly one post-run commit" "1" "$vcache_perf_commits"
+if grep -q "verify-cache.py write$" "$SLEY_PERF_VCACHE_PY_LOG"; then
+  _fail "vcache perf: no standalone cache writes"
+else
+  _pass "vcache perf: no standalone cache writes"
+fi
+vcache_perf_gitdir=$(grep -c "rev-parse --absolute-git-dir" "$SLEY_PERF_VCACHE_GIT_LOG" || true)
+vcache_perf_upstream=$(grep -c "rev-parse --abbrev-ref --symbolic-full-name" "$SLEY_PERF_VCACHE_GIT_LOG" || true)
+_assert_eq "vcache perf: repo identity computed once" "1" "$vcache_perf_gitdir"
+_assert_eq "vcache perf: base identity computed once" "1" "$vcache_perf_upstream"
+vcache_perf_jq_total=$(wc -l <"$SLEY_PERF_VCACHE_JQ_COUNT" | tr -d ' ')
+if [[ "$vcache_perf_jq_total" -le 22 ]]; then
+  _pass "vcache perf: jq stays batched (total $vcache_perf_jq_total <= 22)"
+else
+  _fail "vcache perf: jq stays batched (total $vcache_perf_jq_total <= 22)"
+fi
+if grep -q -- "--rawfile" "$SLEY_PERF_VCACHE_JQ_ARGS"; then
+  _pass "vcache perf: payload built in one jq call"
+else
+  _fail "vcache perf: payload built in one jq call"
+fi
+unset SLEY_PERF_VCACHE_MOCKBIN SLEY_PERF_VCACHE_PY_LOG
+unset SLEY_PERF_VCACHE_GIT_LOG SLEY_PERF_VCACHE_JQ_COUNT
+unset SLEY_PERF_VCACHE_JQ_ARGS SLEY_PERF_CHECKRUN_COUNT_FILE
+unset SLEY_PERF_CHECKRUN_ARGS_PREFIX SLEY_PERF_CHECKRUN_HOME_PREFIX
+unset SLEY_PERF_VCACHE_REAL_PY SLEY_PERF_VCACHE_REAL_JQ
+
+echo "=== sley perf: identity recomputed per cached command ==="
+
+# Identity is per-command-fresh, not gate-memoized: the only caller runs in
+# command substitution, so no memoized value could persist across commands.
+# Two cached commands must therefore show two identity computations each —
+# a gate memoizer would show one. (Single-command above cannot distinguish.)
+vcache2_repo=$(_new_perf_repo)
+mkdir -p "$vcache2_repo/src" "$vcache2_repo/tests" "$vcache2_repo/.sley"
+printf 'initial\n' >"$vcache2_repo/src/app.txt"
+for vcache2_n in 1 2; do
+  cat >"$vcache2_repo/tests/run$vcache2_n.sh" <<EOF
+#!/usr/bin/env bash
+printf 'ran\n' >> tests/count$vcache2_n
+EOF
+  chmod +x "$vcache2_repo/tests/run$vcache2_n.sh"
+done
+cat >"$vcache2_repo/.sley/verify.json" <<'EOF'
+{"rules": [{"paths": ["src/**"], "commands": [{"cmd": "./tests/run1.sh", "required": true, "cache": {"enabled": true, "salt": "vcache-two-a"}}, {"cmd": "./tests/run2.sh", "required": true, "cache": {"enabled": true, "salt": "vcache-two-b"}}]}]}
+EOF
+(cd "$vcache2_repo" && git add . && git commit -qm "seed two-command identity pin")
+printf 'changed\n' >>"$vcache2_repo/src/app.txt"
+(cd "$vcache2_repo" && git add src/app.txt)
+vcache2_mock=$(_mock_bin)
+export VCACHE2_GIT_LOG="$vcache2_repo/git.log"
+export VCACHE2_MOCKBIN="$vcache2_mock"
+: >"$VCACHE2_GIT_LOG"
+cat >"$vcache2_mock/git" <<'MOCK'
+#!/usr/bin/env bash
+printf 'git %s\n' "$*" >>"$VCACHE2_GIT_LOG"
+PATH=":$PATH:"
+PATH="${PATH//:$VCACHE2_MOCKBIN:/:}"
+PATH="${PATH#:}"
+PATH="${PATH%:}"
+export PATH
+exec git "$@"
+MOCK
+chmod +x "$vcache2_mock/git"
+vcache2_state=$(_tmpdir)
+export SLEY_PERF_CHECKRUN_COUNT_FILE="$vcache2_state/checkrun-count"
+export SLEY_PERF_CHECKRUN_ARGS_PREFIX="$vcache2_state/checkrun-args"
+export SLEY_PERF_CHECKRUN_HOME_PREFIX="$vcache2_state/checkrun-home"
+printf '0\n' >"$SLEY_PERF_CHECKRUN_COUNT_FILE"
+vcache2_cache=$(_tmpdir)/vcache-two
+vcache2_rc=0
+(cd "$vcache2_repo" && PATH="$vcache2_mock:$PATH" HOME="$vcache2_repo/.home" \
+  XDG_CONFIG_HOME="$vcache2_repo/.xdg-config" XDG_CACHE_HOME="$vcache2_repo/.xdg-cache" \
+  GIT_CONFIG_GLOBAL="$vcache2_repo/.gitconfig-test" \
+  SLEY_VERIFY_CACHE_DIR="$vcache2_cache" \
+  "$SLEY" verify --run-required >/dev/null 2>&1) || vcache2_rc=$?
+_assert_exit "vcache perf: two-command run exits 0" 0 "$vcache2_rc"
+_assert_eq "vcache perf: first command ran" "ran" "$(cat "$vcache2_repo/tests/count1")"
+_assert_eq "vcache perf: second command ran" "ran" "$(cat "$vcache2_repo/tests/count2")"
+vcache2_gitdir=$(grep -c "rev-parse --absolute-git-dir" "$VCACHE2_GIT_LOG" || true)
+vcache2_upstream=$(grep -c "rev-parse --abbrev-ref --symbolic-full-name" "$VCACHE2_GIT_LOG" || true)
+_assert_eq "vcache perf: two commands compute repo identity twice" "2" "$vcache2_gitdir"
+_assert_eq "vcache perf: two commands compute base identity twice" "2" "$vcache2_upstream"
+unset VCACHE2_GIT_LOG VCACHE2_MOCKBIN
+unset SLEY_PERF_CHECKRUN_COUNT_FILE SLEY_PERF_CHECKRUN_ARGS_PREFIX
+unset SLEY_PERF_CHECKRUN_HOME_PREFIX
 
 _test_summary

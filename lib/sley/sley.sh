@@ -22,12 +22,37 @@ source "$_SLEY_LIB_DIR/scope.sh"
 # shellcheck source=hooks.sh
 # shellcheck disable=SC1091 # sibling module resolved from this file's dir.
 source "$_SLEY_LIB_DIR/hooks.sh"
-# shellcheck source=verify.sh
-# shellcheck disable=SC1091 # sibling module resolved from this file's dir.
-source "$_SLEY_LIB_DIR/verify.sh"
-# shellcheck source=ready.sh
-# shellcheck disable=SC1091 # sibling module resolved from this file's dir.
-source "$_SLEY_LIB_DIR/ready.sh"
+# verify.sh (local verification) and ready.sh (aggregate readiness) are the
+# heavy modules (~3200 lines, ~10ms of parse). They load eagerly by default
+# so every sourced consumer — including white-box callers of `_sley_ready_*`
+# / `_sley_verify_*` — sees the exact historical API the moment this file is
+# sourced. The CLI (`bin/sley`) sets `SLEY_LAZY_MODULES=1` before sourcing:
+# hook hot paths and non-verify commands then skip the parse, and the
+# `sley_verify` / `sley_ready` wrappers load their module on first use via
+# the idempotent loaders below. verify.sh stays directly sourceable for
+# unit tests that exercise it standalone. The loaded marker is keyed by
+# library directory so re-sourcing from a second sley copy reloads instead
+# of running a stale copy's functions.
+_sley_ensure_verify() {
+  [[ "${_SLEY_VERIFY_LOADED_DIR:-}" == "$_SLEY_LIB_DIR" ]] && return 0
+  # shellcheck source=verify.sh
+  # shellcheck disable=SC1091 # sibling module resolved from this file's dir.
+  source "$_SLEY_LIB_DIR/verify.sh"
+  _SLEY_VERIFY_LOADED_DIR="$_SLEY_LIB_DIR"
+}
+
+_sley_ensure_ready() {
+  [[ "${_SLEY_READY_LOADED_DIR:-}" == "$_SLEY_LIB_DIR" ]] && return 0
+  # shellcheck source=ready.sh
+  # shellcheck disable=SC1091 # sibling module resolved from this file's dir.
+  source "$_SLEY_LIB_DIR/ready.sh"
+  _SLEY_READY_LOADED_DIR="$_SLEY_LIB_DIR"
+}
+
+if [[ "${SLEY_LAZY_MODULES:-0}" != "1" ]]; then
+  _sley_ensure_verify
+  _sley_ensure_ready
+fi
 
 # ---------------------------------------------------------------------------
 # Public API — stable interface for CLIs, hooks, tests, and local extensions
@@ -118,6 +143,7 @@ sley_secrets() {
 sley_verify() {
   local -
   set -u
+  _sley_ensure_verify
   _sley_run_with_cwd_restore _sley_verify "$@"
 }
 
@@ -126,6 +152,7 @@ sley_verify() {
 sley_ready() {
   local -
   set -u
+  _sley_ensure_ready
   _sley_run_with_cwd_restore _sley_ready "$@"
 }
 
