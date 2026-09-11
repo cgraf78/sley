@@ -632,20 +632,19 @@ _sley_verify_cache_helper() {
   python3 "$helper_dir/verify-cache.py" "$@"
 }
 
-# Gate-memoized VCS identity for cache keys: the exact `repo_identity` /
+# Per-command VCS identity for cache keys: the exact `repo_identity` /
 # base-identity values `verify-cache.py` would compute itself, evaluated
-# once per gate instead of once per helper invocation (a miss path used to
-# pay 4× ~5 VCS spawns per cached command). Values mirror the helper
-# precisely — same commands, same working directory, same failure-to-null
-# mapping (a null flag per value, since success-with-empty-output and
-# failure must stay distinct), same merge_base==head normalization. Reset
-# per `_sley_verify_run_required_impl` call; staleness within a gate is
-# safe (keys are self-describing, so a moved base only causes misses).
+# once per cached command instead of once per helper invocation (a miss
+# path used to pay 4× ~5 VCS spawns per cached command). Values mirror the
+# helper precisely — same commands, same working directory, same
+# failure-to-null mapping (a null flag per value, since
+# success-with-empty-output and failure must stay distinct), same
+# merge_base==head normalization. Identity is intentionally NOT memoized
+# across commands (the only caller runs in command substitution, so a
+# memoized value could not persist anyway): every cached command
+# re-probes, so a base that moves mid-gate is always observed fresh and
+# no stale window exists.
 _sley_verify_cache_identity_json() {
-  if [[ -n "${_SLEY_VERIFY_CACHE_IDENTITY_JSON:-}" ]]; then
-    printf '%s\n' "$_SLEY_VERIFY_CACHE_IDENTITY_JSON"
-    return 0
-  fi
   local identity=""
   if [[ "$_REPO_TYPE" == "git" ]]; then
     local git_dir="" git_dir_null=1 remote="" remote_null=1
@@ -745,7 +744,6 @@ _sley_verify_cache_identity_json() {
   else
     return 1
   fi
-  _SLEY_VERIFY_CACHE_IDENTITY_JSON="$identity"
   printf '%s\n' "$identity"
 }
 
@@ -970,9 +968,6 @@ _sley_verify_run_required_impl() {
   local passed_count=0 cached_count=0 failed_count=0 skipped_slow_count=0
   local shell_mode shell_flag shell_field
   local cached_raw top_shell cache_shell field_assignments lookup_assignments
-  # Fresh VCS identity per gate run; the first cached command computes it and
-  # the rest of the gate reuses it via `_sley_verify_cache_identity_json`.
-  _SLEY_VERIFY_CACHE_IDENTITY_JSON=""
 
   # Cleanup-on-signal traps. Normal control flow releases `lock_dir` at every
   # branch below, but a SIGINT (Ctrl-C), SIGTERM, or SIGHUP between the

@@ -101,6 +101,20 @@ def machine_id(root: Path) -> str:
             os.link(tmp_name, ident_path)
         except FileExistsError:
             pass
+        except (AttributeError, OSError):
+            # No hardlink support (Android's Python lacks os.link entirely;
+            # some filesystems refuse it): fall back to atomic exclusive
+            # create, which has the same create-if-absent semantics
+            # everywhere. Whoever wins, the token below is read back from
+            # the shared path, so identity stays stable.
+            try:
+                ident_fd = os.open(ident_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            except FileExistsError:
+                pass
+            else:
+                with os.fdopen(ident_fd, "wb") as ident_file:
+                    ident_file.write(token)
+                    ident_file.write(b"\n")
     finally:
         try:
             os.unlink(tmp_name)

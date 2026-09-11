@@ -1282,12 +1282,12 @@ lazy_perf_eager=$(
     echo "ready=$(declare -F _sley_ready)"
   '
 )
-_assert_contains "lazy perf: sourcing leaves _sley_verify undefined" \
-  "verify=" "$lazy_perf_defined"
+_assert_eq "lazy perf: sourcing leaves _sley_verify undefined" \
+  "verify=" "$(printf '%s\n' "$lazy_perf_defined" | sed -n '1p')"
 _assert_not_contains "lazy perf: sourcing defines no _sley_verify body" \
   "_sley_verify" "$lazy_perf_defined"
-_assert_contains "lazy perf: sourcing leaves _sley_ready undefined" \
-  "ready=" "$lazy_perf_defined"
+_assert_eq "lazy perf: sourcing leaves _sley_ready undefined" \
+  "ready=" "$(printf '%s\n' "$lazy_perf_defined" | sed -n '2p')"
 _assert_not_contains "lazy perf: sourcing defines no _sley_ready body" \
   "_sley_ready" "$lazy_perf_defined"
 _assert_contains "lazy perf: sourcing still defines hook entry points" \
@@ -1518,5 +1518,65 @@ unset SLEY_PERF_VCACHE_GIT_LOG SLEY_PERF_VCACHE_JQ_COUNT
 unset SLEY_PERF_VCACHE_JQ_ARGS SLEY_PERF_CHECKRUN_COUNT_FILE
 unset SLEY_PERF_CHECKRUN_ARGS_PREFIX SLEY_PERF_CHECKRUN_HOME_PREFIX
 unset SLEY_PERF_VCACHE_REAL_PY SLEY_PERF_VCACHE_REAL_JQ
+
+echo "=== sley perf: identity recomputed per cached command ==="
+
+# Identity is per-command-fresh, not gate-memoized: the only caller runs in
+# command substitution, so no memoized value could persist across commands.
+# Two cached commands must therefore show two identity computations each —
+# a gate memoizer would show one. (Single-command above cannot distinguish.)
+vcache2_repo=$(_new_perf_repo)
+mkdir -p "$vcache2_repo/src" "$vcache2_repo/tests" "$vcache2_repo/.sley"
+printf 'initial\n' >"$vcache2_repo/src/app.txt"
+for vcache2_n in 1 2; do
+  cat >"$vcache2_repo/tests/run$vcache2_n.sh" <<EOF
+#!/usr/bin/env bash
+printf 'ran\n' >> tests/count$vcache2_n
+EOF
+  chmod +x "$vcache2_repo/tests/run$vcache2_n.sh"
+done
+cat >"$vcache2_repo/.sley/verify.json" <<'EOF'
+{"rules": [{"paths": ["src/**"], "commands": [{"cmd": "./tests/run1.sh", "required": true, "cache": {"enabled": true, "salt": "vcache-two-a"}}, {"cmd": "./tests/run2.sh", "required": true, "cache": {"enabled": true, "salt": "vcache-two-b"}}]}]}
+EOF
+(cd "$vcache2_repo" && git add . && git commit -qm "seed two-command identity pin")
+printf 'changed\n' >>"$vcache2_repo/src/app.txt"
+(cd "$vcache2_repo" && git add src/app.txt)
+vcache2_mock=$(_mock_bin)
+export VCACHE2_GIT_LOG="$vcache2_repo/git.log"
+export VCACHE2_MOCKBIN="$vcache2_mock"
+: >"$VCACHE2_GIT_LOG"
+cat >"$vcache2_mock/git" <<'MOCK'
+#!/usr/bin/env bash
+printf 'git %s\n' "$*" >>"$VCACHE2_GIT_LOG"
+PATH=":$PATH:"
+PATH="${PATH//:$VCACHE2_MOCKBIN:/:}"
+PATH="${PATH#:}"
+PATH="${PATH%:}"
+export PATH
+exec git "$@"
+MOCK
+chmod +x "$vcache2_mock/git"
+vcache2_state=$(_tmpdir)
+export SLEY_PERF_CHECKRUN_COUNT_FILE="$vcache2_state/checkrun-count"
+export SLEY_PERF_CHECKRUN_ARGS_PREFIX="$vcache2_state/checkrun-args"
+export SLEY_PERF_CHECKRUN_HOME_PREFIX="$vcache2_state/checkrun-home"
+printf '0\n' >"$SLEY_PERF_CHECKRUN_COUNT_FILE"
+vcache2_cache=$(_tmpdir)/vcache-two
+vcache2_rc=0
+(cd "$vcache2_repo" && PATH="$vcache2_mock:$PATH" HOME="$vcache2_repo/.home" \
+  XDG_CONFIG_HOME="$vcache2_repo/.xdg-config" XDG_CACHE_HOME="$vcache2_repo/.xdg-cache" \
+  GIT_CONFIG_GLOBAL="$vcache2_repo/.gitconfig-test" \
+  SLEY_VERIFY_CACHE_DIR="$vcache2_cache" \
+  "$SLEY" verify --run-required >/dev/null 2>&1) || vcache2_rc=$?
+_assert_exit "vcache perf: two-command run exits 0" 0 "$vcache2_rc"
+_assert_eq "vcache perf: first command ran" "ran" "$(cat "$vcache2_repo/tests/count1")"
+_assert_eq "vcache perf: second command ran" "ran" "$(cat "$vcache2_repo/tests/count2")"
+vcache2_gitdir=$(grep -c "rev-parse --absolute-git-dir" "$VCACHE2_GIT_LOG" || true)
+vcache2_upstream=$(grep -c "rev-parse --abbrev-ref --symbolic-full-name" "$VCACHE2_GIT_LOG" || true)
+_assert_eq "vcache perf: two commands compute repo identity twice" "2" "$vcache2_gitdir"
+_assert_eq "vcache perf: two commands compute base identity twice" "2" "$vcache2_upstream"
+unset VCACHE2_GIT_LOG VCACHE2_MOCKBIN
+unset SLEY_PERF_CHECKRUN_COUNT_FILE SLEY_PERF_CHECKRUN_ARGS_PREFIX
+unset SLEY_PERF_CHECKRUN_HOME_PREFIX
 
 _test_summary

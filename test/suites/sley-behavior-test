@@ -6023,6 +6023,46 @@ _assert_not_contains "cache edge: symlinked receipt is not a hit" '"status":"cac
 _assert_eq "cache edge: symlinked receipt increments count" "2" "$(cat "$cache_edge_repo/tests/count")"
 rm -f "$cache_edge_receipt" "$cache_edge_receipt.real"
 
+echo "=== sley: verify cache machine identity without hardlinks ==="
+
+# Android's Python lacks os.link and Android has no /etc/machine-id, so
+# machine-id generation must not depend on hardlinks (Termux CI crashed
+# the first cache lookup with "module 'os' has no attribute 'link'").
+# Simulate both conditions and pin a stable, non-empty identity.
+cache_machine_out=$(
+  SLEY_HELPER="$SLEY_REPO_ROOT/lib/sley/verify-cache.py" \
+    CACHE_MACHINE_DIR="$(_tmpdir)" \
+    python3 - <<'PY'
+import importlib.util
+import os
+import sys
+
+spec = importlib.util.spec_from_file_location("sley_verify_cache", os.environ["SLEY_HELPER"])
+module = importlib.util.module_from_spec(spec)
+sys.modules["sley_verify_cache"] = module
+spec.loader.exec_module(module)
+
+# Simulate Android: os.link missing entirely.
+del os.link
+# Simulate Android: no /etc/machine-id.
+real_is_file = module.Path.is_file
+module.Path.is_file = lambda self: False if str(self) == "/etc/machine-id" else real_is_file(self)
+
+first = module.machine_id(module.Path(os.environ["CACHE_MACHINE_DIR"]))
+second = module.machine_id(module.Path(os.environ["CACHE_MACHINE_DIR"]))
+print("first=%s" % first)
+print("second=%s" % second)
+PY
+)
+cache_machine_rc=$?
+_assert_exit "cache edge: machine identity works without os.link" 0 "$cache_machine_rc"
+cache_machine_first=$(printf '%s\n' "$cache_machine_out" | sed -n 's/^first=//p')
+cache_machine_second=$(printf '%s\n' "$cache_machine_out" | sed -n 's/^second=//p')
+_assert_contains "cache edge: machine identity is non-empty without os.link" \
+  "sha256:" "$cache_machine_first"
+_assert_eq "cache edge: machine identity is stable without os.link" \
+  "$cache_machine_first" "$cache_machine_second"
+
 echo "=== sley: verify cache post-lock hit ==="
 
 # A receipt that lands while this run waits on the cache lock must satisfy
