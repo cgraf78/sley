@@ -772,8 +772,11 @@ PATH="$probe_bin:$PATH" _run_perf_sley_timed 5 "$outside_repo" \
 _assert_exit "hook format-file perf: absolute target exits 0" 0 "$__SLEY_RC"
 _assert_file_content "hook format-file perf: discovers target Git repo once" \
   "1" "$SLEY_PERF_GIT_PROBE_COUNT_FILE"
-_assert_file_content "hook format-file perf: checks Sapling precedence once" \
-  "1" "$SLEY_PERF_SL_PROBE_COUNT_FILE"
+# Git-only checkout: the upward metadata scan rules Sapling out without a
+# subprocess (dual/nested precedence still probes both — see the `detect:`
+# characterization block). This used to assert 1; the scan makes it 0.
+_assert_file_content "hook format-file perf: skips Sapling probe when no .sl/.hg above" \
+  "0" "$SLEY_PERF_SL_PROBE_COUNT_FILE"
 _assert_autoformat_invocations "hook format-file perf: absolute target delegation" \
   1 "$autoformat_state/expected-args"
 
@@ -826,8 +829,10 @@ PATH="$probe_bin:$PATH" _run_perf_sley_timed 5 "$outside_repo" \
 _assert_exit "hook lint-file perf: absolute target exits 0" 0 "$__SLEY_RC"
 _assert_file_content "hook lint-file perf: discovers target Git repo once" \
   "1" "$SLEY_PERF_GIT_PROBE_COUNT_FILE"
-_assert_file_content "hook lint-file perf: checks Sapling precedence once" \
-  "1" "$SLEY_PERF_SL_PROBE_COUNT_FILE"
+# Git-only checkout: the upward metadata scan rules Sapling out without a
+# subprocess (see the format-file note above).
+_assert_file_content "hook lint-file perf: skips Sapling probe when no .sl/.hg above" \
+  "0" "$SLEY_PERF_SL_PROBE_COUNT_FILE"
 _assert_autolint_invocations "hook lint-file perf: absolute target delegation" \
   1 "$autolint_state/expected-args"
 
