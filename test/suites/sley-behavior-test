@@ -2353,8 +2353,8 @@ repo=$(_new_repo)
 origin=$(_tmpdir)
 git init -q --bare "$origin"
 mkdir -p "$repo/src" "$repo/.sley"
-cat >"$repo/src/app.txt" <<'EOF'
-initial
+cat >"$repo/src/app.go" <<'EOF'
+package main
 EOF
 cat >"$repo/.sley/verify.json" <<'EOF'
 {
@@ -2379,8 +2379,8 @@ EOF
 git -C "$repo" remote add origin "$origin"
 branch=$(git -C "$repo" branch --show-current)
 git -C "$repo" push -q -u origin "$branch"
-echo "changed" >>"$repo/src/app.txt"
-(cd "$repo" && git add src/app.txt && git commit -q -m "change cached app")
+printf '// changed\n' >>"$repo/src/app.go"
+(cd "$repo" && git add src/app.go && git commit -q -m "change cached app")
 
 mockbin=$(_mock_bin)
 home=$(_tmpdir)
@@ -2518,8 +2518,8 @@ _assert_contains "verify --json: detects make target" '"command":"make test"' "$
 repo=$(_new_repo)
 mkdir -p "$repo/src" "$repo/space dir"
 echo "print('one')" >"$repo/src/app.py"
-echo "print('two')" >"$repo/space dir/app.py"
-git -C "$repo" add src/app.py "space dir/app.py"
+printf 'package main\n\nfunc main() {}\n' >"$repo/space dir/app.go"
+git -C "$repo" add src/app.py "space dir/app.go"
 
 checkrun_mock=$(_mock_bin)
 cat >"$checkrun_mock/checkrun" <<'EOF'
@@ -2543,7 +2543,153 @@ _assert_contains "verify Checkrun bridge: passes separator to Checkrun" \
 _assert_contains "verify Checkrun bridge: passes regular changed file" \
   '<src/app.py>' "$(cat "$repo/checkrun-verify.log")"
 _assert_contains "verify Checkrun bridge: preserves spaces through shell quoting" \
-  '<space dir/app.py>' "$(cat "$repo/checkrun-verify.log")"
+  '<space dir/app.go>' "$(cat "$repo/checkrun-verify.log")"
+
+echo "=== sley: verify Checkrun bridge pre-filter ==="
+
+# Pure-python/shell changes in a repo without Go/Rust projects skip the
+# bridge: no backend could act on them, so emitting the command only burns
+# a Checkrun interpreter startup plus discovery on every gate.
+repo=$(_new_repo)
+mkdir -p "$repo/src"
+echo "print('one')" >"$repo/src/app.py"
+printf '#!/usr/bin/env bash\necho ok\n' >"$repo/src/run.sh"
+git -C "$repo" add src/app.py src/run.sh
+
+checkrun_mock=$(_mock_bin)
+cat >"$checkrun_mock/checkrun" <<'EOF'
+#!/usr/bin/env bash
+echo invoked > checkrun-verify.log
+exit 0
+EOF
+chmod +x "$checkrun_mock/checkrun"
+
+PATH="$checkrun_mock:$PATH" _run_sley "$repo" verify --json
+_assert_exit "verify pre-filter: py/sh-only listing succeeds" 0 "$__SLEY_RC"
+_assert_not_contains "verify pre-filter: py/sh-only omits bridge" \
+  ' verify -- ' "$__SLEY_OUT"
+PATH="$checkrun_mock:$PATH" _run_sley "$repo" verify --run-required --json
+_assert_exit "verify pre-filter: py/sh-only run succeeds" 0 "$__SLEY_RC"
+_assert_contains "verify pre-filter: py/sh-only reports no-required" \
+  '"status":"no-required"' "$__SLEY_OUT"
+_assert_file_missing "verify pre-filter: py/sh-only never invokes Checkrun" \
+  "$repo/checkrun-verify.log"
+
+# A Python file inside a Go module DOES trigger golangci-lint/govulncheck
+# (Checkrun verifies the nearest owning project for any existing file), so
+# the pre-filter must keep the bridge via the ancestor-marker walk rather
+# than extensions alone.
+repo=$(_new_repo)
+printf 'module example.com/x\n\ngo 1.21\n' >"$repo/go.mod"
+echo "print('one')" >"$repo/app.py"
+(cd "$repo" && git add go.mod app.py && git commit -q -m "seed mixed module")
+echo "print('two')" >>"$repo/app.py"
+git -C "$repo" add app.py
+
+checkrun_mock=$(_mock_bin)
+cat >"$checkrun_mock/checkrun" <<'EOF'
+#!/usr/bin/env bash
+{
+  for arg in "$@"; do
+    printf '<%s>\n' "$arg"
+  done
+} > checkrun-verify.log
+exit 0
+EOF
+chmod +x "$checkrun_mock/checkrun"
+
+PATH="$checkrun_mock:$PATH" _run_sley "$repo" verify --json --commit
+_assert_exit "verify pre-filter: mixed-module listing succeeds" 0 "$__SLEY_RC"
+_assert_contains "verify pre-filter: py under go.mod keeps bridge" \
+  ' verify -- ' "$__SLEY_OUT"
+PATH="$checkrun_mock:$PATH" _run_sley "$repo" verify --run-required --json --commit
+_assert_exit "verify pre-filter: mixed-module run succeeds" 0 "$__SLEY_RC"
+_assert_contains "verify pre-filter: mixed-module invokes Checkrun" \
+  '<verify>' "$(cat "$repo/checkrun-verify.log")"
+_assert_contains "verify pre-filter: mixed-module passes py file through" \
+  '<app.py>' "$(cat "$repo/checkrun-verify.log")"
+
+# Fail-closed: unknown extensions keep the bridge so a future Checkrun
+# backend for a new extension cannot be skipped by an older Sley.
+repo=$(_new_repo)
+echo "data" >"$repo/data.xyz"
+git -C "$repo" add data.xyz
+
+checkrun_mock=$(_mock_bin)
+_mock_checkrun_verify "$checkrun_mock"
+
+PATH="$checkrun_mock:$PATH" _run_sley "$repo" verify --json
+_assert_exit "verify pre-filter: unknown-extension listing succeeds" 0 "$__SLEY_RC"
+_assert_contains "verify pre-filter: unknown extension keeps bridge" \
+  ' verify -- ' "$__SLEY_OUT"
+
+# Fail-closed: absent extension info (extensionless and dotfile basenames)
+# keeps the bridge.
+repo=$(_new_repo)
+printf 'all:\n\ttrue\n' >"$repo/Makefile"
+printf '*.pyc\n' >"$repo/.gitignore"
+git -C "$repo" add Makefile .gitignore
+
+checkrun_mock=$(_mock_bin)
+_mock_checkrun_verify "$checkrun_mock"
+
+PATH="$checkrun_mock:$PATH" _run_sley "$repo" verify --json
+_assert_exit "verify pre-filter: extensionless listing succeeds" 0 "$__SLEY_RC"
+_assert_contains "verify pre-filter: absent extension keeps bridge" \
+  ' verify -- ' "$__SLEY_OUT"
+
+# Missing files are name-gated inside Checkrun: a deleted Go file keeps the
+# bridge (it selects the surviving module), a deleted Python file skips it.
+repo=$(_new_repo)
+printf 'module example.com/x\n\ngo 1.21\n' >"$repo/go.mod"
+printf 'package main\n\nfunc main() {}\n' >"$repo/main.go"
+(cd "$repo" && git add go.mod main.go && git commit -q -m "seed go module")
+git -C "$repo" rm -q -- main.go
+
+checkrun_mock=$(_mock_bin)
+_mock_checkrun_verify "$checkrun_mock"
+
+PATH="$checkrun_mock:$PATH" _run_sley "$repo" verify --json
+_assert_exit "verify pre-filter: deleted-go listing succeeds" 0 "$__SLEY_RC"
+_assert_contains "verify pre-filter: deleted Go file keeps bridge" \
+  ' verify -- ' "$__SLEY_OUT"
+
+repo=$(_new_repo)
+echo "print('one')" >"$repo/app.py"
+(cd "$repo" && git add app.py && git commit -q -m "seed py file")
+git -C "$repo" rm -q -- app.py
+
+checkrun_mock=$(_mock_bin)
+cat >"$checkrun_mock/checkrun" <<'EOF'
+#!/usr/bin/env bash
+echo invoked > checkrun-verify.log
+exit 0
+EOF
+chmod +x "$checkrun_mock/checkrun"
+
+PATH="$checkrun_mock:$PATH" _run_sley "$repo" verify --json
+_assert_exit "verify pre-filter: deleted-py listing succeeds" 0 "$__SLEY_RC"
+_assert_not_contains "verify pre-filter: deleted Python file skips bridge" \
+  ' verify -- ' "$__SLEY_OUT"
+PATH="$checkrun_mock:$PATH" _run_sley "$repo" verify --run-required --json
+_assert_exit "verify pre-filter: deleted-py run succeeds" 0 "$__SLEY_RC"
+_assert_file_missing "verify pre-filter: deleted-py never invokes Checkrun" \
+  "$repo/checkrun-verify.log"
+
+# Fail-closed: symlinks resolve to trees the filter cannot see, so they
+# keep the bridge.
+repo=$(_new_repo)
+echo "print('one')" >"$repo/real.py"
+ln -s real.py "$repo/link.py"
+git -C "$repo" add real.py link.py
+
+checkrun_mock=$(_mock_bin)
+_mock_checkrun_verify "$checkrun_mock"
+
+PATH="$checkrun_mock:$PATH" _run_sley "$repo" verify --json
+_assert_exit "verify pre-filter: symlink listing succeeds" 0 "$__SLEY_RC"
+_assert_contains "verify pre-filter: symlink keeps bridge" \
+  ' verify -- ' "$__SLEY_OUT"
 
 repo=$(_new_repo)
 mkdir -p "$repo/sub"
@@ -2809,8 +2955,8 @@ _assert_contains "verify extension: unknown tier reports invalid extension comma
 
 repo=$(_new_repo)
 mkdir -p "$repo/src" "$repo/.sley"
-cat >"$repo/src/app.txt" <<'EOF'
-initial
+cat >"$repo/src/app.go" <<'EOF'
+package main
 EOF
 cat >"$repo/.sley/verify.json" <<'EOF'
 {
@@ -2824,7 +2970,7 @@ cat >"$repo/.sley/verify.json" <<'EOF'
 }
 EOF
 (cd "$repo" && git add . && git commit -q -m "seed disabled verify rule")
-echo "changed" >>"$repo/src/app.txt"
+printf '// changed\n' >>"$repo/src/app.go"
 
 _mock_checkrun_verify "$repo/mockbin"
 PATH="$repo/mockbin:$PATH" _run_sley "$repo" verify --run-required
@@ -2832,7 +2978,7 @@ _assert_exit "verify registry: disabled rule exits 0" 0 "$__SLEY_RC"
 _assert_contains "verify registry: disabled rule still runs built-in Checkrun bridge" \
   "running required fast command:" "$__SLEY_OUT"
 _assert_contains "verify registry: disabled rule bridge receives changed file" \
-  "verify -- 'src/app.txt'" "$__SLEY_OUT"
+  "verify -- 'src/app.go'" "$__SLEY_OUT"
 _assert_not_contains "verify registry: disabled rule command omitted" "disabled-rule" "$__SLEY_OUT"
 
 repo=$(_new_repo)
@@ -3468,8 +3614,8 @@ mkdir -p "$repo/src" "$repo/docs" "$repo/tests" "$repo/.sley"
 cat >"$repo/src/app.txt" <<'EOF'
 initial
 EOF
-cat >"$repo/docs/readme.md" <<'EOF'
-initial
+cat >"$repo/docs/readme.go" <<'EOF'
+package main
 EOF
 cat >"$repo/tests/run.sh" <<'EOF'
 #!/usr/bin/env bash
@@ -3480,7 +3626,7 @@ cat >"$repo/.sley/verify.json" <<'EOF'
 {"rules":[{"paths":["src/**"],"commands":["./tests/run.sh"]}]}
 EOF
 (cd "$repo" && git add . && git commit -q -m "seed unmatched verify registry")
-echo "changed" >"$repo/docs/readme.md"
+printf '// changed\n' >"$repo/docs/readme.go"
 
 _mock_checkrun_verify "$repo/mockbin"
 PATH="$repo/mockbin:$PATH" _run_sley "$repo" verify --run-required
@@ -3510,11 +3656,11 @@ _assert_exit "verify registry: failing mapped command blocks readiness" 1 "$__SL
 _assert_contains "verify registry: failing command exit recorded" "exit code: 7" "$__SLEY_OUT"
 
 repo=$(_new_repo)
-cat >"$repo/file.txt" <<'EOF'
-initial
+cat >"$repo/file.go" <<'EOF'
+package main
 EOF
-(cd "$repo" && git add file.txt && git commit -q -m "seed no registry")
-echo "changed" >>"$repo/file.txt"
+(cd "$repo" && git add file.go && git commit -q -m "seed no registry")
+printf '// changed\n' >>"$repo/file.go"
 
 _mock_checkrun_verify "$repo/mockbin"
 PATH="$repo/mockbin:$PATH" _run_sley "$repo" verify --run-required
@@ -3626,8 +3772,8 @@ _assert_contains "verify registry: home user config command is listed" "echo pro
 repo=$(_new_repo)
 config_dir=$(_tmpdir)
 mkdir -p "$config_dir/dir" "$repo"
-cat >"$repo/app.txt" <<'EOF'
-initial
+cat >"$repo/app.go" <<'EOF'
+package main
 EOF
 cat >"$config_dir/file.json" <<EOF
 {
@@ -3635,7 +3781,7 @@ cat >"$config_dir/file.json" <<EOF
     {
       "match": {"root": "$repo"},
       "rules": [
-        {"paths": ["app.txt"], "commands": ["echo env-file-test"]}
+        {"paths": ["app.go"], "commands": ["echo env-file-test"]}
       ]
     }
   ]
@@ -3647,7 +3793,7 @@ cat >"$config_dir/dir/private.json" <<EOF
     {
       "match": {"root": "$repo"},
       "rules": [
-        {"paths": ["app.txt"], "commands": ["echo env-dir-test"]}
+        {"paths": ["app.go"], "commands": ["echo env-dir-test"]}
       ]
     }
   ]
@@ -3659,14 +3805,14 @@ cat >"$config_dir/old.json" <<EOF
     {
       "match": {"root": "$repo"},
       "rules": [
-        {"paths": ["app.txt"], "commands": ["echo old-env-test"]}
+        {"paths": ["app.go"], "commands": ["echo old-env-test"]}
       ]
     }
   ]
 }
 EOF
-(cd "$repo" && git add app.txt && git commit -q -m "seed env verify")
-echo "changed" >>"$repo/app.txt"
+(cd "$repo" && git add app.go && git commit -q -m "seed env verify")
+printf '// changed\n' >>"$repo/app.go"
 
 SLEY_VERIFY_CONFIG="$config_dir/file.json" _run_sley "$repo" verify
 _assert_exit "verify registry: env file config exits 0" 0 "$__SLEY_RC"
@@ -5769,9 +5915,11 @@ echo "=== sley: verify/ready load on demand; hook file path needs neither ==="
 # eager (the white-box suites pin that by driving privates directly).
 lazy_repo=$(_new_repo)
 printf 'x = 1\n' >"$lazy_repo/hook.py"
-(cd "$lazy_repo" && git add hook.py && git commit -qm "seed lazy loading fixture")
+printf 'package main\n' >"$lazy_repo/hook.go"
+(cd "$lazy_repo" && git add hook.py hook.go && git commit -qm "seed lazy loading fixture")
 printf 'y = 2\n' >>"$lazy_repo/hook.py"
-(cd "$lazy_repo" && git add hook.py)
+printf '// changed\n' >>"$lazy_repo/hook.go"
+(cd "$lazy_repo" && git add hook.py hook.go)
 lazy_bin=$(_mock_bin)
 lazy_log="$lazy_repo/lazy.log"
 cat >"$lazy_bin/autoformat" <<'MOCK'

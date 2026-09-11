@@ -432,9 +432,16 @@ _write_changed_tree() {
   local repo="$1" count="$2" i dir file
   dir="$repo/packages/app/src/generated/deep/nested"
   mkdir -p "$dir"
+  # file-1 is Go so the Checkrun verify bridge stays exercised: the
+  # registry-perf block asserts bridge invocation counts as a vacuity guard,
+  # and the bridge pre-filter skips pure-.js scopes.
   for i in $(seq 1 "$count"); do
-    file="$dir/file-$i.js"
-    printf 'export const value%s = %s;\n' "$i" "$i" >"$file"
+    if [[ "$i" == "1" ]]; then
+      printf 'package generated\n' >"$dir/file-1.go"
+    else
+      file="$dir/file-$i.js"
+      printf 'export const value%s = %s;\n' "$i" "$i" >"$file"
+    fi
   done
   (
     cd "$repo" || exit 1
@@ -442,8 +449,12 @@ _write_changed_tree() {
     git commit -q -m "seed large verify fixture"
   )
   for i in $(seq 1 "$count"); do
-    file="$dir/file-$i.js"
-    printf 'export const changed%s = %s;\n' "$i" "$i" >>"$file"
+    if [[ "$i" == "1" ]]; then
+      printf '// changed\n' >>"$dir/file-1.go"
+    else
+      file="$dir/file-$i.js"
+      printf 'export const changed%s = %s;\n' "$i" "$i" >>"$file"
+    fi
   done
 }
 
@@ -1370,11 +1381,13 @@ echo "=== sley perf: required commands avoid login shells unless asked ==="
 # A counting `.bash_profile` proves no `bash -lc` runs for default-shell
 # required commands. No wall-clock assertions — login-shell count is the
 # signal, and the bridge-executed assertion below guards vacuity.
+# A Go fixture keeps the Checkrun bridge exercised (the bridge-executed
+# assertion guards vacuity); the pre-filter skips pure-.txt scopes.
 shell_perf_repo=$(_new_perf_repo)
-printf 'x = 1\n' >"$shell_perf_repo/file.txt"
-(cd "$shell_perf_repo" && git add file.txt && git commit -qm "seed shell perf")
-printf 'changed\n' >>"$shell_perf_repo/file.txt"
-(cd "$shell_perf_repo" && git add file.txt)
+printf 'package main\n' >"$shell_perf_repo/file.go"
+(cd "$shell_perf_repo" && git add file.go && git commit -qm "seed shell perf")
+printf '// changed\n' >>"$shell_perf_repo/file.go"
+(cd "$shell_perf_repo" && git add file.go)
 shell_perf_state=$(_tmpdir)
 export SLEY_PERF_CHECKRUN_COUNT_FILE="$shell_perf_state/count"
 export SLEY_PERF_CHECKRUN_ARGS_PREFIX="$shell_perf_state/args"

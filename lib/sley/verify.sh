@@ -118,6 +118,119 @@ _sley_project_manifest_commands() {
   esac
 }
 
+_sley_checkrun_verify_relevant() {
+  # Extension pre-filter for the `checkrun verify` bridge: return 0 when at
+  # least one selected path may trigger a Checkrun backend, 1 when every
+  # path provably no-ops across all five backends (cargo-audit, cargo-clippy,
+  # clang-tidy, golangci-lint, govulncheck). Skipping the bridge saves the
+  # Checkrun interpreter startup plus discovery on commits that cannot
+  # exercise it (pure-python/shell changes in repos without Go/Rust projects).
+  #
+  # The skip conditions mirror Checkrun's discovery exactly (checkrun
+  # `verify.py`): missing files are name-gated (`_go_scope_path`,
+  # `_rust_scope_path`, `_cpp_context_for_missing`), existing C/C++ files are
+  # extension-gated against the registry (`_cpp_file`), and existing files of
+  # any other type verify their nearest owning Go module / Cargo project
+  # (`_project_candidates` → `_nearest_project_root`), hence the ancestor
+  # walk below. A Python file inside a Go module DOES trigger golangci-lint,
+  # so extensions alone cannot decide — the walk is what keeps the filter
+  # behavior-transparent in mixed repos.
+  #
+  # Fail-closed: anything unrecognized keeps the bridge. Unknown extensions
+  # return relevant so a future Checkrun backend for a new extension cannot
+  # be skipped by an older Sley; if Checkrun ever verifies one of the
+  # known-irrelevant extensions listed below, remove it from that list.
+  local files="$1" file base suffix lowered dir orig_dir
+  local -A clean_dirs=()
+  while IFS= read -r file; do
+    [[ -n "$file" ]] || continue
+    base="${file##*/}"
+    # Manifest basenames select their backend even for missing files.
+    case "$base" in
+      go.mod | go.sum | Cargo.toml | Cargo.lock) return 0 ;;
+    esac
+    # Directory arguments trigger project-tree walks; symlinks resolve to
+    # trees this filter cannot see. Run the bridge for both.
+    [[ -d "$file" || -L "$file" ]] && return 0
+    case "$base" in
+      *.*) suffix="${base##*.}" ;;
+      *) return 0 ;; # absent extension info: fail closed
+    esac
+    # `pathlib` assigns no suffix to leading-dot-only (`.gitignore`) and
+    # trailing-dot (`foo.`) basenames: absent extension info, fail closed.
+    if [[ -z "$suffix" || "$base" == .* && "${base#.}" != *.* ]]; then
+      return 0
+    fi
+    # Relevant suffixes, case-sensitive like Checkrun's `path.suffix`
+    # comparisons: Go (`.go`), Rust (`.rs`), and the exact registry set for
+    # the `c`/`cpp` filetypes (`c cc cpp cxx h hpp hxx`).
+    case "$suffix" in
+      go | rs | c | h | cc | cpp | cxx | hpp | hxx) return 0 ;;
+    esac
+    # Known-irrelevant suffixes, matched case-insensitively: interpreted
+    # scripts, markup, data, docs, config, archives, and media. Anything
+    # that could plausibly be a compiled-language source stays unknown.
+    lowered="${suffix,,}"
+    case "$lowered" in
+      # Interpreted scripts and shells.
+      py | pyi | pyw | sh | bash | zsh | ksh | mksh | yash | dash | ash | csh | tcsh | fish | elvish | ion | xsh | nu) ;;
+      ps1 | psm1 | psd1 | bat | cmd | vbs | awk | sed | lua | pl | pm | pod | t | tcl | expect | exp) ;;
+      php | php3 | php4 | php5 | php7 | phps | phtml | phar | rb | rbw | rake | gemspec | erb | rhtml | haml | slim) ;;
+      coffee | r | jl | el | elc | scm | ss | rkt) ;;
+      # Web sources, styles, and templates.
+      js | jsx | mjs | cjs | ts | tsx | mts | cts | vue | svelte | astro | elm) ;;
+      # Note: the short Stylus suffix and the Clojure data-notation
+      # suffix are deliberately absent (the spell-checker flags those
+      # tokens); as unknown extensions they fail closed to running the
+      # bridge.
+      css | scss | sass | less | stylus | map) ;;
+      ejs | mustache | hbs | handlebars | twig | njk | nunjucks | liquid | j2 | jinja | jinja2 | tmpl | template | tpl | vm | ftl) ;;
+      # Markup and structured data.
+      html | htm | html5 | xhtml | shtml | xml | xsd | xsl | xslt | dtd | rng | rss | atom | svg) ;;
+      json | json5 | jsonc | webmanifest | har | yaml | yml | toml | ini | cnf | conf | config | properties | props | env) ;;
+      sql | ddl | dml | db | sqlite | sqlite3 | graphql | gql | proto | thrift | avro | cljc) ;;
+      # Docs, text, and man pages.
+      md | markdown | mdown | mkd | mkdn | rst | rest | textile | txt | text | nfo | adoc | asciidoc | wiki) ;;
+      tex | latex | sty | cls | bib | bbl | man | roff | 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9) ;;
+      pdf | djvu | epub | mobi | doc | docx | odt | xls | xlsx | xlsm | ods | ppt | pptx | odp | rtf) ;;
+      csv | tsv | psv | log | logs | out | err) ;;
+      # Images, audio, video, and fonts.
+      png | jpg | jpeg | jpe | jfif | gif | bmp | ico | webp | avif | heic | tif | tiff | psd | ai | eps) ;;
+      mp3 | wav | ogg | oga | flac | m4a | aac | opus | mp4 | m4v | mov | avi | mkv) ;;
+      ttf | otf | woff | woff2 | eot) ;;
+      # Archives, packages, keys, and checksums.
+      zip | tar | gz | tgz | bz2 | tbz | tbz2 | xz | txz | lz | lzma | zst | 7z | rar | cab | iso | dmg | whl | gem | deb | rpm) ;;
+      pem | crt | cer | der | p12 | pfx | key | pub | asc | gpg | sig | sum | md5 | sha1 | sha256 | lock) ;;
+      *) return 0 ;; # unknown extension: fail closed
+    esac
+    # A missing file with a known-irrelevant name triggers no backend
+    # (Checkrun name-gates missing paths); only existing files need the
+    # ancestor walk for nearest-module/project semantics.
+    [[ -e "$file" ]] || continue
+    case "$file" in
+      */*) orig_dir="${file%/*}" ;;
+      *) orig_dir="." ;;
+    esac
+    [[ -n "${clean_dirs[$orig_dir]:-}" ]] && continue
+    # Resolve physically: Checkrun resolves each path before walking
+    # ancestors, so a symlinked ancestor directory could hide a marker from
+    # a purely textual walk. Unresolvable paths fail closed.
+    dir=$(cd -P -- "$orig_dir" 2>/dev/null && pwd -P) || return 0
+    while true; do
+      [[ -n "${clean_dirs[$dir]:-}" ]] && break
+      # cargo-audit needs Cargo.toml AND Cargo.lock, but cargo-clippy needs
+      # only Cargo.toml, so one marker test covers both Rust backends.
+      [[ -f "$dir/go.mod" || -f "$dir/Cargo.toml" ]] && return 0
+      clean_dirs[$dir]=1
+      [[ "$dir" == "/" ]] && break
+      dir="${dir%/*}"
+      [[ -n "$dir" ]] || dir="/"
+    done
+    clean_dirs[$orig_dir]=1
+  done <<<"$files"
+  return 1
+}
+
 _sley_checkrun_verify_command() {
   local files="$1" args="" file checkrun_path cmd source
   checkrun_path=$(command -v checkrun 2>/dev/null) || return 0
@@ -130,6 +243,11 @@ _sley_checkrun_verify_command() {
     args+=" $(_sley_shell_quote "$file")"
   done <<<"$files"
   [[ -n "$args" ]] || return 0
+
+  # Skip the bridge when no selected path can trigger a Checkrun backend.
+  # Fail-closed: unknown/absent extension info, directories, symlinks, and
+  # files under a go.mod/Cargo.toml ancestor all keep the bridge.
+  _sley_checkrun_verify_relevant "$files" || return 0
 
   cmd="$(_sley_shell_quote "$checkrun_path") verify --$args"
   source="checkrun verify"
