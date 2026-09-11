@@ -5837,4 +5837,144 @@ _assert_eq "lazy: hook format-file from outside uses buffer dir" \
 _assert_eq "lazy: hook format-file from outside is quiet" "" "$lazy_outside_out"
 unset MOCK_LOG
 
+echo "=== sley: non-cached verify commands inherit the gate environment ==="
+
+# Characterization ahead of the login-shell default flip: with a mock HOME
+# (no startup files) a non-cached required command must observe the exact
+# inherited environment — exit codes, stdout, env vars, and PATH resolution
+# — identically before and after the change.
+shell_env_home=$(_tmpdir)
+mkdir -p "$shell_env_home/.local/bin"
+_copy_sley_libs "$shell_env_home"
+shell_env_repo=$(_new_repo)
+mkdir -p "$shell_env_repo/src" "$shell_env_repo/tests" "$shell_env_repo/.sley"
+printf 'initial\n' >"$shell_env_repo/src/app.txt"
+cat >"$shell_env_repo/.sley/verify.json" <<'EOF'
+{"rules": [{"paths": ["src/**"], "commands": ["./tests/dump.sh"]}, {"paths": ["src/other.txt"], "commands": ["./tests/exit3.sh"]}]}
+EOF
+cat >"$shell_env_repo/tests/dump.sh" <<'EOF'
+#!/usr/bin/env bash
+printf 'marker=%s\n' "${SLEY_PROBE_MARKER:-<unset>}"
+printf 'tool=%s\n' "$(command -v sley-probe-tool)"
+EOF
+cat >"$shell_env_repo/tests/exit3.sh" <<'EOF'
+#!/usr/bin/env bash
+echo hello-stdout
+exit 3
+EOF
+chmod +x "$shell_env_repo/tests/dump.sh" "$shell_env_repo/tests/exit3.sh"
+(cd "$shell_env_repo" && git add . && git commit -qm "seed shell env verify")
+printf 'changed\n' >>"$shell_env_repo/src/app.txt"
+shell_env_bin=$(_mock_bin)
+printf '#!/usr/bin/env bash\nexit 0\n' >"$shell_env_bin/sley-probe-tool"
+chmod +x "$shell_env_bin/sley-probe-tool"
+
+HOME="$shell_env_home" SLEY_PROBE_MARKER=hello PATH="$shell_env_bin:$PATH" \
+  _run_sley "$shell_env_repo" verify --run-required
+_assert_exit "shell env: non-cached command exits 0" 0 "$__SLEY_RC"
+_assert_contains "shell env: child inherits exported vars" \
+  "marker=hello" "$__SLEY_OUT"
+_assert_contains "shell env: child resolves inherited PATH" \
+  "tool=$shell_env_bin/sley-probe-tool" "$__SLEY_OUT"
+
+HOME="$shell_env_home" PATH="$shell_env_bin:$PATH" \
+  _run_sley "$shell_env_repo" verify --run-required --json
+_assert_exit "shell env: json run exits 0" 0 "$__SLEY_RC"
+_assert_contains "shell env: json reports passed with exit code" \
+  '"status":"passed","exit_code":0' "$__SLEY_OUT"
+
+printf 'other\n' >"$shell_env_repo/src/other.txt"
+(cd "$shell_env_repo" && git add src/other.txt && git commit -qm "seed exit3 fixture")
+printf 'changed\n' >>"$shell_env_repo/src/other.txt"
+HOME="$shell_env_home" PATH="$shell_env_bin:$PATH" \
+  _run_sley "$shell_env_repo" verify --run-required
+_assert_exit "shell env: failing command blocks" 1 "$__SLEY_RC"
+_assert_contains "shell env: stdout passes through" \
+  "hello-stdout" "$__SLEY_OUT"
+_assert_contains "shell env: exit code recorded" \
+  "exit code: 3" "$__SLEY_OUT"
+
+echo "=== sley: non-cached verify shell default with login opt-in ==="
+
+# Non-cached required commands run under `bash -c` with the inherited
+# environment; `"shell": "login"` opts a command back into startup files.
+# The mock HOME below marks login shells via `.bash_profile`.
+shell_login_home=$(_tmpdir)
+mkdir -p "$shell_login_home/.local/bin"
+_copy_sley_libs "$shell_login_home"
+cat >"$shell_login_home/.bash_profile" <<'EOF'
+export SLEY_LOGIN_MARKER=from-login-profile
+EOF
+shell_login_repo=$(_new_repo)
+mkdir -p "$shell_login_repo/src" "$shell_login_repo/tests" "$shell_login_repo/.sley"
+printf 'initial\n' >"$shell_login_repo/src/app.txt"
+cat >"$shell_login_repo/tests/shell-mode.sh" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "${SLEY_LOGIN_MARKER:-default-shell}" > tests/shell-mode
+EOF
+chmod +x "$shell_login_repo/tests/shell-mode.sh"
+cat >"$shell_login_repo/.sley/verify.json" <<'EOF'
+{"rules": [{"paths": ["src/**"], "commands": [{"cmd": "./tests/shell-mode.sh", "required": true}]}]}
+EOF
+(cd "$shell_login_repo" && git add . && git commit -qm "seed non-cached shell default")
+printf 'changed\n' >>"$shell_login_repo/src/app.txt"
+
+HOME="$shell_login_home" _run_sley "$shell_login_repo" verify --run-required
+_assert_exit "shell default: plain command exits 0" 0 "$__SLEY_RC"
+_assert_eq "shell default: plain command skips login startup" \
+  "default-shell" "$(cat "$shell_login_repo/tests/shell-mode")"
+
+cat >"$shell_login_repo/.sley/verify.json" <<'EOF'
+{"rules": [{"paths": ["src/**"], "commands": [{"cmd": "./tests/shell-mode.sh", "required": true, "shell": "login"}]}]}
+EOF
+(cd "$shell_login_repo" && git add .sley/verify.json && git commit -qm "opt into login shell")
+rm -f "$shell_login_repo/tests/shell-mode"
+printf 'changed again\n' >>"$shell_login_repo/src/app.txt"
+
+HOME="$shell_login_home" _run_sley "$shell_login_repo" verify --run-required
+_assert_exit "shell default: login opt-in exits 0" 0 "$__SLEY_RC"
+_assert_eq "shell default: login opt-in sources startup files" \
+  "from-login-profile" "$(cat "$shell_login_repo/tests/shell-mode")"
+
+cat >"$shell_login_repo/.sley/verify.json" <<'EOF'
+{"rules": [{"paths": ["src/**"], "commands": [{"cmd": "./tests/shell-mode.sh", "required": true, "shell": "fish"}]}]}
+EOF
+(cd "$shell_login_repo" && git add .sley/verify.json && git commit -qm "seed invalid shell")
+printf 'changed once more\n' >>"$shell_login_repo/src/app.txt"
+
+HOME="$shell_login_home" _run_sley "$shell_login_repo" verify --run-required
+_assert_exit "shell default: invalid shell value blocks" 1 "$__SLEY_RC"
+_assert_contains "shell default: invalid shell reports source" \
+  "invalid verify registry" "$__SLEY_OUT"
+
+# Same command text with different shells must not merge into one grouped
+# execution: the shell is part of the grouping identity.
+shell_group_repo=$(_new_repo)
+mkdir -p "$shell_group_repo/src" "$shell_group_repo/tests" "$shell_group_repo/.sley"
+printf 'initial\n' >"$shell_group_repo/src/app.txt"
+cat >"$shell_group_repo/tests/count.sh" <<'EOF'
+#!/usr/bin/env bash
+count=0
+[[ -f tests/count ]] && count=$(cat tests/count)
+printf '%s\n' "$((count + 1))" > tests/count
+EOF
+chmod +x "$shell_group_repo/tests/count.sh"
+cat >"$shell_group_repo/.sley/verify.json" <<'EOF'
+{"rules": [
+  {"paths": ["src/**"], "commands": [{"cmd": "./tests/count.sh", "required": true}]},
+  {"paths": ["src/**"], "commands": [{"cmd": "./tests/count.sh", "required": true, "shell": "login"}]}
+]}
+EOF
+(cd "$shell_group_repo" && git add . && git commit -qm "seed shell grouping")
+printf 'changed\n' >>"$shell_group_repo/src/app.txt"
+
+HOME="$shell_login_home" _run_sley "$shell_group_repo" verify --run-required
+_assert_exit "shell default: differing shells both run" 0 "$__SLEY_RC"
+_assert_eq "shell default: differing shells do not merge" \
+  "2" "$(cat "$shell_group_repo/tests/count")"
+
+HOME="$shell_login_home" _run_sley "$shell_group_repo" verify --json
+_assert_contains "shell default: discovery carries shell through" \
+  '"shell":"login"' "$__SLEY_OUT"
+
 _test_summary

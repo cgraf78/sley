@@ -327,7 +327,7 @@ _sley_verify_validate_config() {
       (type == "string" and length > 0) or
       (
         type == "object" and
-        keys_in(["cmd", "command", "enabled", "kind", "required", "tier", "cache"]) and
+        keys_in(["cmd", "command", "enabled", "kind", "required", "tier", "shell", "cache"]) and
         ((has("cmd") | not) or (.cmd | type == "string" and length > 0)) and
         ((has("command") | not) or (.command | type == "string" and length > 0)) and
         (
@@ -339,6 +339,7 @@ _sley_verify_validate_config() {
         ((has("kind") | not) or (.kind | type == "string")) and
         ((has("required") | not) or (.required | type == "boolean")) and
         ((has("tier") | not) or (.tier | IN("fast", "slow", "full", "suggested"))) and
+        ((has("shell") | not) or (.shell | IN("default", "login"))) and
         ((has("cache") | not) or (.cache | cache))
       );
     def rule:
@@ -468,6 +469,7 @@ _sley_verify_registry_commands() {
               "required": (if has("required") then .required else true end),
               "tier": (.tier // "fast")
             }
+            + (if ((.shell // null) | type) == "string" then {"shell": .shell} else {} end)
             + (if ((.cache // null) | type) == "object" then {"cache": .cache} else {} end)
           else
             {"command": ""}
@@ -511,6 +513,8 @@ for line in os.fdopen(3):
     if "tier" in item and (not isinstance(item["tier"], str) or item["tier"] not in TIERS):
         sys.exit(1)
     if "required" in item and not isinstance(item["required"], bool):
+        sys.exit(1)
+    if "shell" in item and (not isinstance(item["shell"], str) or item["shell"] not in ("default", "login")):
         sys.exit(1)
 PY
 }
@@ -557,10 +561,12 @@ for line in os.fdopen(3):
         continue
     item = json.loads(line)
     cache = item.get("cache")
+    shell = item.get("shell")
     key = json.dumps(
         {
             "command": item["command"],
             "kind": item["kind"],
+            "shell": shell if isinstance(shell, str) else None,
             "cache": cache if isinstance(cache, dict) else None,
         },
         sort_keys=True,
@@ -575,6 +581,8 @@ for line in os.fdopen(3):
             "sources": [],
             "source_contexts": [],
         }
+        if isinstance(shell, str):
+            groups[key]["shell"] = shell
         if isinstance(cache, dict):
             groups[key]["cache"] = cache
         order.append(key)
@@ -828,7 +836,7 @@ _sley_verify_run_required_impl() {
   local required command_item command tier exit_code failed=0 status result_status
   local results_json="" first=1 cache_enabled payload lookup cache_status receipt pre_key post_lookup post_key write_result lock_dir
   local passed_count=0 cached_count=0 failed_count=0 skipped_slow_count=0
-  local shell_mode shell_flag
+  local shell_mode shell_flag shell_field
 
   # Cleanup-on-signal traps. Normal control flow releases `lock_dir` at every
   # branch below, but a SIGINT (Ctrl-C), SIGTERM, or SIGHUP between the
@@ -888,13 +896,18 @@ _sley_verify_run_required_impl() {
     tier=$(printf '%s' "$command_item" | jq -r '.tier // "fast"')
     [[ -n "$command" ]] || continue
     cache_enabled=0
-    shell_mode="login"
+    # Required commands run under `bash -c` with the gate's inherited
+    # environment; a login shell (~200ms of profile/startup cost here) is
+    # opt-in per command. Cached commands keep their established
+    # `cache.shell` knob; non-cached commands use the top-level `shell`
+    # field. When both are present on a cached command, `cache.shell`
+    # wins: it is the historical knob and also feeds the cache key.
+    shell_mode=$(printf '%s' "$command_item" | jq -r '.shell // "default"')
+    shell_field="shell"
     if printf '%s' "$command_item" | jq -e '.cache.enabled == true' >/dev/null 2>&1; then
       cache_enabled=1
-      # Non-cached commands keep the historical login-shell behavior. Cached
-      # commands default to `bash -c` so startup files are not invisible cache
-      # inputs; `cache.shell: "login"` is an explicit registry choice.
       shell_mode=$(printf '%s' "$command_item" | jq -r '.cache.shell // "default"')
+      shell_field="cache.shell"
       payload=$(_sley_verify_cache_payload "$files" "$command_item") || {
         echo "sley verify: failed to build cache key input for command: $command" >&2
         return 1
@@ -990,7 +1003,7 @@ _sley_verify_run_required_impl() {
       *)
         _sley_verify_cache_lock_release "$lock_dir"
         lock_dir=""
-        echo "sley verify: unsupported cache.shell for command: $command" >&2
+        echo "sley verify: unsupported $shell_field for command: $command" >&2
         return 1
         ;;
     esac

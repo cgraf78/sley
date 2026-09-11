@@ -1346,4 +1346,40 @@ _assert_eq "hook perf: bare env never probes sl" \
   "0" "$(cat "$hook_perf_slcount")"
 unset SLEY_PERF_HOOK_GIT_LOG SLEY_PERF_HOOK_MOCKBIN SLEY_PERF_HOOK_SL_COUNT
 
+echo "=== sley perf: required commands avoid login shells unless asked ==="
+
+# A counting `.bash_profile` proves no `bash -lc` runs for default-shell
+# required commands. No wall-clock assertions — login-shell count is the
+# signal, and the bridge-executed assertion below guards vacuity.
+shell_perf_repo=$(_new_perf_repo)
+printf 'x = 1\n' >"$shell_perf_repo/file.txt"
+(cd "$shell_perf_repo" && git add file.txt && git commit -qm "seed shell perf")
+printf 'changed\n' >>"$shell_perf_repo/file.txt"
+(cd "$shell_perf_repo" && git add file.txt)
+shell_perf_state=$(_tmpdir)
+export SLEY_PERF_CHECKRUN_COUNT_FILE="$shell_perf_state/count"
+export SLEY_PERF_CHECKRUN_ARGS_PREFIX="$shell_perf_state/args"
+export SLEY_PERF_CHECKRUN_HOME_PREFIX="$shell_perf_state/home"
+printf '0\n' >"$SLEY_PERF_CHECKRUN_COUNT_FILE"
+shell_perf_home="$shell_perf_repo/.home"
+mkdir -p "$shell_perf_home"
+export SLEY_PERF_LOGIN_COUNT_FILE="$shell_perf_state/logins"
+printf '0\n' >"$SLEY_PERF_LOGIN_COUNT_FILE"
+cat >"$shell_perf_home/.bash_profile" <<'MOCK'
+count=$(cat "$SLEY_PERF_LOGIN_COUNT_FILE")
+printf '%s\n' "$((count + 1))" >"$SLEY_PERF_LOGIN_COUNT_FILE"
+MOCK
+shell_perf_rc=0
+(cd "$shell_perf_repo" && HOME="$shell_perf_home" \
+  XDG_CONFIG_HOME="$shell_perf_repo/.xdg-config" XDG_CACHE_HOME="$shell_perf_repo/.xdg-cache" \
+  GIT_CONFIG_GLOBAL="$shell_perf_repo/.gitconfig-test" \
+  "$SLEY" verify --run-required >/dev/null 2>&1) || shell_perf_rc=$?
+_assert_exit "shell perf: verify run exits 0" 0 "$shell_perf_rc"
+_assert_eq "shell perf: checkrun bridge executed" \
+  "1" "$(cat "$SLEY_PERF_CHECKRUN_COUNT_FILE")"
+_assert_eq "shell perf: no login shells spawned" \
+  "0" "$(cat "$SLEY_PERF_LOGIN_COUNT_FILE")"
+unset SLEY_PERF_CHECKRUN_COUNT_FILE SLEY_PERF_CHECKRUN_ARGS_PREFIX
+unset SLEY_PERF_CHECKRUN_HOME_PREFIX SLEY_PERF_LOGIN_COUNT_FILE
+
 _test_summary
