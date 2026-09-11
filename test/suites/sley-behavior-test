@@ -5761,10 +5761,12 @@ detect_hint_mock=""
 
 echo "=== sley: verify/ready load on demand; hook file path needs neither ==="
 
-# The `verify`/`ready` libraries load when their public wrappers run — never
-# as a side effect of sourcing `sley.sh` for hook work. These pin the
-# consumer-visible contract: sourced hook flows work, and sourced
-# verify/ready flows load transparently (including repeated calls).
+# With `SLEY_LAZY_MODULES=1` (as the CLI sets), the `verify`/`ready`
+# libraries load when their public wrappers run — never as a side effect of
+# sourcing `sley.sh` for hook work. These pin the consumer-visible lazy
+# contract: sourced hook flows work, and sourced verify/ready flows load
+# transparently (including repeated calls). Without the flag, sourcing is
+# eager (the white-box suites pin that by driving privates directly).
 lazy_repo=$(_new_repo)
 printf 'x = 1\n' >"$lazy_repo/hook.py"
 (cd "$lazy_repo" && git add hook.py && git commit -qm "seed lazy loading fixture")
@@ -5780,7 +5782,7 @@ chmod +x "$lazy_bin/autoformat"
 export MOCK_LOG="$lazy_log"
 lazy_sourced_out=$(
   cd "$lazy_repo" &&
-    HOME="$lazy_repo" PATH="$lazy_bin:$PATH" bash -c '
+    HOME="$lazy_repo" PATH="$lazy_bin:$PATH" SLEY_LAZY_MODULES=1 bash -c '
       source "$SLEY_REPO_ROOT/lib/sley/sley.sh"
       sley_hook_init
       sley_hook_format_file hook.py
@@ -5794,7 +5796,7 @@ _assert_eq "lazy: sourced hook flow is quiet" "" "$lazy_sourced_out"
 
 lazy_verify_out=$(
   cd "$lazy_repo" &&
-    HOME="$lazy_repo" PATH="$lazy_bin:$PATH" bash -c '
+    HOME="$lazy_repo" PATH="$lazy_bin:$PATH" SLEY_LAZY_MODULES=1 bash -c '
       source "$SLEY_REPO_ROOT/lib/sley/sley.sh"
       sley_verify
       sley_verify --json
@@ -5807,7 +5809,7 @@ _assert_contains "lazy: sourced sley_verify discovers commands" \
 
 lazy_ready_out=$(
   cd "$lazy_repo" &&
-    HOME="$lazy_repo" PATH="$lazy_bin:$PATH" bash -c '
+    HOME="$lazy_repo" PATH="$lazy_bin:$PATH" SLEY_LAZY_MODULES=1 bash -c '
       source "$SLEY_REPO_ROOT/lib/sley/sley.sh"
       sley_ready --help
     ' 2>&1

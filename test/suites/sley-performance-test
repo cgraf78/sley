@@ -1256,15 +1256,25 @@ unset SLEY_PERF_GIT_LOG SLEY_PERF_MOCKBIN MOCK_SL_ROOT
 
 echo "=== sley perf: hook path avoids verify/ready parse and launcher probe ==="
 
-# Sourcing the library must not define verify/ready entry points; the
-# wrappers load them on first use (proven functionally by the lazy behavior
-# block). No wall-clock assertions — definition presence is the signal.
+# Sourcing the library with `SLEY_LAZY_MODULES=1` (as the CLI does) must
+# not define verify/ready entry points; the wrappers load them on first
+# use (proven functionally by the lazy behavior block). Without the flag,
+# sourcing defines everything eagerly (pinned by white-box suites).
+# No wall-clock assertions — definition presence is the signal.
 lazy_perf_defined=$(
-  SLEY_REPO_ROOT="$SLEY_REPO_ROOT" bash -c '
+  SLEY_REPO_ROOT="$SLEY_REPO_ROOT" SLEY_LAZY_MODULES=1 bash -c '
     source "$SLEY_REPO_ROOT/lib/sley/sley.sh" || exit 3
     echo "verify=$(declare -F _sley_verify)"
     echo "ready=$(declare -F _sley_ready)"
     echo "hook=$(declare -F _sley_hook_format_file)"
+  '
+)
+lazy_perf_eager=$(
+  unset SLEY_LAZY_MODULES
+  SLEY_REPO_ROOT="$SLEY_REPO_ROOT" bash -c '
+    source "$SLEY_REPO_ROOT/lib/sley/sley.sh" || exit 3
+    echo "verify=$(declare -F _sley_verify)"
+    echo "ready=$(declare -F _sley_ready)"
   '
 )
 _assert_contains "lazy perf: sourcing leaves _sley_verify undefined" \
@@ -1277,6 +1287,10 @@ _assert_not_contains "lazy perf: sourcing defines no _sley_ready body" \
   "_sley_ready" "$lazy_perf_defined"
 _assert_contains "lazy perf: sourcing still defines hook entry points" \
   "_sley_hook_format_file" "$lazy_perf_defined"
+_assert_contains "lazy perf: eager sourcing defines verify" \
+  "_sley_verify" "$lazy_perf_eager"
+_assert_contains "lazy perf: eager sourcing defines ready" \
+  "_sley_ready" "$lazy_perf_eager"
 
 # With a caller `_REPO_TYPE` override the launcher hint is never consumed,
 # so the legacy path probes twice (launcher + hook-init). The skip must cut

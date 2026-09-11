@@ -30,6 +30,12 @@ _bin_dir=$(_sley_script_dir "${BASH_SOURCE[0]}") ||
   _sley_die "cannot resolve executable path"
 _sley_dir="$_bin_dir/../lib/sley"
 
+# Defer the heavy verify/ready modules: CLI hot paths (`hook format-file`,
+# `status`, ...) skip ~10ms of parse, and the `verify`/`ready` commands
+# load their module on first use. Sourced consumers keep eager loading
+# (the default) so the full API is defined immediately after sourcing.
+# A preset value (e.g. `SLEY_LAZY_MODULES=0` for debugging) is honored.
+SLEY_LAZY_MODULES="${SLEY_LAZY_MODULES:-1}"
 # shellcheck disable=SC1091 # resolved relative to this executable.
 source "$_sley_dir/sley.sh"
 
