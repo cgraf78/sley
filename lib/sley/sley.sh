@@ -1082,6 +1082,13 @@ _sley_secrets_parallel_record_signal() {
     # Keep the exact-child proof and signal in one shell. A caller-defined
     # `kill` function must not turn cancellation into an unbounded wait.
     builtin kill -KILL "$wait_pid" 2>/dev/null || true
+    # Reap the exact child here, while the handler's stderr stays contained.
+    # Otherwise Bash's post-trap zombie checkpoint can collect this KILLed job
+    # and print its asynchronous "Killed" notice to the caller's real stderr
+    # (attributed to the next command's line number), racing the guarded
+    # ownership wait below. The later exact-PID waits then find no such job
+    # and stay silent; their status is discarded on the signal path anyway.
+    builtin wait "$wait_pid" 2>/dev/null || true
   fi
 }
 
