@@ -37,7 +37,9 @@ Run the read-only fast lint and validation phase for selected files. Use
 to bypass configured user lint exclusions for this invocation.
 .TP
 .B secrets
-Run the configured redacted secret scan.
+Run the configured redacted secret scan over selected changed files. With
+.BI --message-file " path"
+as the first argument, scan that commit message file instead of changed files.
 .TP
 .B verify
 Discover and run broader local verification commands from manifests, verify
@@ -104,6 +106,56 @@ from the default config directory.
 .B SLEY_VERIFY_CACHE_DIR
 Explicit directory for local verify success receipts.
 .TP
+.B SLEY_VERIFY_STATE_DIR
+Optional directory where
+.B sley ready
+touches
+.I last-verify-pass
+when its verify phase passes after running or reusing at least one command.
+Agent integrations use the marker to recognize gate-verified runs without
+parsing output.
+.TP
+.B SLEY_SECRETS_JOBS
+Maximum number of concurrent
+.B gitleaks
+processes when a secret scan has multiple independent scan items. Defaults to
+the online CPU count (4 if unknown), capped at 8; a non-numeric or
+smaller-than-1 value means 1.
+.TP
+.B SLEY_GIT_COMMIT_GATE
+Executable path that the provider-owned Git hook launchers run instead of the
+bundled
+.I share/sley/hooks/git/sley-commit-gate
+readiness gate.
+.TP
+.B SLEY_COMMIT_MESSAGE_TEMPLATE
+Readable Git-compatible plaintext template whose declared sections the Git
+.I commit-msg
+launcher requires. Set at most one of
+.B SLEY_COMMIT_MESSAGE_TEMPLATE
+and
+.BR SLEY_COMMIT_MESSAGE_VALIDATOR .
+.TP
+.B SLEY_COMMIT_MESSAGE_VALIDATOR
+Executable that the Git
+.I commit-msg
+launcher runs with one commit message file path for advanced validation. Set
+at most one of
+.B SLEY_COMMIT_MESSAGE_TEMPLATE
+and
+.BR SLEY_COMMIT_MESSAGE_VALIDATOR .
+.TP
+.B SLEY_LAZY_MODULES
+Internal load-time switch. The
+.B sley
+executable sets it to
+.B 1
+by default so verify and readiness modules load on first use; set it to
+.B 0
+to load them eagerly when debugging. Sourced consumers load eagerly unless it
+is
+.BR 1 .
+.TP
 .B XDG_CONFIG_HOME
 Absolute base directory for Sley extensions, lint-ignore paths, and user verify
 registries. An empty or relative value falls back to
@@ -126,6 +178,17 @@ must also be explicit when no default config root can be resolved.
 .TP
 .I share/sley/schemas/verify.schema.json
 JSON Schema for Sley verify registry files.
+.TP
+.I .sley/verify.json
+Repository-owned verify registry, discovered in every ancestor directory of a
+selected changed file up to the repository root and before user registries.
+Its rules apply to the containing repository, and its path patterns may be
+relative to the repository root or to the directory containing
+.IR .sley .
+.TP
+.I .sley/verify.d/*.json
+Additional repository-owned verify registries discovered alongside
+.IR .sley/verify.json .
 .TP
 .I $XDG_CONFIG_HOME/sley/extensions.d/*.sh
 Ordered extension files for local hook and verify policy.
@@ -154,7 +217,26 @@ The requested workflow phase succeeded.
 A selected check, secret scan, or verification command failed.
 .TP
 .B 2
-Usage error or invalid local configuration.
+Usage error, invalid local configuration, a repository or path scope that
+cannot be evaluated, or a required tool that is unavailable, such as the
+formatter, linter,
+.BR gitleaks ,
+or the
+.B jq
+or
+.B python3
+helpers that JSON output and
+.B verify
+require. An invalid verify registry, or
+.B jq
+missing when registry files exist, makes
+.B verify
+exit 1 instead.
+For
+.BR ready ,
+an exit status of 2 from the status or verify phase, or any unexpected phase
+exit status, is an error; other phases that exit 2 are reported as unavailable
+without failing the aggregate report.
 .SH SEE ALSO
 .BR checkrun (1),
 .BR autoformat (1),

@@ -68,6 +68,7 @@ sley check        # read-only lint/validation phase
 sley secrets      # redacted secret scan where supported
 sley verify       # local verification command discovery and execution
 sley ready        # aggregate pre-submit readiness report
+sley hook         # low-level editor, agent, and VCS hook plumbing
 ```
 
 `sley verify` reports where each suggested command came from. Human output labels
@@ -232,6 +233,13 @@ project analyzer policy. Sley passes selected changed files to
 Repo-specific workflow commands still belong in Sley's verify registry or
 extension API rather than manifest guessing.
 
+Repository-owned verify registries live at `.sley/verify.json` and
+`.sley/verify.d/*.json` in any ancestor directory of a selected changed file,
+up to and including the repository root. Their rules apply to the containing
+repository without repo matching, and their path patterns may be relative to
+either the repository root or the directory containing `.sley`. They are
+discovered before user registries.
+
 User verify registries live at `$XDG_CONFIG_HOME/sley/verify.json` and
 `$XDG_CONFIG_HOME/sley/verify.d/*.json`, falling back to the same paths under
 `~/.config`. Set `SLEY_VERIFY_CONFIG` to add one explicit registry file or
@@ -295,7 +303,9 @@ Public functions:
   `vim.diagnostic` records.
 
 Supported options are intentionally small: `command`, `args`, `condition`,
-`source`, `default_severity`, and pass-through plugin fields. The module does
+`source`, `default_severity`, `parser_opts` (a complete `parse_diagnostics`
+options table for `nvim_lint_linter` that replaces `source` and
+`default_severity`), and pass-through plugin fields. The module does
 not choose filetypes, configure keymaps, resolve shdeps dependencies, inspect
 workspace roots, or decide local disable flags.
 
@@ -339,9 +349,10 @@ The former `repo-check` surface has been removed. New code should not introduce
 - `share/sley/vscode/` owns the versioned VS Code integration payload and its
   consumer contract.
 
-Neovim exposes `:SleyStatus`, `:SleyCheck`, and `:SleyReady` for human-facing
-repo workflows. Save-time formatting and diagnostics use the same hook APIs as
-agent and VCS hooks.
+Sley does not define Neovim user commands. Consuming configs may wrap
+`sley status`, `sley check`, or `sley ready` in their own commands for
+human-facing repo workflows. Save-time formatting and diagnostics use the same
+hook APIs as agent and VCS hooks.
 
 ## License
 

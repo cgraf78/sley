@@ -44,6 +44,26 @@ shell_completion_output=$(
     COMP_CWORD=2
     _sley_shell_complete
     printf "ready_opt:%s\n" "${COMPREPLY[@]}"
+    COMP_WORDS=(sley secrets "")
+    COMP_CWORD=2
+    _sley_shell_complete
+    printf "secrets_opt:%s\n" "${COMPREPLY[@]}"
+    COMP_WORDS=(sley status "")
+    COMP_CWORD=2
+    _sley_shell_complete
+    printf "status_opt:%s\n" "${COMPREPLY[@]}"
+    COMP_WORDS=(sley hook "")
+    COMP_CWORD=2
+    _sley_shell_complete
+    printf "hook_cmd:%s\n" "${COMPREPLY[@]}"
+    COMP_WORDS=(sley hook lint-file "")
+    COMP_CWORD=3
+    _sley_shell_complete
+    printf "hook_arg:%s\n" "${COMPREPLY[@]}"
+    COMP_WORDS=(sley secrets --commit "")
+    COMP_CWORD=3
+    _sley_shell_complete
+    printf "secrets_later:%s\n" "${COMPREPLY[@]}"
     printf "schema:%s\n" "${SLEY_VERIFY_SCHEMA:-}"
     printf "schema_fn:%s\n" "$(sley_verify_schema_path)"
   '
@@ -66,6 +86,24 @@ _assert_contains "shell api: check completion includes --no-lint-ignore" \
   "check_opt:--no-lint-ignore" "$shell_completion_output"
 _assert_contains "shell api: ready completion includes --no-lint-ignore" \
   "ready_opt:--no-lint-ignore" "$shell_completion_output"
+_assert_contains "shell api: command completion includes hook" \
+  "cmd:hook" "$shell_completion_output"
+_assert_contains "shell api: verify completion includes --run-required" \
+  "opt:--run-required" "$shell_completion_output"
+_assert_contains "shell api: verify completion includes --cache-stats" \
+  "opt:--cache-stats" "$shell_completion_output"
+_assert_contains "shell api: secrets completion includes --message-file" \
+  "secrets_opt:--message-file" "$shell_completion_output"
+_assert_contains "shell api: status completion includes --path" \
+  "status_opt:--path" "$shell_completion_output"
+_assert_contains "shell api: hook completion includes lint-file" \
+  "hook_cmd:lint-file" "$shell_completion_output"
+_assert_not_contains "shell api: hook subcommands only complete first" \
+  "hook_arg:lint-file" "$shell_completion_output"
+_assert_contains "shell api: later secrets completion keeps scope flags" \
+  "secrets_later:--path" "$shell_completion_output"
+_assert_not_contains "shell api: --message-file only completes first" \
+  "secrets_later:--message-file" "$shell_completion_output"
 _assert_contains "shell api: exposes verify schema env var" \
   "schema:$SLEY_REPO_ROOT/share/sley/schemas/verify.schema.json" \
   "$shell_completion_output"
@@ -119,6 +157,21 @@ if command -v zsh >/dev/null 2>&1; then
       words=(sley check "")
       CURRENT=3
       _sley_zsh_complete
+      words=(sley hook "")
+      CURRENT=3
+      _sley_zsh_complete
+      words=(sley hook lint-file "")
+      CURRENT=4
+      compadd() {
+        while [[ "$1" == "--" ]]; do
+          shift
+        done
+        printf "late:%s\n" "$@"
+      }
+      _sley_zsh_complete
+      words=(sley secrets --commit "")
+      CURRENT=4
+      _sley_zsh_complete
       print -r -- "registered=${+functions[_sley_zsh_complete]}"
     '
   )
@@ -138,6 +191,14 @@ if command -v zsh >/dev/null 2>&1; then
     "match:--json" "$zsh_completion_output"
   _assert_contains "shell api: zsh check completion includes --no-lint-ignore" \
     "match:--no-lint-ignore" "$zsh_completion_output"
+  _assert_contains "shell api: zsh hook completion includes lint-file" \
+    "match:lint-file" "$zsh_completion_output"
+  _assert_not_contains "shell api: zsh hook subcommands only complete first" \
+    "late:lint-file" "$zsh_completion_output"
+  _assert_contains "shell api: zsh later secrets completion keeps scope flags" \
+    "late:--path" "$zsh_completion_output"
+  _assert_not_contains "shell api: zsh --message-file only completes first" \
+    "late:--message-file" "$zsh_completion_output"
   zsh_deferred_output=$(
     SLEY_REPO_ROOT="$SLEY_REPO_ROOT" zsh -fc '
       source "$SLEY_REPO_ROOT/share/sley/shell.sh"
