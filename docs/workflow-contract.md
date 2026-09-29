@@ -62,9 +62,11 @@ built-in `checkrun verify -- <changed-files>` bridge. Verification is allowed
 to be broader or slower than `sley check` because callers choose it as an
 explicit readiness phase.
 
-`sley ready` composes the selected phases. It may include fix, check, secrets,
-and verify according to caller flags and hook policy, but it should continue to
-call public Sley and Checkrun surfaces rather than duplicating their internals.
+`sley ready` composes the selected phases: status, check, secrets, and verify,
+plus any phases an extension adds, minus any the caller excludes. `--fix` runs
+formatting as a pre-step before those phases rather than as a phase. Ready
+should continue to call public Sley and Checkrun surfaces rather than
+duplicating their internals.
 
 ## Low-Level Tool Invocation
 

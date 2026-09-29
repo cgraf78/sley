@@ -80,22 +80,37 @@ sley_verify_schema_path() {
 }
 
 _sley_shell_commands() {
-  printf '%s\n' "status changes fix check secrets verify ready help"
+  printf '%s\n' "status changes fix check secrets verify ready hook help"
 }
 
+# $1 is the command word; $2 is the 1-based position of the word being
+# completed after it. Position matters where the parser does: hook
+# subcommands and `secrets --message-file` are only accepted first.
 _sley_shell_options() {
   case "$1" in
-    status)
-      printf '%s\n' "--json"
-      ;;
     ready)
       printf '%s\n' "--fix --full --force --exclude --quiet --no-lint-ignore --commit --include-untracked --repo-wide --path --json"
       ;;
     check)
       printf '%s\n' "--no-lint-ignore --commit --include-untracked --repo-wide --path --json"
       ;;
-    changes | fix | secrets | verify)
+    verify)
+      printf '%s\n' "--run-required --full --force --explain-cache --cache-stats --commit --include-untracked --repo-wide --path --json"
+      ;;
+    secrets)
+      if [ "${2:-1}" -eq 1 ]; then
+        printf '%s\n' "--message-file --commit --include-untracked --repo-wide --path --json"
+      else
+        printf '%s\n' "--commit --include-untracked --repo-wide --path --json"
+      fi
+      ;;
+    status | changes | fix)
       printf '%s\n' "--commit --include-untracked --repo-wide --path --json"
+      ;;
+    hook)
+      if [ "${2:-1}" -eq 1 ]; then
+        printf '%s\n' "changed-files format-file lint-file format lint validate validate-message"
+      fi
       ;;
   esac
 }
@@ -119,7 +134,7 @@ _sley_shell_complete() {
     return 0
   fi
 
-  _sley_shell_complete_reply "$(_sley_shell_options "$cmd")" "$cur"
+  _sley_shell_complete_reply "$(_sley_shell_options "$cmd" "$((COMP_CWORD - 1))")" "$cur"
 }
 
 _sley_zsh_complete() {
@@ -131,7 +146,7 @@ _sley_zsh_complete() {
     candidates="$(_sley_shell_commands)"
   else
     cmd="${words[2]:-}"
-    candidates="$(_sley_shell_options "$cmd")"
+    candidates="$(_sley_shell_options "$cmd" "$((CURRENT - 2))")"
   fi
 
   for match in $candidates; do
