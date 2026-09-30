@@ -30,6 +30,14 @@ _sley_ready_run_phase() {
   esac
 }
 
+_sley_ready_phase_payload() {
+  # Runs inside the phase guardian's payload subshell, so the assignment
+  # cannot leak into the worker.
+  # shellcheck disable=SC2034 # read by `_sley_init_repo` in this subshell.
+  SLEY_ORIGINAL_PWD="$_SLEY_CALLER_PWD"
+  _sley_ready_run_phase "$@"
+}
+
 _sley_ready_usage() {
   cat <<'EOF'
 Usage: sley ready [OPTIONS]
@@ -1223,44 +1231,90 @@ _sley_ready_run_format_file_list() {
   return 0
 }
 
+_sley_ready_reap() {
+  local child_pid="$1" wait_rc deferred_before
+  # `wait` returns above 128 both when a trapped signal interrupts it and when
+  # the child itself died from a signal, and Bash keeps returning a reaped
+  # child's saved status. Only a deferred cancellation trap can interrupt this
+  # wait, so retry exactly when `_sley_ready_cancel_impl` ran during it; an
+  # interrupted wait then cannot abandon a child that is still running.
+  while :; do
+    deferred_before=${_sley_ready_deferred_signals:-0}
+    wait "$child_pid" 2>/dev/null && return 0
+    wait_rc=$?
+    [[ "$wait_rc" -gt 128 ]] || return 0
+    [[ "${_sley_ready_deferred_signals:-0}" != "$deferred_before" ]] || return 0
+  done
+}
+
+_sley_ready_abort_launch() {
+  local child_pid="$1" child_control="$2"
+  # Keep the abort file and control directory until the guardian is reaped. A
+  # cancellation signal only records a pending status while a launch is in
+  # progress, so removing the directory after an interrupted wait would let a
+  # guardian that has not yet observed the abort poll forever. If the abort
+  # file cannot be written, removing the directory is the guardian's other
+  # exit condition.
+  : >"$child_control/abort" 2>/dev/null || rm -rf -- "$child_control"
+  _sley_ready_reap "$child_pid"
+  rm -rf -- "$child_control"
+}
+
+_sley_ready_guardian() {
+  local child_control="$1" child_rc
+  shift
+  # Body of every managed process-group leader. It waits for the worker to
+  # publish `run` after recording ownership, then runs the payload in a
+  # foreground child and keeps its immutable cancellation traps.
+  _sley_ready_guardian_status=""
+  trap '_sley_ready_guardian_cancel 129' HUP
+  trap '_sley_ready_guardian_cancel 130' INT
+  trap '_sley_ready_guardian_cancel 143' TERM
+  # A vanished control directory also ends the wait: an abandoned launch must
+  # never leave an unowned guardian polling after the worker is gone.
+  while [[ -d "$child_control" && ! -e "$child_control/run" &&
+    ! -e "$child_control/abort" && ! -e "$_sley_ready_worker_dead" ]]; do
+    sleep 0.01
+  done
+  [[ -e "$child_control/run" && ! -e "$child_control/abort" &&
+    ! -e "$_sley_ready_worker_dead" ]] || exit 2
+  # Keep hook-owned trap changes inside a foreground child. This process-group
+  # leader remains a guardian with immutable cancellation traps, so graceful
+  # hook cleanup cannot replace the guardian's final escalation behavior.
+  if (
+    # A cancellation trap that ran during the gate wait records its status and
+    # returns so the leader survives for escalation. Check it in the payload
+    # process: a signal handled before this fork is inherited here and stops
+    # the payload, while one handled after it is enforced by the guardian's
+    # group kill. Otherwise the payload would start after cancellation with
+    # the handler's ignored TERM, INT, and HUP dispositions.
+    [[ -z "$_sley_ready_guardian_status" ]] || exit "$_sley_ready_guardian_status"
+    _sley_ready_run_guarded_command "$@"
+  ); then
+    child_rc=0
+  else
+    child_rc=$?
+  fi
+  if [[ -n "$_sley_ready_guardian_status" ]]; then
+    exit "$_sley_ready_guardian_status"
+  fi
+  exit "$child_rc"
+}
+
 _sley_ready_run_owned() {
-  local child_rc started_pid started_identity started_group child_control child_run child_abort
+  local child_rc started_pid started_identity started_group child_control child_run
   local child_had_monitor=0
   local _sley_ready_owned_record=""
   child_control=$(mktemp -d "$_sley_ready_status_dir/child.XXXXXX") || return 2
   child_run=$child_control/run
-  child_abort=$child_control/abort
   _sley_ready_launching_child=1
   [[ "$-" == *m* ]] && child_had_monitor=1
   set -m
-  (
-    _sley_ready_guardian_status=""
-    trap '_sley_ready_guardian_cancel 129' HUP
-    trap '_sley_ready_guardian_cancel 130' INT
-    trap '_sley_ready_guardian_cancel 143' TERM
-    while [[ ! -e "$child_run" && ! -e "$child_abort" && ! -e "$_sley_ready_worker_dead" ]]; do
-      sleep 0.01
-    done
-    [[ ! -e "$child_abort" && ! -e "$_sley_ready_worker_dead" ]] || exit 2
-    # Keep hook-owned trap changes inside a foreground child. This process-group
-    # leader remains a guardian with immutable cancellation traps, so graceful
-    # hook cleanup cannot replace the guardian's final escalation behavior.
-    if (_sley_ready_run_guarded_command "$@"); then
-      child_rc=0
-    else
-      child_rc=$?
-    fi
-    if [[ -n "$_sley_ready_guardian_status" ]]; then
-      exit "$_sley_ready_guardian_status"
-    fi
-    exit "$child_rc"
-  ) </dev/null &
+  _sley_ready_guardian "$child_control" "$@" </dev/null &
   started_pid=$!
   [[ "$child_had_monitor" == "1" ]] || set +m
   if ! started_identity=$(_sley_ready_process_identity "$started_pid"); then
-    : >"$child_abort" 2>/dev/null || true
-    wait "$started_pid" 2>/dev/null || true
-    rm -rf -- "$child_control"
+    _sley_ready_abort_launch "$started_pid" "$child_control"
     _sley_ready_finish_child_launch
     _sley_ready_supervision_failure="process identity is unavailable"
     _sley_ready_supervision_error formatter "$_sley_ready_supervision_failure"
@@ -1268,9 +1322,7 @@ _sley_ready_run_owned() {
   fi
   if ! started_group=$(_sley_ready_process_group "$started_pid") ||
     [[ "$started_group" != "$started_pid" ]]; then
-    : >"$child_abort" 2>/dev/null || true
-    wait "$started_pid" 2>/dev/null || true
-    rm -rf -- "$child_control"
+    _sley_ready_abort_launch "$started_pid" "$child_control"
     _sley_ready_finish_child_launch
     _sley_ready_supervision_failure="dedicated process group is unavailable"
     _sley_ready_supervision_error formatter "$_sley_ready_supervision_failure"
@@ -1281,12 +1333,10 @@ _sley_ready_run_owned() {
   active_child_group=$started_group
   if ! _sley_ready_register_owned_process \
     "$started_pid" "$started_identity" "$started_group"; then
-    : >"$child_abort" 2>/dev/null || true
-    wait "$started_pid" 2>/dev/null || true
+    _sley_ready_abort_launch "$started_pid" "$child_control"
     active_child_pid=""
     active_child_identity=""
     active_child_group=""
-    rm -rf -- "$child_control"
     _sley_ready_finish_child_launch
     _sley_ready_supervision_failure="ownership record could not be published"
     _sley_ready_supervision_error formatter "$_sley_ready_supervision_failure"
@@ -1294,14 +1344,12 @@ _sley_ready_run_owned() {
   fi
   active_child_record=$_sley_ready_owned_record
   : >"$child_run" || {
-    : >"$child_abort" 2>/dev/null || true
-    wait "$started_pid" 2>/dev/null || true
+    _sley_ready_abort_launch "$started_pid" "$child_control"
     active_child_pid=""
     active_child_identity=""
     active_child_group=""
     rm -f -- "$active_child_record"
     active_child_record=""
-    rm -rf -- "$child_control"
     _sley_ready_finish_child_launch
     _sley_ready_supervision_failure="launch gate could not be published"
     _sley_ready_supervision_error formatter "$_sley_ready_supervision_failure"
@@ -1324,12 +1372,22 @@ _sley_ready_run_owned() {
 
 _sley_ready_cancel_impl() {
   local signal_status="$1"
-  if [[ "${_sley_ready_launching_child:-0}" == "1" ]]; then
+  # Defer while a launch or a cleanup is in progress. Both publish ownership
+  # or restore user files in steps that must not be abandoned halfway; each
+  # honors the pending status as soon as it completes.
+  if [[ "${_sley_ready_launching_child:-0}" == "1" ||
+    "${_sley_ready_cleanup_active:-0}" == "1" ]]; then
+    # Counted so `_sley_ready_reap` can tell an interrupted wait from a child
+    # that exited by a signal.
+    _sley_ready_deferred_signals=$((${_sley_ready_deferred_signals:-0} + 1))
     if [[ "${_sley_ready_pending_status:-0}" == "0" ]]; then
       _sley_ready_pending_status=$signal_status
     fi
     return 0
   fi
+  # A status deferred by a finished launch or cleanup came first; keep it.
+  [[ "${_sley_ready_pending_status:-0}" == "0" ]] ||
+    signal_status=$_sley_ready_pending_status
   trap '' INT TERM HUP
   _sley_ready_cleanup
   exit "$signal_status"
@@ -1351,8 +1409,14 @@ _sley_ready_cleanup() {
   local active_child_tree="" active_descendant_tree=""
   local -a cleanup_child_pids=() cleanup_child_identities=() cleanup_child_groups=()
   local -a cleanup_child_trees=()
+  local pending_status
   [[ "${_sley_ready_cleanup_done:-0}" == "0" ]] || return 0
-  _sley_ready_cleanup_done=1
+  [[ "${_sley_ready_cleanup_active:-0}" == "0" ]] || return 0
+  # Mark cleanup in progress, not complete, until every resource is released.
+  # A signal arriving meanwhile is deferred by `_sley_ready_cancel_impl`;
+  # otherwise its recursive cleanup would return at once and exit, skipping the
+  # rest of this teardown, including restoring a `--fix` backup.
+  _sley_ready_cleanup_active=1
 
   # Snapshot each owned tree before signaling its root. Start-time identities
   # keep delayed escalation safe even if a descendant exits and its PID is
@@ -1411,7 +1475,7 @@ _sley_ready_cleanup() {
     "${active_child_pid:-}" \
     "${phase_pids[@]+"${phase_pids[@]}"}"; do
     [[ -n "$child_pid" ]] || continue
-    wait "$child_pid" 2>/dev/null || true
+    _sley_ready_reap "$child_pid"
   done
   [[ -z "${active_child_record:-}" ]] || rm -f -- "$active_child_record"
   active_child_pid=""
@@ -1461,6 +1525,14 @@ _sley_ready_cleanup() {
   stderr_file=""
   selected_cache_file=""
   _fix_batch_file=""
+  _sley_ready_cleanup_done=1
+  _sley_ready_cleanup_active=0
+  pending_status=${_sley_ready_pending_status:-0}
+  _sley_ready_pending_status=0
+  if [[ "$pending_status" != "0" ]]; then
+    trap '' INT TERM HUP
+    exit "$pending_status"
+  fi
 }
 
 _sley_ready_impl() {
@@ -1562,7 +1634,9 @@ _sley_ready_impl() {
   local -a phase_control_dirs=() phase_record_files=()
   local -a phase_stdout_files=() phase_stderr_files=()
   local extension_phases extension_phase
-  local _sley_ready_cleanup_done=0 _sley_ready_launching_child=0 _sley_ready_pending_status=0
+  local _sley_ready_cleanup_done=0 _sley_ready_cleanup_active=0
+  local _sley_ready_launching_child=0 _sley_ready_pending_status=0
+  local _sley_ready_deferred_signals=0
   local _sley_ready_supervision_failure=""
   local _fix_bak="" _fix_active_file="" _fix_preserve_backup=0
   local _fix_batch_file=""
@@ -1860,45 +1934,20 @@ _sley_ready_impl() {
     child_had_monitor=0
     [[ "$-" == *m* ]] && child_had_monitor=1
     set -m
-    (
-      _sley_ready_guardian_status=""
-      trap '_sley_ready_guardian_cancel 129' HUP
-      trap '_sley_ready_guardian_cancel 130' INT
-      trap '_sley_ready_guardian_cancel 143' TERM
-      while [[ ! -e "$child_run" && ! -e "$child_abort" && ! -e "$_sley_ready_worker_dead" ]]; do
-        sleep 0.01
-      done
-      [[ ! -e "$child_abort" && ! -e "$_sley_ready_worker_dead" ]] || exit 2
-      if (
-        # shellcheck disable=SC2034 # read by `_sley_init_repo` in this subshell.
-        SLEY_ORIGINAL_PWD="$_SLEY_CALLER_PWD"
-        _sley_ready_run_guarded_command \
-          _sley_ready_run_phase "$phase" "$full" "$force" "${scope_args[@]}"
-      ); then
-        rc=0
-      else
-        rc=$?
-      fi
-      if [[ -n "$_sley_ready_guardian_status" ]]; then
-        exit "$_sley_ready_guardian_status"
-      fi
-      exit "$rc"
-    ) </dev/null >"$stdout_file" 2>"$stderr_file" &
+    _sley_ready_guardian "$child_control" \
+      _sley_ready_phase_payload "$phase" "$full" "$force" "${scope_args[@]}" \
+      </dev/null >"$stdout_file" 2>"$stderr_file" &
     pid=$!
     [[ "$child_had_monitor" == "1" ]] || set +m
     if ! child_identity=$(_sley_ready_process_identity "$pid"); then
-      : >"$child_abort" 2>/dev/null || true
-      wait "$pid" 2>/dev/null || true
-      rm -rf -- "$child_control"
+      _sley_ready_abort_launch "$pid" "$child_control"
       _sley_ready_finish_child_launch
       _sley_ready_supervision_error "phase $phase" "process identity is unavailable"
       _sley_ready_cleanup
       return 2
     fi
     if ! child_group=$(_sley_ready_process_group "$pid") || [[ "$child_group" != "$pid" ]]; then
-      : >"$child_abort" 2>/dev/null || true
-      wait "$pid" 2>/dev/null || true
-      rm -rf -- "$child_control"
+      _sley_ready_abort_launch "$pid" "$child_control"
       _sley_ready_finish_child_launch
       _sley_ready_supervision_error "phase $phase" "dedicated process group is unavailable"
       _sley_ready_cleanup
