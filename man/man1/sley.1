@@ -132,9 +132,22 @@ whose exit status of 2 (a missing tool or tool error) the
 gate tolerates for this invocation, for example
 .BR "SLEY_ALLOW_UNAVAILABLE=secrets git commit" " or"
 .BR "SLEY_ALLOW_UNAVAILABLE=check sl commit" .
-A tolerated phase is reported as bypassed rather than hidden. Findings (exit
-status 1) and every other phase still gate the commit. Any other value is a
-usage error for
+The exit is tolerated only when the phase confirms it reported no findings:
+the linter is missing, or Checkrun's
+.B autolint
+reports no findings next to its tool error, or no secret scan reported leaks
+or failed (the exit came from sley itself, such as a missing gitleaks).
+Findings always block, including findings that an exit status of
+2 outranks; so does an exit 2 that the phase cannot vouch for, such as a lint
+hook extension that runs its own linter, an older Checkrun, or a secret
+scanner that ran and failed. A tolerated phase is reported as bypassed rather
+than hidden, and every other phase still gates the commit. The Git
+.B commit-msg
+hook's
+.B secrets --message-file
+scan honors the same value and rule. The variable covers every commit that the
+one VCS command creates, such as each commit a rebase or histedit replays. Any
+other value is a usage error for
 .B ready --commit
 and only a warning otherwise.
 .TP
@@ -257,7 +270,7 @@ without failing the aggregate report. With
 the commit-gate path, an exit status of 2 from the check or secrets phase is
 also an error: a missing or misconfigured linter or secret scanner blocks the
 commit instead of letting it land unchecked. To allow that for one commit
-deliberately, set
+deliberately when the phase reported no findings, set
 .B SLEY_ALLOW_UNAVAILABLE
 for the commit command.
 .SH SEE ALSO

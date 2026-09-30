@@ -159,6 +159,7 @@ _sley_hook_lint_bounded() {
     0) ;;
     1 | 2)
       echo "sley: installed Checkrun does not support bounded autolint stdin; update Checkrun before linting this file set" >&2
+      _sley_hook_lint_not_run tool-unavailable
       return 2
       ;;
     *)
@@ -169,6 +170,7 @@ _sley_hook_lint_bounded() {
         return "$capability_status"
       fi
       echo "sley: Checkrun bounded-input capability probe failed with status $capability_status" >&2
+      _sley_hook_lint_not_run tool-error
       return 2
       ;;
   esac
@@ -192,9 +194,25 @@ _sley_hook_lint_bounded() {
   return 0
 }
 
+# Note, for `sley check` under the commit gate, that autolint exited 2 without
+# running, so it cannot have hidden a finding (see `_sley_check_lint_evidence`).
+# Only set when that caller asked for evidence, so hook paths gain no globals.
+_sley_hook_lint_not_run() {
+  [[ -z "${_SLEY_LINT_REPORT:-}" ]] || _SLEY_LINT_NOT_RUN=$1
+}
+
 _sley_hook_lint() {
   local sizing_status
-  command -v autolint >/dev/null 2>&1 || return 2
+  if ! command -v autolint >/dev/null 2>&1; then
+    _sley_hook_lint_not_run tool-unavailable
+    return 2
+  fi
+  # `sley check` under the commit gate asks autolint whether an exit 2 hides
+  # findings. Scope the export to this call so direct runs, hooks, and any
+  # linter an extension runs itself never write the report.
+  if [[ -n "${_SLEY_LINT_REPORT:-}" ]]; then
+    local -x CHECKRUN_AUTOLINT_REPORT="$_SLEY_LINT_REPORT"
+  fi
   # Let autolint's stderr pass through. `sley check` is a human-facing read-
   # only command and must surface the diagnostics that explain a non-zero exit;
   # hook callers can wrap their own redirection if they want quieter output.
