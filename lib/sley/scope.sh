@@ -79,6 +79,13 @@ _sley_parse_scope() {
   esac
 }
 
+# Succeed when the parsed change scope is VCS commit input (`--commit`). Only
+# `--commit` selects these scopes, so callers can apply commit-gate policy
+# without re-parsing arguments or knowing each VCS's scope name.
+_sley_scope_is_commit() {
+  [[ "$_SLEY_SCOPE_CHANGE" == "staged" || "$_SLEY_SCOPE_CHANGE" == "pending" ]]
+}
+
 _sley_path_filters() {
   local p rel scoped_path
   # No filters means "active change context only", not "walk the repository".

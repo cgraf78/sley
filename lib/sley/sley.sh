@@ -816,7 +816,14 @@ _sley_check() {
     sley_hook_lint "$lint_files"
     case $? in
       0) ;;
-      2) return 2 ;;
+      2)
+        # The default lint hook returns 2 silently when autolint is absent
+        # (hot hook paths treat that as a no-op). This human-facing command,
+        # and the commit gate built on it, must say why nothing was linted.
+        command -v autolint >/dev/null 2>&1 ||
+          echo "sley check: linter unavailable (autolint not found)" >&2
+        return 2
+        ;;
       *) return 1 ;;
     esac
   fi

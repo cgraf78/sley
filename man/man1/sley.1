@@ -236,7 +236,15 @@ For
 .BR ready ,
 an exit status of 2 from the status or verify phase, or any unexpected phase
 exit status, is an error; other phases that exit 2 are reported as unavailable
-without failing the aggregate report.
+without failing the aggregate report. With
+.BR --commit ,
+the commit-gate path, an exit status of 2 from the check or secrets phase is
+also an error: a missing or misconfigured linter or secret scanner blocks the
+commit instead of letting it land unchecked. To commit without that phase
+deliberately, pass
+.BI --exclude " phase"
+to a direct invocation or use the VCS hook bypass, such as
+.BR "git commit --no-verify" .
 .SH SEE ALSO
 .BR checkrun (1),
 .BR autoformat (1),

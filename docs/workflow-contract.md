@@ -68,6 +68,15 @@ formatting as a pre-step before those phases rather than as a phase. Ready
 should continue to call public Sley and Checkrun surfaces rather than
 duplicating their internals.
 
+An exit status of 2 from `status` or `verify` is always a ready error. From
+`check` or `secrets` it means the phase could not run, for example a missing
+linter or gitleaks, or a structural linter error that Checkrun lets win over
+findings. A report-only `sley ready` shows those phases as unavailable and
+continues. The `--commit` commit gate fails closed instead: it exits 2 and
+names each phase that could not run, so an unavailable tool cannot let lint
+findings or secrets land. Callers skip a phase deliberately with `--exclude`
+or the VCS hook bypass, not by leaving a tool uninstalled.
+
 ## Low-Level Tool Invocation
 
 Sley should not directly invoke language tools such as `ruff`, `mypy`,

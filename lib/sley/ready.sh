@@ -1532,6 +1532,12 @@ _sley_ready_impl() {
 
   _sley_parse_scope "${scope_args[@]}" || return $?
   [[ "$_SLEY_SCOPE_JSON" == "0" ]] || _repo_require_json_encoder || return 2
+  # `--commit` is the commit-gate path used by native and agent hooks. There,
+  # a check or secrets phase that could not run must block instead of being
+  # reported as optional unavailability; see the rc 2 handling below.
+  local commit_gate=0
+  local -a gate_unavailable=()
+  _sley_scope_is_commit && commit_gate=1
   local progress=0
   [[ "$quiet" != "1" && "$_SLEY_SCOPE_JSON" != "1" ]] && progress=1
 
@@ -1964,6 +1970,17 @@ _sley_ready_impl() {
           status="error"
           errors=$((errors + 1))
           global=2
+        elif [[ "$commit_gate" == "1" ]] &&
+          [[ "$phase" == "check" || "$phase" == "secrets" ]]; then
+          # In the commit gate, rc 2 means lint or secret scanning did not
+          # complete: a missing tool, or a tool error such as a broken linter
+          # config, which Checkrun lets win over real findings in the same
+          # run. Treating that as optional would let those findings or a
+          # leaked secret land, so the gate fails closed and names the phase.
+          status="error"
+          errors=$((errors + 1))
+          global=2
+          gate_unavailable+=("$phase")
         else
           # Direct phase invocations can fail hard for missing tools or
           # unsupported scopes, but `ready` is a report. Keep those gaps visible
@@ -2060,6 +2077,18 @@ _sley_ready_impl() {
   if [[ "$_SLEY_SCOPE_JSON" == "1" ]]; then
     printf '{"phases":[%s],"summary":{"blocking":%s,"unavailable":%s,"errors":%s,"exit_code":%s}}\n' \
       "$phases_json" "$blocking" "$unavailable" "$errors" "$global"
+  fi
+  if [[ "${#gate_unavailable[@]}" -gt 0 ]]; then
+    # stderr keeps `--json` stdout machine-readable. The phase's own
+    # diagnostic (for example `gitleaks not found`) is already in the report.
+    local gate_phases="" gate_phase gate_bypass="--exclude PHASE on a direct run"
+    for gate_phase in "${gate_unavailable[@]}"; do
+      gate_phases+="${gate_phases:+, }$gate_phase"
+    done
+    # Only Git has a documented native hook bypass; stay VCS-neutral otherwise.
+    [[ "$_REPO_TYPE" != "git" ]] || gate_bypass+=", or git commit --no-verify"
+    printf 'sley ready: commit gate blocked: %s exited 2 (missing tool or tool error; see its output above); fix it, or bypass the gate deliberately (%s)\n' \
+      "$gate_phases" "$gate_bypass" >&2
   fi
   return "$global"
 }
