@@ -2012,6 +2012,102 @@ _assert_eq "ready identity: stale launch identity is rejected" \
 _assert_eq "ready identity: owned exec survivor remains signalable" \
   "no" "$(_result_value exec_survivor "$identity_data")"
 
+echo "=== sley: procfs scans keep newline command names ==="
+
+# The full procfs scans read each stat file without forking. A process can put
+# a newline in its command name, so a line-oriented read would truncate that
+# record and silently drop the process from cleanup. Both scans must still
+# report it; the ps override forces the procfs branch of the group scan.
+newline_comm_harness=$(_tmpdir)/ready-newline-comm-harness
+cat >"$newline_comm_harness" <<'HARNESS'
+#!/usr/bin/env bash
+
+root="$1"
+sync_dir="$2"
+
+# shellcheck disable=SC1090 # The test supplies the checkout under test.
+source "$root/lib/sley/sley.sh"
+_sley_ready_ps() { return 127; }
+
+set -m
+(
+  set +m
+  # Bash line-buffers builtin output and would split the name across two
+  # writes, each replacing comm. Python renames itself in one write; it may
+  # run under a launcher, so it publishes its own PID. The name stays within
+  # the kernel's 15-byte comm limit.
+  python3 -c '
+import os
+import sys
+import time
+
+try:
+    comm_fd = os.open("/proc/self/comm", os.O_WRONLY)
+    os.write(comm_fd, b"ren\nx) S 1")
+    os.close(comm_fd)
+except OSError:
+    pass
+with open(sys.argv[1] + ".tmp", "w", encoding="ascii") as pid_file:
+    pid_file.write(str(os.getpid()))
+os.rename(sys.argv[1] + ".tmp", sys.argv[1])
+time.sleep(60)
+' "$sync_dir/newline-comm.pid" >/dev/null 2>&1 &
+  launcher_pid=$!
+  renamed_pid=""
+  for _ in {1..500}; do
+    [[ -s "$sync_dir/newline-comm.pid" ]] && break
+    sleep 0.01
+  done
+  [[ -s "$sync_dir/newline-comm.pid" ]] && renamed_pid=$(<"$sync_dir/newline-comm.pid")
+  renamed_comm=""
+  if [[ -n "$renamed_pid" ]]; then
+    { renamed_comm=$(<"/proc/$renamed_pid/comm"); } 2>/dev/null
+  fi
+  if [[ -z "$renamed_pid" ]]; then
+    printf 'newline_comm=no-pid\n'
+  elif [[ "$renamed_comm" != $'ren\nx) S 1' ]]; then
+    printf 'newline_comm=unsupported\n'
+  else
+    printf 'newline_comm=set\n'
+    # Capture the guardian before command substitution changes BASHPID.
+    guardian_pid=$BASHPID
+    snapshot=$(_sley_ready_proc_snapshot_tree "$guardian_pid")
+    members=$(_sley_ready_process_group_tree "$guardian_pid" "$guardian_pid")
+    snapshot_found=no
+    group_found=no
+    [[ $'\n'"$snapshot" == *$'\n'"$renamed_pid"$'\t'* ]] && snapshot_found=yes
+    # Group records are "generation<TAB>pid<TAB>identity".
+    [[ "$members" == *$'\t'"$renamed_pid"$'\t'* ]] && group_found=yes
+    printf 'snapshot_found=%s\n' "$snapshot_found"
+    printf 'group_found=%s\n' "$group_found"
+  fi
+  kill ${renamed_pid:+"$renamed_pid"} "$launcher_pid" 2>/dev/null
+  wait "$launcher_pid" 2>/dev/null || true
+) &
+wait "$!"
+HARNESS
+chmod +x "$newline_comm_harness"
+
+if [[ -w /proc/self/comm ]]; then
+  newline_comm_sync=$(_tmpdir)
+  newline_comm_data=$(_with_timeout 20 bash --noprofile --norc \
+    "$newline_comm_harness" "$SLEY_REPO_ROOT" "$newline_comm_sync")
+  # Skip only when the kernel refuses the rename; a fixture that never
+  # publishes its PID is a failure, not an unsupported platform.
+  if [[ "$(_result_value newline_comm "$newline_comm_data")" == "unsupported" ]]; then
+    echo "  SKIP: procfs newline command names (cannot rename a process)"
+  else
+    _assert_eq "ready procfs scans: fixture renames a process" \
+      "set" "$(_result_value newline_comm "$newline_comm_data")"
+    _assert_eq "ready procfs snapshot: keeps a newline command name" \
+      "yes" "$(_result_value snapshot_found "$newline_comm_data")"
+    _assert_eq "ready procfs group scan: keeps a newline command name" \
+      "yes" "$(_result_value group_found "$newline_comm_data")"
+  fi
+else
+  echo "  SKIP: procfs newline command names (no writable /proc/self/comm)"
+fi
+
 echo "=== sley: guardian process-group discovery ==="
 
 group_tree_harness=$(_tmpdir)/ready-group-tree-harness

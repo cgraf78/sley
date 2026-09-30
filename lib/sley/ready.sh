@@ -547,10 +547,19 @@ _sley_ready_proc_snapshot_tree() {
   fi
   # Some Linux kernels omit task/PID/children even though proc stat is
   # available. Build one stable-enough process snapshot from stat files using
-  # Bash's built-in file read, so minimal systems still do not need ps.
+  # Bash's built-in file read, so minimal systems still do not need ps. Use
+  # `read`, not `$(<file)`: the latter forks a command-substitution subshell
+  # per file, and cancellation takes several of these scans, so on a host with
+  # thousands of processes the forks alone can exceed the cancellation bound.
+  # Read to EOF (`-d ''`) because a process can put a newline in its command
+  # name; a line read would truncate the record and hide that process. `read`
+  # then reports EOF as status 1, so ignore its status (callers may run with
+  # errexit) and test the content instead.
   for stat_file in /proc/[0-9]*/stat; do
     [[ -r "$stat_file" ]] || continue
-    stat_line=$(<"$stat_file") || continue
+    stat_line=""
+    { IFS= read -r -d '' stat_line <"$stat_file" || :; } 2>/dev/null
+    [[ -n "$stat_line" ]] || continue
     child_pid=${stat_file#/proc/}
     child_pid=${child_pid%/stat}
     _sley_ready_parse_proc_stat "$child_pid" "$stat_line" || continue
@@ -711,9 +720,13 @@ _sley_ready_process_group_tree() {
       ready+=(0)
     done <<<"$snapshot"
   elif [[ -d /proc ]]; then
+    # Fork-free whole-file `read`, as in `_sley_ready_proc_snapshot_tree`:
+    # this scan visits every process on the host.
     for stat_file in /proc/[0-9]*/stat; do
       [[ -r "$stat_file" ]] || continue
-      { stat_line=$(<"$stat_file"); } 2>/dev/null || continue
+      stat_line=""
+      { IFS= read -r -d '' stat_line <"$stat_file" || :; } 2>/dev/null
+      [[ -n "$stat_line" ]] || continue
       process_pid=${stat_file#/proc/}
       process_pid=${process_pid%/stat}
       _sley_ready_parse_proc_stat "$process_pid" "$stat_line" || continue
