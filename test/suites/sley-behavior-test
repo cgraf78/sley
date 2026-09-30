@@ -3153,6 +3153,9 @@ cat >"$repo/.sley/verify.json" <<'EOF'
   ]
 }
 EOF
+# Untracked files are cache-key inputs; keep the in-repo run counter ignored
+# like any test artifact so it does not invalidate the receipt it proves.
+printf 'tests/count\n' >"$repo/.gitignore"
 (cd "$repo" && git add . && git commit -q -m "seed cacheable verify")
 echo "changed" >>"$repo/src/app.txt"
 
@@ -3286,6 +3289,7 @@ cat >"$repo/.sley/verify.json" <<'EOF'
   ]
 }
 EOF
+printf 'tests/count\n' >"$repo/.gitignore"
 (cd "$repo" && git add . && git commit -q -m "seed identity env verify")
 echo "changed" >>"$repo/src/app.txt"
 
@@ -3462,6 +3466,7 @@ cat >"$repo/.sley/verify.json" <<'EOF'
   ]
 }
 EOF
+printf 'tests/count\n' >"$repo/.gitignore"
 (cd "$repo" && git add . && git commit -q -m "seed identity failure verify")
 echo "changed" >>"$repo/src/app.txt"
 
@@ -3508,6 +3513,7 @@ cat >"$repo/.sley/verify.json" <<'EOF'
   ]
 }
 EOF
+printf 'tests/count\n' >"$repo/.gitignore"
 (cd "$repo" && git add . && git commit -q -m "seed malformed receipt verify")
 echo "changed" >>"$repo/src/app.txt"
 
@@ -3609,6 +3615,258 @@ COUNT_FILE="$counter" _run_sley "$repo" verify --run-required --include-untracke
 _assert_exit "verify registry cache: untracked content change exits 0" 0 "$__SLEY_RC"
 _assert_contains "verify registry cache: untracked content change reruns" '"status":"passed"' "$__SLEY_OUT"
 _assert_eq "verify registry cache: untracked content change increments count" "2" "$(cat "$counter")"
+
+# Cache keys must cover inputs outside the selected files that a test runner
+# still reads: untracked files (without --include-untracked) and, for a
+# branch with no upstream, the committed tree. The command fails whenever any
+# file under src/ says "broken", so a stale receipt shows up as a cached pass.
+_new_stale_cache_repo() {
+  local repo="$1" policy="${2:-}" cache
+  mkdir -p "$repo/src" "$repo/tests" "$repo/.sley"
+  printf 'initial\n' >"$repo/src/app.txt"
+  cat >"$repo/tests/run.sh" <<'EOF'
+#!/usr/bin/env bash
+count=0
+[[ -f "$COUNT_FILE" ]] && count=$(cat "$COUNT_FILE")
+printf '%s\n' "$((count + 1))" >"$COUNT_FILE"
+! grep -rq broken src
+EOF
+  chmod +x "$repo/tests/run.sh"
+  cache='"enabled": true, "salt": "stale-cache-test"'
+  [[ -z "$policy" ]] || cache+=", \"base_policy\": \"$policy\""
+  cat >"$repo/.sley/verify.json" <<EOF
+{"rules": [{"paths": ["src/**"], "commands": [{"cmd": "./tests/run.sh", "required": true, "cache": {$cache}}]}]}
+EOF
+  (cd "$repo" && git add . && git commit -q -m "seed stale cache verify")
+  printf 'changed\n' >>"$repo/src/app.txt"
+}
+
+repo=$(_new_repo)
+_new_stale_cache_repo "$repo"
+counter=$(_tmpdir)/stale-untracked-counter
+COUNT_FILE="$counter" _run_sley "$repo" verify --run-required --json
+_assert_exit "verify registry cache: stale untracked setup passes" 0 "$__SLEY_RC"
+printf 'broken\n' >"$repo/src/new.txt"
+COUNT_FILE="$counter" _run_sley "$repo" verify --run-required --json
+_assert_exit "verify registry cache: new untracked file is not a cached pass" 1 "$__SLEY_RC"
+_assert_not_contains "verify registry cache: new untracked file misses the receipt" '"cached-pass"' "$__SLEY_OUT"
+_assert_eq "verify registry cache: new untracked file reruns command" "2" "$(cat "$counter")"
+rm -f "$repo/src/new.txt"
+COUNT_FILE="$counter" _run_sley "$repo" verify --run-required --json
+_assert_contains "verify registry cache: removing the untracked file restores the hit" '"cached-pass"' "$__SLEY_OUT"
+
+# Untracked files outside an explicit --path scope are outside the key.
+mkdir -p "$repo/other"
+COUNT_FILE="$counter" _run_sley "$repo" verify --run-required --json --path src
+_assert_exit "verify registry cache: path-scoped setup passes" 0 "$__SLEY_RC"
+printf 'scratch\n' >"$repo/other/scratch.txt"
+COUNT_FILE="$counter" _run_sley "$repo" verify --run-required --json --path src
+_assert_contains "verify registry cache: untracked file outside --path keeps the hit" '"cached-pass"' "$__SLEY_OUT"
+printf 'broken\n' >"$repo/src/scoped.txt"
+COUNT_FILE="$counter" _run_sley "$repo" verify --run-required --json --path src
+_assert_exit "verify registry cache: untracked file inside --path is not a cached pass" 1 "$__SLEY_RC"
+rm -f "$repo/src/scoped.txt"
+
+# SLEY_SKIP_UNTRACKED opts out of the untracked walk (huge bare worktrees)
+# and knowingly keeps the old stale-hit tradeoff.
+repo=$(_new_repo)
+_new_stale_cache_repo "$repo"
+counter=$(_tmpdir)/skip-untracked-counter
+SLEY_SKIP_UNTRACKED=1 COUNT_FILE="$counter" _run_sley "$repo" verify --run-required --json
+_assert_exit "verify registry cache: skip-untracked setup passes" 0 "$__SLEY_RC"
+printf 'broken\n' >"$repo/src/new.txt"
+SLEY_SKIP_UNTRACKED=1 COUNT_FILE="$counter" _run_sley "$repo" verify --run-required --json
+_assert_contains "verify registry cache: SLEY_SKIP_UNTRACKED leaves untracked files out of the key" \
+  '"cached-pass"' "$__SLEY_OUT"
+
+# An untracked file the helper cannot read leaves the key unprovable: the
+# command runs uncached instead of verify failing on the cache helper.
+if [[ "$(id -u)" == "0" ]]; then
+  echo "  SKIP: verify cache unreadable untracked file (running as root)"
+else
+  repo=$(_new_repo)
+  _new_stale_cache_repo "$repo"
+  counter=$(_tmpdir)/unreadable-untracked-counter
+  printf 'secret\n' >"$repo/src/unreadable.txt"
+  chmod 000 "$repo/src/unreadable.txt"
+  COUNT_FILE="$counter" _run_sley "$repo" verify --run-required --json
+  chmod 600 "$repo/src/unreadable.txt"
+  _assert_exit "verify registry cache: unreadable untracked file still runs command" 0 "$__SLEY_RC"
+  _assert_contains "verify registry cache: unreadable untracked file disables cache" \
+    "cache disabled" "$__SLEY_OUT"
+  _assert_not_contains "verify registry cache: unreadable untracked file is not a helper failure" \
+    "failed to compute cache key" "$__SLEY_OUT"
+fi
+
+# selected-content declares that only the selected files matter.
+repo=$(_new_repo)
+_new_stale_cache_repo "$repo" selected-content
+counter=$(_tmpdir)/selected-untracked-counter
+COUNT_FILE="$counter" _run_sley "$repo" verify --run-required --json
+_assert_exit "verify registry cache: selected-content untracked setup passes" 0 "$__SLEY_RC"
+printf 'scratch\n' >"$repo/src/new.txt"
+COUNT_FILE="$counter" _run_sley "$repo" verify --run-required --json
+_assert_contains "verify registry cache: selected-content ignores unselected untracked files" \
+  '"cached-pass"' "$__SLEY_OUT"
+
+# No upstream means no merge base; a commit that adds broken content while
+# the selected dirty file stays unchanged must still miss.
+repo=$(_new_repo)
+_new_stale_cache_repo "$repo"
+counter=$(_tmpdir)/stale-commit-counter
+COUNT_FILE="$counter" _run_sley "$repo" verify --run-required --json
+_assert_exit "verify registry cache: no-upstream setup passes" 0 "$__SLEY_RC"
+printf 'broken\n' >"$repo/src/committed.txt"
+(cd "$repo" && git add src/committed.txt && git commit -q -m "commit broken file")
+COUNT_FILE="$counter" _run_sley "$repo" verify --run-required --json
+_assert_exit "verify registry cache: no-upstream commit is not a cached pass" 1 "$__SLEY_RC"
+_assert_not_contains "verify registry cache: no-upstream commit misses the receipt" '"cached-pass"' "$__SLEY_OUT"
+_assert_eq "verify registry cache: no-upstream commit reruns command" "2" "$(cat "$counter")"
+
+# With an upstream, committing exactly the verified content must keep the
+# receipt: selected files are keyed by worktree content, and only committed
+# files outside the selection count as committed-tree input.
+_push_stale_cache_upstream() {
+  local repo="$1" origin branch
+  origin=$(_tmpdir)
+  git init -q --bare "$origin"
+  git -C "$repo" remote add origin "$origin"
+  branch=$(git -C "$repo" branch --show-current)
+  git -C "$repo" push -q -u origin "$branch"
+}
+
+repo=$(_new_repo)
+_new_stale_cache_repo "$repo"
+_push_stale_cache_upstream "$repo"
+# Level with the upstream: this first commit on top of it must hit too.
+counter=$(_tmpdir)/commit-verified-counter
+COUNT_FILE="$counter" _run_sley "$repo" verify --run-required --json
+_assert_exit "verify registry cache: pre-commit verify passes" 0 "$__SLEY_RC"
+(cd "$repo" && git commit -q -am "commit verified content")
+COUNT_FILE="$counter" _run_sley "$repo" verify --run-required --json
+_assert_contains "verify registry cache: committing the verified content hits" '"cached-pass"' "$__SLEY_OUT"
+_assert_eq "verify registry cache: committing the verified content does not rerun" "1" "$(cat "$counter")"
+printf 'more\n' >>"$repo/src/app.txt"
+COUNT_FILE="$counter" _run_sley "$repo" verify --run-required --json
+_assert_exit "verify registry cache: second verified change passes" 0 "$__SLEY_RC"
+(cd "$repo" && git commit -q -am "commit more verified content")
+COUNT_FILE="$counter" _run_sley "$repo" verify --run-required --json
+_assert_contains "verify registry cache: committing on an ahead branch hits" '"cached-pass"' "$__SLEY_OUT"
+_assert_eq "verify registry cache: committing on an ahead branch does not rerun" "2" "$(cat "$counter")"
+
+# A committed change outside a --path selection is still an input: the test
+# reads all of src/, and the old key (unchanged merge base plus selected
+# content) kept hitting.
+mkdir -p "$repo/src/one" "$repo/src/two"
+printf 'one\n' >"$repo/src/one/a.txt"
+printf 'two\n' >"$repo/src/two/b.txt"
+(cd "$repo" && git add src && git commit -q -m "add subdirs")
+printf 'one changed\n' >"$repo/src/one/a.txt"
+COUNT_FILE="$counter" _run_sley "$repo" verify --run-required --json --path src/one
+_assert_exit "verify registry cache: path-scoped upstream setup passes" 0 "$__SLEY_RC"
+printf 'broken\n' >"$repo/src/two/b.txt"
+(cd "$repo" && git commit -q -m "break unselected file" src/two/b.txt)
+COUNT_FILE="$counter" _run_sley "$repo" verify --run-required --json --path src/one
+_assert_exit "verify registry cache: committed change outside --path is not a cached pass" 1 "$__SLEY_RC"
+_assert_not_contains "verify registry cache: committed change outside --path misses the receipt" \
+  '"cached-pass"' "$__SLEY_OUT"
+
+# merge-base policy on a branch level with its upstream: a fast-forward pull
+# that brings broken content into an unselected file must miss. The old key
+# normalized the level merge base to null on both sides and kept hitting.
+repo=$(_new_repo)
+_new_stale_cache_repo "$repo" merge-base
+_push_stale_cache_upstream "$repo"
+counter=$(_tmpdir)/merge-base-pull-counter
+COUNT_FILE="$counter" _run_sley "$repo" verify --run-required --json
+_assert_exit "verify registry cache: merge-base level setup passes" 0 "$__SLEY_RC"
+other=$(_tmpdir)
+# Keep the runner's global git config (and any commit hooks it installs)
+# out of the second clone.
+(
+  export GIT_CONFIG_GLOBAL="$repo/.gitconfig-test"
+  git clone -q -b "$(git -C "$repo" branch --show-current)" "$(git -C "$repo" remote get-url origin)" "$other" &&
+    cd "$other" &&
+    printf 'broken\n' >src/pulled.txt &&
+    git add src/pulled.txt &&
+    git -c user.email=test@test.local -c user.name="Test User" commit -q -m "break upstream" &&
+    git push -q &&
+    cd "$repo" &&
+    git stash -q &&
+    git pull -q --ff-only &&
+    git stash pop -q
+)
+_assert_file_exists "verify registry cache: merge-base setup pulled the upstream change" "$repo/src/pulled.txt"
+COUNT_FILE="$counter" _run_sley "$repo" verify --run-required --json
+_assert_exit "verify registry cache: merge-base pulled broken file is not a cached pass" 1 "$__SLEY_RC"
+
+# HEAD is pinned once per command, so the post-run check must notice a
+# checkout or commit that moved HEAD's tree while the command ran.
+repo=$(_new_repo)
+mkdir -p "$repo/src" "$repo/.sley"
+printf 'initial\n' >"$repo/src/app.txt"
+cat >"$repo/.sley/verify.json" <<'JSON'
+{"rules": [{"paths": ["src/**"], "commands": [{"cmd": "echo $$ >>moved.txt && git add moved.txt && git commit -q -m moved", "required": true, "cache": {"enabled": true, "salt": "head-move-test"}}]}]}
+JSON
+(cd "$repo" && git add . && git commit -q -m "seed head move verify")
+printf 'changed\n' >>"$repo/src/app.txt"
+_run_sley "$repo" verify --run-required --json
+_assert_exit "verify registry cache: HEAD tree moving during the run blocks the receipt" 1 "$__SLEY_RC"
+_assert_contains "verify registry cache: HEAD tree move explains mismatch" \
+  "changes changed during required command; not caching receipt" "$__SLEY_OUT"
+
+# selected-content keys only the selected files, so the same HEAD move is
+# not a key change there and the passed run stays a pass.
+sed -i.bak 's/"salt": "head-move-test"/"salt": "head-move-test", "base_policy": "selected-content"/' \
+  "$repo/.sley/verify.json"
+rm -f "$repo/.sley/verify.json.bak"
+(cd "$repo" && git commit -q -m "selected-content policy" .sley/verify.json)
+_run_sley "$repo" verify --run-required --json
+_assert_exit "verify registry cache: selected-content ignores a HEAD move during the run" 0 "$__SLEY_RC"
+
+# A command that writes an untracked artifact still passes; the receipt is
+# only written once a run leaves the untracked set as it found it.
+repo=$(_new_repo)
+mkdir -p "$repo/src" "$repo/.sley"
+printf 'initial\n' >"$repo/src/app.txt"
+cat >"$repo/.sley/verify.json" <<'EOF'
+{"rules": [{"paths": ["src/**"], "commands": [{"cmd": "echo artifact >build.log", "required": true, "cache": {"enabled": true, "salt": "artifact-test"}}]}]}
+EOF
+(cd "$repo" && git add . && git commit -q -m "seed artifact verify")
+printf 'changed\n' >>"$repo/src/app.txt"
+_run_sley "$repo" verify --run-required --json
+_assert_exit "verify registry cache: untracked artifact does not fail the run" 0 "$__SLEY_RC"
+_assert_contains "verify registry cache: untracked artifact run reports passed" '"status":"passed"' "$__SLEY_OUT"
+_assert_contains "verify registry cache: untracked artifact explains skipped receipt" \
+  "untracked files changed during required command; not caching receipt" "$__SLEY_OUT"
+_run_sley "$repo" verify --run-required --json
+_assert_exit "verify registry cache: stable artifact rerun passes" 0 "$__SLEY_RC"
+_assert_not_contains "verify registry cache: stable artifact rerun writes receipt" \
+  "not caching receipt" "$__SLEY_OUT"
+_run_sley "$repo" verify --run-required --json
+_assert_contains "verify registry cache: stable artifact then hits" '"cached-pass"' "$__SLEY_OUT"
+
+# An artifact the helper cannot read after the run leaves the untracked
+# input unknown; the passed run must stay a pass, just uncached.
+if [[ "$(id -u)" == "0" ]]; then
+  echo "  SKIP: verify cache unreadable untracked artifact (running as root)"
+else
+  repo=$(_new_repo)
+  mkdir -p "$repo/src" "$repo/.sley"
+  printf 'initial\n' >"$repo/src/app.txt"
+  cat >"$repo/.sley/verify.json" <<'JSON'
+{"rules": [{"paths": ["src/**"], "commands": [{"cmd": "rm -f locked.out; touch locked.out; chmod 000 locked.out", "required": true, "cache": {"enabled": true, "salt": "unreadable-artifact-test"}}]}]}
+JSON
+  (cd "$repo" && git add . && git commit -q -m "seed unreadable artifact verify")
+  printf 'changed\n' >>"$repo/src/app.txt"
+  _run_sley "$repo" verify --run-required --json
+  chmod 600 "$repo/locked.out" 2>/dev/null
+  _assert_exit "verify registry cache: unreadable untracked artifact does not fail the run" 0 "$__SLEY_RC"
+  _assert_contains "verify registry cache: unreadable untracked artifact skips the receipt" \
+    "not caching receipt" "$__SLEY_OUT"
+  _assert_not_contains "verify registry cache: unreadable untracked artifact is not a content change" \
+    "changes changed during required command" "$__SLEY_OUT"
+fi
 
 home=$(_tmpdir)
 mkdir -p "$home/.local/bin"
@@ -4021,6 +4279,7 @@ case "$1" in
       *'--change lowerrev'*) printf 'base/lower.txt\n' ;;
       *'--change tiprev'*) printf 'tip/tip.txt\n' ;;
       *'--change .'*) printf 'tip/tip.txt\n' ;;
+      *'--unknown'*) [[ ! -e "$SL_REPO/scratch.txt" ]] || printf 'scratch.txt\0' ;;
       *) printf 'tip/pending.txt\n' ;;
     esac
     ;;
@@ -4081,6 +4340,12 @@ SL_REPO="$repo" PATH="$mockbin:$PATH" _run_sley "$repo" verify --run-required --
 _assert_exit "verify registry cache: sl lower stack change exits 0" 0 "$__SLEY_RC"
 _assert_contains "verify registry cache: sl lower stack change reruns" '"status":"passed"' "$__SLEY_OUT"
 _assert_eq "verify registry cache: sl lower stack change invalidates receipt" "2" "$(cat "$repo/tests/count")"
+
+SL_REPO="$repo" PATH="$mockbin:$PATH" _run_sley "$repo" verify --run-required --json
+_assert_contains "verify registry cache: sl unchanged stack hits" '"cached-pass"' "$__SLEY_OUT"
+printf 'scratch\n' >"$repo/scratch.txt"
+SL_REPO="$repo" PATH="$mockbin:$PATH" _run_sley "$repo" verify --run-required --json
+_assert_eq "verify registry cache: sl new untracked file invalidates receipt" "3" "$(cat "$repo/tests/count")"
 
 repo=$(_new_repo)
 mkdir -p "$repo/src" "$repo/.sley"
@@ -6247,6 +6512,7 @@ chmod +x "$cache_edge_repo/tests/run.sh"
 cat >"$cache_edge_repo/.sley/verify.json" <<'EOF'
 {"rules": [{"paths": ["src/**"], "commands": [{"cmd": "./tests/run.sh", "required": true, "cache": {"enabled": true, "salt": "symlink-receipt-test"}}]}]}
 EOF
+printf 'tests/count\n' >"$cache_edge_repo/.gitignore"
 (cd "$cache_edge_repo" && git add . && git commit -qm "seed symlink receipt verify")
 printf 'changed\n' >>"$cache_edge_repo/src/app.txt"
 
@@ -6328,6 +6594,7 @@ chmod +x "$cache_race_repo/tests/run.sh"
 cat >"$cache_race_repo/.sley/verify.json" <<'EOF'
 {"rules": [{"paths": ["src/**"], "commands": [{"cmd": "./tests/run.sh", "required": true, "cache": {"enabled": true, "salt": "post-lock-hit-test"}}]}]}
 EOF
+printf 'tests/count\n' >"$cache_race_repo/.gitignore"
 (cd "$cache_race_repo" && git add . && git commit -qm "seed post-lock verify")
 printf 'changed\n' >>"$cache_race_repo/src/app.txt"
 
