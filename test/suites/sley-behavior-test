@@ -5346,7 +5346,8 @@ lock_stdout=$(
     source "$SLEY_REPO_ROOT/lib/sley/scope.sh"
     source "$SLEY_REPO_ROOT/lib/sley/hooks.sh"
     source "$SLEY_REPO_ROOT/lib/sley/verify.sh"
-    _sley_verify_cache_lock_acquire "'"$verify_receipt"'"
+    _sley_verify_cache_lock_acquire "'"$verify_receipt"'" || exit
+    printf "%s\n" "$lock_dir"
   ' 2>"$lock_stderr_file"
 )
 # Capture the bash -c subprocess's rc IMMEDIATELY after the command
@@ -5401,7 +5402,8 @@ lock_live_stdout=$(
     source "$SLEY_REPO_ROOT/lib/sley/scope.sh"
     source "$SLEY_REPO_ROOT/lib/sley/hooks.sh"
     source "$SLEY_REPO_ROOT/lib/sley/verify.sh"
-    _sley_verify_cache_lock_acquire "'"$verify_receipt"'"
+    _sley_verify_cache_lock_acquire "'"$verify_receipt"'" || exit
+    printf "%s\n" "$lock_dir"
   ' 2>"$lock_live_stderr_file"
 )
 lock_live_rc=$?
@@ -5421,6 +5423,185 @@ else
 fi
 
 rm -rf "$verify_expected_lock_dir" 2>/dev/null || true
+
+# Run a lock scenario (script on stdin) in a fresh bash with the verify
+# library sourced. VERIFY_RECEIPT / VERIFY_LOCK_DIR name the lock under test.
+_verify_lock_script() {
+  local script
+  script=$(mktemp "$(_tmpdir)/lock-script.XXXXXX")
+  {
+    # shellcheck disable=SC2016 # expanded by the generated script, not here.
+    printf 'source "$SLEY_REPO_ROOT/lib/sley/%s"\n' repo.sh scope.sh hooks.sh verify.sh
+    cat
+  } >"$script"
+  VERIFY_RECEIPT="$verify_receipt" VERIFY_LOCK_DIR="$verify_expected_lock_dir" bash "$script"
+}
+
+_verify_lock_token() {
+  awk -F= '$1=="token" {print $2; exit}' "$1/owner.meta" 2>/dev/null
+}
+
+echo "=== sley: verify cache lock is acquired in the calling process ==="
+
+# The run-required loop's signal trap releases `lock_dir`. When the lock was
+# created inside `$(...)`, a signal between mkdir and the assignment left a
+# lock the trap could not see. Acquisition must publish the lock (and the
+# token that proves ownership) in the caller's own shell.
+rm -rf "$verify_expected_lock_dir"
+lock_proc_out=$(
+  _verify_lock_script <<'EOF'
+_sley_verify_cache_lock_acquire "$VERIFY_RECEIPT" >/dev/null || exit 9
+printf 'dir=%s\ntoken=%s\npid=%s\n' "$lock_dir" "${lock_token:-}" "$$"
+EOF
+)
+lock_proc_token=$(_verify_lock_token "$verify_expected_lock_dir")
+_assert_contains "verify lock: acquire sets lock_dir in the calling shell" \
+  "dir=$verify_expected_lock_dir" "$lock_proc_out"
+if [[ -n "$lock_proc_token" && "$lock_proc_out" == *"token=$lock_proc_token"* ]]; then
+  _pass "verify lock: acquire sets lock_token matching owner.meta"
+else
+  _fail "verify lock: acquire sets lock_token matching owner.meta (meta '$lock_proc_token', got '$lock_proc_out')"
+fi
+lock_proc_pid=$(awk -F= '$1=="pid" {print $2; exit}' "$verify_expected_lock_dir/owner.meta" 2>/dev/null)
+_assert_contains "verify lock: owner.meta names the acquiring process" "pid=$lock_proc_pid" "$lock_proc_out"
+rm -rf "$verify_expected_lock_dir"
+
+echo "=== sley: verify cache lock signal cleanup spares a successor's lock ==="
+
+# Normal release removes the lock before the loop clears `lock_dir`. If a
+# signal lands in between and another process has already re-acquired the
+# same path, the trap's second release must leave the successor's lock alone.
+lock_aba_rc=0
+_verify_lock_script <<'EOF' || lock_aba_rc=$?
+trap '_sley_verify_cache_lock_release "$VERIFY_LOCK_DIR" "${lock_token:-}"; exit 143' TERM
+_sley_verify_cache_lock_acquire "$VERIFY_RECEIPT" >/dev/null || exit 9
+_sley_verify_cache_lock_release "$VERIFY_LOCK_DIR" "${lock_token:-}"
+[[ ! -e "$VERIFY_LOCK_DIR" ]] || exit 8
+mkdir "$VERIFY_LOCK_DIR"
+printf 'pid=%s\nhost=%s\nstarted=0\ntoken=successor\n' "$PPID" "${HOSTNAME:-$(uname -n)}" \
+  >"$VERIFY_LOCK_DIR/owner.meta"
+kill -TERM "$$"
+exit 7
+EOF
+_assert_eq "verify lock: trap exits with the signal status" "143" "$lock_aba_rc"
+_assert_eq "verify lock: trap cleanup leaves the successor's lock" \
+  "successor" "$(_verify_lock_token "$verify_expected_lock_dir")"
+rm -rf "$verify_expected_lock_dir"
+
+echo "=== sley: verify cache lock reclaim cannot take a fresh lock ==="
+
+# Two waiters can both judge a dead owner's lock stale. If the other one
+# reclaims it and a third process acquires a fresh lock at the same path
+# before this waiter renames "the stale lock", the rename used to move the
+# live lock away and run the same command twice. The hook below injects that
+# interleaving right after the first stale verdict, then plays the fresh
+# holder: it checks its lock on every later probe and releases after three.
+lock_toctou_out=$(
+  _verify_lock_script 2>&1 <<'EOF'
+host=${HOSTNAME:-$(uname -n)}
+mkdir -p "$VERIFY_LOCK_DIR"
+printf 'pid=999999999\nhost=%s\nstarted=0\ntoken=dead\n' "$host" >"$VERIFY_LOCK_DIR/owner.meta"
+eval "$(declare -f _sley_verify_cache_lock_is_stale | sed '1s/^_sley_verify_cache_lock_is_stale/_orig_lock_is_stale/')"
+phase=stale probes=0
+_sley_verify_cache_lock_is_stale() {
+  local rc=0
+  _orig_lock_is_stale "$@" || rc=$?
+  case "$phase" in
+    stale)
+      if [[ "$rc" -eq 0 ]]; then
+        rm -rf "$1"
+        mkdir "$1"
+        printf 'pid=%s\nhost=%s\nstarted=0\ntoken=fresh\n' "$$" "$host" >"$1/owner.meta"
+        phase=held
+      fi
+      ;;
+    held)
+      probes=$((probes + 1))
+      grep -qx 'token=fresh' "$1/owner.meta" 2>/dev/null || echo "fresh-lock-disturbed"
+      if [[ "$probes" -ge 3 ]]; then
+        rm -rf "$1"
+        phase=released
+      fi
+      ;;
+  esac
+  return "$rc"
+}
+if _sley_verify_cache_lock_acquire "$VERIFY_RECEIPT" >/dev/null; then
+  echo "acquired-after=$phase"
+else
+  echo "not-acquired phase=$phase"
+fi
+EOF
+)
+_assert_contains "verify lock: waiter acquires only after the fresh holder releases" \
+  "acquired-after=released" "$lock_toctou_out"
+_assert_not_contains "verify lock: fresh lock is never moved while held" \
+  "fresh-lock-disturbed" "$lock_toctou_out"
+_assert_not_contains "verify lock: fresh lock is not reported as reclaimed" \
+  "reclaiming stale" "$lock_toctou_out"
+rm -rf "$verify_expected_lock_dir"
+
+echo "=== sley: verify cache lock treats an unsignalable live owner as alive ==="
+
+# `kill -0` also fails with EPERM for a live process owned by another user.
+# PID 1 is alive and, for a non-root user, unsignalable.
+if kill -0 1 2>/dev/null; then
+  echo "  SKIP: verify lock EPERM owner (PID 1 is signalable by this user)"
+else
+  lock_eperm_out=$(
+    _verify_lock_script <<'EOF'
+mkdir -p "$VERIFY_LOCK_DIR"
+printf 'pid=1\nhost=%s\nstarted=0\ntoken=other-user\n' "${HOSTNAME:-$(uname -n)}" >"$VERIFY_LOCK_DIR/owner.meta"
+_sley_verify_cache_lock_is_stale "$VERIFY_LOCK_DIR" && echo stale || echo live
+EOF
+  )
+  _assert_eq "verify lock: EPERM owner PID is not stale" "live" "$lock_eperm_out"
+  rm -rf "$verify_expected_lock_dir"
+fi
+
+echo "=== sley: verify cache lock recovers a lock left without owner metadata ==="
+
+# A holder killed between mkdir and writing owner.meta leaves a lock with no
+# owner to check. It must not block every later run forever, but a fresh one
+# is a live acquirer mid-stamp and must be left alone.
+lock_metaless_out=$(
+  _verify_lock_script <<'EOF'
+mkdir -p "$VERIFY_LOCK_DIR"
+_sley_verify_cache_lock_is_stale "$VERIFY_LOCK_DIR" && echo fresh=stale || echo fresh=live
+EOF
+)
+_assert_eq "verify lock: fresh lock without metadata is not stale" "fresh=live" "$lock_metaless_out"
+touch -t 200001010000 "$verify_expected_lock_dir"
+lock_metaless_stderr_file=$(_tmpdir)/verify_lock_metaless_stderr.txt
+lock_metaless_rc=0
+lock_metaless_out=$(
+  _verify_lock_script 2>"$lock_metaless_stderr_file" <<'EOF'
+_sley_verify_cache_lock_acquire "$VERIFY_RECEIPT" || exit
+printf '%s\n' "$lock_dir"
+EOF
+) || lock_metaless_rc=$?
+_assert_eq "verify lock: expired lock without metadata is reclaimed" "0" "$lock_metaless_rc"
+_assert_eq "verify lock: reclaimed metadata-less lock is re-acquired" \
+  "$verify_expected_lock_dir" "$lock_metaless_out"
+_assert_contains "verify lock: metadata-less reclaim is reported" \
+  "reclaiming stale cache lock" "$(cat "$lock_metaless_stderr_file")"
+rm -rf "$verify_expected_lock_dir"
+
+echo "=== sley: verify cache lock recovers a leaked reclaim mutex ==="
+
+# A reclaimer killed inside the reclaim critical section leaks the mutex; an
+# expired one must not block reclaiming a dead owner's lock forever.
+mkdir -p "$verify_expected_lock_dir" "$verify_expected_lock_dir.reclaim"
+printf 'pid=999999999\nhost=%s\nstarted=0\ntoken=dead\n' "${HOSTNAME:-$(uname -n)}" \
+  >"$verify_expected_lock_dir/owner.meta"
+touch -t 200001010000 "$verify_expected_lock_dir.reclaim"
+lock_mutex_rc=0
+_verify_lock_script >/dev/null 2>&1 <<'EOF' || lock_mutex_rc=$?
+_sley_verify_cache_lock_acquire "$VERIFY_RECEIPT"
+EOF
+_assert_eq "verify lock: expired reclaim mutex does not block reclaim" "0" "$lock_mutex_rc"
+_assert_file_missing "verify lock: expired reclaim mutex is removed" "$verify_expected_lock_dir.reclaim"
+rm -rf "$verify_expected_lock_dir" "$verify_expected_lock_dir.reclaim"
 
 echo "=== sley: secrets worktree scan preserves max-severity rc across files/batches ==="
 
@@ -6651,5 +6832,49 @@ _assert_contains "cache race: waiter reports cached pass" \
 _assert_eq "cache race: waiter does not rerun command" \
   "1" "$(cat "$cache_race_repo/tests/count")"
 rm -rf "$cache_race_lock_dir" 2>/dev/null || true
+
+echo "=== sley: verify signal while waiting on another run's cache lock ==="
+
+# The trap can fire while this run still polls for another agent's lock. It
+# must exit with the signal status and leave that agent's lock in place:
+# `lock_dir` already names the path, but the lock is not ours.
+printf 'changed again\n' >>"$cache_race_repo/src/app.txt"
+_run_sley "$cache_race_repo" verify --run-required --explain-cache
+_assert_exit "cache signal: setup run exits 0" 0 "$__SLEY_RC"
+cache_sig_receipt=$(printf '%s\n' "$__SLEY_OUT" | sed -n 's/^sley verify: cache receipt: //p' | head -1)
+rm -f "$cache_sig_receipt"
+cache_sig_lock_dir="$(dirname "$(dirname "$cache_sig_receipt")")/locks/$(basename "$cache_sig_receipt").lock"
+mkdir -p "$cache_sig_lock_dir"
+printf 'pid=%s\nhost=%s\nstarted=0\ntoken=holder\n' "$$" "${HOSTNAME:-$(uname -n)}" \
+  >"$cache_sig_lock_dir/owner.meta"
+cache_sig_count=$(cat "$cache_race_repo/tests/count")
+cache_sig_out=$(_tmpdir)/signal-out.txt
+: >"$cache_sig_out"
+(cd "$cache_race_repo" &&
+  XDG_CONFIG_HOME="$(_sley_test_xdg_config_home)" \
+  XDG_CACHE_HOME="$SLEY_TEST_XDG_CACHE_HOME" \
+  GIT_CONFIG_GLOBAL="$cache_race_repo/.gitconfig-test" \
+    exec "$SLEY" verify --run-required --explain-cache >"$cache_sig_out" 2>&1) &
+cache_sig_pid=$!
+cache_sig_seen=0
+for ((cache_sig_i = 0; cache_sig_i < 300; cache_sig_i++)); do
+  # The receipt line is the last output before lock acquisition starts.
+  if grep -q "cache receipt: " "$cache_sig_out" 2>/dev/null; then
+    cache_sig_seen=1
+    break
+  fi
+  kill -0 "$cache_sig_pid" 2>/dev/null || break
+  sleep 0.1
+done
+_assert_eq "cache signal: waiter reached the held lock" "1" "$cache_sig_seen"
+kill -TERM "$cache_sig_pid" 2>/dev/null
+cache_sig_rc=0
+wait "$cache_sig_pid" || cache_sig_rc=$?
+_assert_eq "cache signal: waiter exits with the TERM status" "143" "$cache_sig_rc"
+_assert_eq "cache signal: other run's lock survives the waiter's trap" \
+  "holder" "$(awk -F= '$1=="token" {print $2}' "$cache_sig_lock_dir/owner.meta" 2>/dev/null)"
+_assert_eq "cache signal: interrupted waiter did not run the command" \
+  "$cache_sig_count" "$(cat "$cache_race_repo/tests/count")"
+rm -rf "$cache_sig_lock_dir" 2>/dev/null || true
 
 _test_summary
