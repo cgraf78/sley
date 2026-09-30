@@ -468,9 +468,18 @@ _assert_contains "changes: json has files" '"files":[' "$__SLEY_OUT"
 _assert_contains "changes: json includes exists field" '"exists":true' "$__SLEY_OUT"
 
 no_json_encoder_path=$(_mock_bin)
-for cmd in bash git dirname; do
+for cmd in bash dirname; do
   ln -s "$(command -v "$cmd")" "$no_json_encoder_path/$cmd"
 done
+# Link Git's own executable rather than the first `git` on the caller's PATH.
+# That entry can be a wrapper script (a dotfiles launcher or version-manager
+# shim) that sources helpers relative to its install directory or needs tools
+# this pruned PATH omits; symlinked here it fails, and sley reports
+# "unsupported repo" before reaching the encoder check. Standard Git installs
+# place the real binary in the exec-path; fall back to PATH if it is absent.
+no_json_encoder_git="$(git --exec-path)/git"
+[[ -x "$no_json_encoder_git" ]] || no_json_encoder_git=$(command -v git)
+ln -s "$no_json_encoder_git" "$no_json_encoder_path/git"
 __SLEY_OUT=$(
   cd "$repo" &&
     GIT_CONFIG_GLOBAL="$repo/.gitconfig-test" PATH="$no_json_encoder_path" "$SLEY" status --json 2>&1
