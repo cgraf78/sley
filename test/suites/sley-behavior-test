@@ -3725,6 +3725,34 @@ _run_sley "$repo" verify --run-required
 _assert_exit "verify registry: failing mapped command blocks readiness" 1 "$__SLEY_RC"
 _assert_contains "verify registry: failing command exit recorded" "exit code: 7" "$__SLEY_OUT"
 
+# The run loop reads the required-command list from a here-string. A command
+# that reads stdin (cat, ssh, docker -i, some test runners) must not consume
+# the rest of that list: the later failing command has to run and block.
+repo=$(_new_repo)
+mkdir -p "$repo/src" "$repo/.sley"
+printf 'initial\n' >"$repo/src/app.txt"
+stdin_log=$(_tmpdir)/verify-stdin.log
+cat >"$repo/.sley/verify.json" <<'EOF'
+{"rules":[{"paths":["src/**"],"commands":[
+  "cat >/dev/null; echo first-ran >>\"$STDIN_LOG\"",
+  "echo second-ran >>\"$STDIN_LOG\"; exit 5"
+]}]}
+EOF
+(cd "$repo" && git add . && git commit -q -m "seed stdin-reading verify registry")
+echo "changed" >>"$repo/src/app.txt"
+
+STDIN_LOG="$stdin_log" _run_sley "$repo" verify --run-required
+_assert_exit "verify registry: stdin-reading command does not swallow later commands" 1 "$__SLEY_RC"
+_assert_contains "verify registry: stdin-reading command runs" "first-ran" "$(cat "$stdin_log" 2>/dev/null)"
+_assert_contains "verify registry: command after stdin reader still runs" "second-ran" "$(cat "$stdin_log" 2>/dev/null)"
+_assert_contains "verify registry: command after stdin reader reports its exit" "exit code: 5" "$__SLEY_OUT"
+
+: >"$stdin_log"
+STDIN_LOG="$stdin_log" _run_sley "$repo" verify --run-required --json
+_assert_exit "verify registry: json stdin-reading command does not swallow later commands" 1 "$__SLEY_RC"
+_assert_contains "verify registry: json command after stdin reader still runs" "second-ran" "$(cat "$stdin_log" 2>/dev/null)"
+_assert_contains "verify registry: json reports command after stdin reader" '"exit_code":5' "$__SLEY_OUT"
+
 repo=$(_new_repo)
 cat >"$repo/file.go" <<'EOF'
 package main

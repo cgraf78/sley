@@ -1266,10 +1266,15 @@ _sley_verify_run_required_impl() {
         return 1
         ;;
     esac
+    # This loop reads its command list from the here-string on stdin. A
+    # command that reads stdin (cat, ssh, `docker -i`, some test runners)
+    # would otherwise consume the remaining list, silently skip every later
+    # required command, and let the gate pass. Required commands are
+    # non-interactive by contract, so they get an empty stdin.
     if [[ "$json" == "1" ]]; then
-      bash "$shell_flag" "$command" >&2
+      bash "$shell_flag" "$command" </dev/null >&2
     else
-      bash "$shell_flag" "$command"
+      bash "$shell_flag" "$command" </dev/null
     fi
     exit_code=$?
     [[ "$json" == "1" ]] || echo "sley verify: exit code: $exit_code"
