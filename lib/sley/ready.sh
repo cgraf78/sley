@@ -30,6 +30,36 @@ _sley_ready_run_phase() {
   esac
 }
 
+_sley_ready_phase_payload() {
+  # Runs inside the phase guardian's payload subshell, so the assignments
+  # cannot leak into the worker. The first argument is the commit gate's
+  # evidence file for this phase, or empty (see `_sley_phase_evidence`); it
+  # stays an unexported shell variable so nested commands never write it.
+  # shellcheck disable=SC2034 # read by `_sley_phase_evidence` in this subshell.
+  local _SLEY_PHASE_EVIDENCE_FILE="$1"
+  shift
+  # shellcheck disable=SC2034 # read by `_sley_init_repo` in this subshell.
+  SLEY_ORIGINAL_PWD="$_SLEY_CALLER_PWD"
+  _sley_ready_run_phase "$@"
+}
+
+_sley_ready_gate_commit_command() {
+  # The one-commit override is an environment variable, so it reaches the
+  # native hook through the VCS command that runs it.
+  case "$_REPO_TYPE" in
+    sl) printf 'sl commit ...' ;;
+    *) printf 'git commit ...' ;;
+  esac
+}
+
+_sley_ready_join_phases() {
+  local joined="" phase
+  for phase in "$@"; do
+    joined+="${joined:+, }$phase"
+  done
+  printf '%s' "$joined"
+}
+
 _sley_ready_usage() {
   cat <<'EOF'
 Usage: sley ready [OPTIONS]
@@ -56,6 +86,12 @@ Scope:
   --repo-wide          consider all changed files in the repo
   --path PATH          restrict selected changed files to PATH
   --json               emit machine-readable output
+
+Environment:
+  SLEY_ALLOW_UNAVAILABLE=PHASES
+                       with --commit, tolerate exit 2 (missing tool or tool
+                       error) from check and/or secrets, comma-separated,
+                       when the phase reports no findings
 EOF
 }
 
@@ -1223,44 +1259,90 @@ _sley_ready_run_format_file_list() {
   return 0
 }
 
+_sley_ready_reap() {
+  local child_pid="$1" wait_rc deferred_before
+  # `wait` returns above 128 both when a trapped signal interrupts it and when
+  # the child itself died from a signal, and Bash keeps returning a reaped
+  # child's saved status. Only a deferred cancellation trap can interrupt this
+  # wait, so retry exactly when `_sley_ready_cancel_impl` ran during it; an
+  # interrupted wait then cannot abandon a child that is still running.
+  while :; do
+    deferred_before=${_sley_ready_deferred_signals:-0}
+    wait "$child_pid" 2>/dev/null && return 0
+    wait_rc=$?
+    [[ "$wait_rc" -gt 128 ]] || return 0
+    [[ "${_sley_ready_deferred_signals:-0}" != "$deferred_before" ]] || return 0
+  done
+}
+
+_sley_ready_abort_launch() {
+  local child_pid="$1" child_control="$2"
+  # Keep the abort file and control directory until the guardian is reaped. A
+  # cancellation signal only records a pending status while a launch is in
+  # progress, so removing the directory after an interrupted wait would let a
+  # guardian that has not yet observed the abort poll forever. If the abort
+  # file cannot be written, removing the directory is the guardian's other
+  # exit condition.
+  : >"$child_control/abort" 2>/dev/null || rm -rf -- "$child_control"
+  _sley_ready_reap "$child_pid"
+  rm -rf -- "$child_control"
+}
+
+_sley_ready_guardian() {
+  local child_control="$1" child_rc
+  shift
+  # Body of every managed process-group leader. It waits for the worker to
+  # publish `run` after recording ownership, then runs the payload in a
+  # foreground child and keeps its immutable cancellation traps.
+  _sley_ready_guardian_status=""
+  trap '_sley_ready_guardian_cancel 129' HUP
+  trap '_sley_ready_guardian_cancel 130' INT
+  trap '_sley_ready_guardian_cancel 143' TERM
+  # A vanished control directory also ends the wait: an abandoned launch must
+  # never leave an unowned guardian polling after the worker is gone.
+  while [[ -d "$child_control" && ! -e "$child_control/run" &&
+    ! -e "$child_control/abort" && ! -e "$_sley_ready_worker_dead" ]]; do
+    sleep 0.01
+  done
+  [[ -e "$child_control/run" && ! -e "$child_control/abort" &&
+    ! -e "$_sley_ready_worker_dead" ]] || exit 2
+  # Keep hook-owned trap changes inside a foreground child. This process-group
+  # leader remains a guardian with immutable cancellation traps, so graceful
+  # hook cleanup cannot replace the guardian's final escalation behavior.
+  if (
+    # A cancellation trap that ran during the gate wait records its status and
+    # returns so the leader survives for escalation. Check it in the payload
+    # process: a signal handled before this fork is inherited here and stops
+    # the payload, while one handled after it is enforced by the guardian's
+    # group kill. Otherwise the payload would start after cancellation with
+    # the handler's ignored TERM, INT, and HUP dispositions.
+    [[ -z "$_sley_ready_guardian_status" ]] || exit "$_sley_ready_guardian_status"
+    _sley_ready_run_guarded_command "$@"
+  ); then
+    child_rc=0
+  else
+    child_rc=$?
+  fi
+  if [[ -n "$_sley_ready_guardian_status" ]]; then
+    exit "$_sley_ready_guardian_status"
+  fi
+  exit "$child_rc"
+}
+
 _sley_ready_run_owned() {
-  local child_rc started_pid started_identity started_group child_control child_run child_abort
+  local child_rc started_pid started_identity started_group child_control child_run
   local child_had_monitor=0
   local _sley_ready_owned_record=""
   child_control=$(mktemp -d "$_sley_ready_status_dir/child.XXXXXX") || return 2
   child_run=$child_control/run
-  child_abort=$child_control/abort
   _sley_ready_launching_child=1
   [[ "$-" == *m* ]] && child_had_monitor=1
   set -m
-  (
-    _sley_ready_guardian_status=""
-    trap '_sley_ready_guardian_cancel 129' HUP
-    trap '_sley_ready_guardian_cancel 130' INT
-    trap '_sley_ready_guardian_cancel 143' TERM
-    while [[ ! -e "$child_run" && ! -e "$child_abort" && ! -e "$_sley_ready_worker_dead" ]]; do
-      sleep 0.01
-    done
-    [[ ! -e "$child_abort" && ! -e "$_sley_ready_worker_dead" ]] || exit 2
-    # Keep hook-owned trap changes inside a foreground child. This process-group
-    # leader remains a guardian with immutable cancellation traps, so graceful
-    # hook cleanup cannot replace the guardian's final escalation behavior.
-    if (_sley_ready_run_guarded_command "$@"); then
-      child_rc=0
-    else
-      child_rc=$?
-    fi
-    if [[ -n "$_sley_ready_guardian_status" ]]; then
-      exit "$_sley_ready_guardian_status"
-    fi
-    exit "$child_rc"
-  ) </dev/null &
+  _sley_ready_guardian "$child_control" "$@" </dev/null &
   started_pid=$!
   [[ "$child_had_monitor" == "1" ]] || set +m
   if ! started_identity=$(_sley_ready_process_identity "$started_pid"); then
-    : >"$child_abort" 2>/dev/null || true
-    wait "$started_pid" 2>/dev/null || true
-    rm -rf -- "$child_control"
+    _sley_ready_abort_launch "$started_pid" "$child_control"
     _sley_ready_finish_child_launch
     _sley_ready_supervision_failure="process identity is unavailable"
     _sley_ready_supervision_error formatter "$_sley_ready_supervision_failure"
@@ -1268,9 +1350,7 @@ _sley_ready_run_owned() {
   fi
   if ! started_group=$(_sley_ready_process_group "$started_pid") ||
     [[ "$started_group" != "$started_pid" ]]; then
-    : >"$child_abort" 2>/dev/null || true
-    wait "$started_pid" 2>/dev/null || true
-    rm -rf -- "$child_control"
+    _sley_ready_abort_launch "$started_pid" "$child_control"
     _sley_ready_finish_child_launch
     _sley_ready_supervision_failure="dedicated process group is unavailable"
     _sley_ready_supervision_error formatter "$_sley_ready_supervision_failure"
@@ -1281,12 +1361,10 @@ _sley_ready_run_owned() {
   active_child_group=$started_group
   if ! _sley_ready_register_owned_process \
     "$started_pid" "$started_identity" "$started_group"; then
-    : >"$child_abort" 2>/dev/null || true
-    wait "$started_pid" 2>/dev/null || true
+    _sley_ready_abort_launch "$started_pid" "$child_control"
     active_child_pid=""
     active_child_identity=""
     active_child_group=""
-    rm -rf -- "$child_control"
     _sley_ready_finish_child_launch
     _sley_ready_supervision_failure="ownership record could not be published"
     _sley_ready_supervision_error formatter "$_sley_ready_supervision_failure"
@@ -1294,14 +1372,12 @@ _sley_ready_run_owned() {
   fi
   active_child_record=$_sley_ready_owned_record
   : >"$child_run" || {
-    : >"$child_abort" 2>/dev/null || true
-    wait "$started_pid" 2>/dev/null || true
+    _sley_ready_abort_launch "$started_pid" "$child_control"
     active_child_pid=""
     active_child_identity=""
     active_child_group=""
     rm -f -- "$active_child_record"
     active_child_record=""
-    rm -rf -- "$child_control"
     _sley_ready_finish_child_launch
     _sley_ready_supervision_failure="launch gate could not be published"
     _sley_ready_supervision_error formatter "$_sley_ready_supervision_failure"
@@ -1324,12 +1400,22 @@ _sley_ready_run_owned() {
 
 _sley_ready_cancel_impl() {
   local signal_status="$1"
-  if [[ "${_sley_ready_launching_child:-0}" == "1" ]]; then
+  # Defer while a launch or a cleanup is in progress. Both publish ownership
+  # or restore user files in steps that must not be abandoned halfway; each
+  # honors the pending status as soon as it completes.
+  if [[ "${_sley_ready_launching_child:-0}" == "1" ||
+    "${_sley_ready_cleanup_active:-0}" == "1" ]]; then
+    # Counted so `_sley_ready_reap` can tell an interrupted wait from a child
+    # that exited by a signal.
+    _sley_ready_deferred_signals=$((${_sley_ready_deferred_signals:-0} + 1))
     if [[ "${_sley_ready_pending_status:-0}" == "0" ]]; then
       _sley_ready_pending_status=$signal_status
     fi
     return 0
   fi
+  # A status deferred by a finished launch or cleanup came first; keep it.
+  [[ "${_sley_ready_pending_status:-0}" == "0" ]] ||
+    signal_status=$_sley_ready_pending_status
   trap '' INT TERM HUP
   _sley_ready_cleanup
   exit "$signal_status"
@@ -1351,8 +1437,14 @@ _sley_ready_cleanup() {
   local active_child_tree="" active_descendant_tree=""
   local -a cleanup_child_pids=() cleanup_child_identities=() cleanup_child_groups=()
   local -a cleanup_child_trees=()
+  local pending_status
   [[ "${_sley_ready_cleanup_done:-0}" == "0" ]] || return 0
-  _sley_ready_cleanup_done=1
+  [[ "${_sley_ready_cleanup_active:-0}" == "0" ]] || return 0
+  # Mark cleanup in progress, not complete, until every resource is released.
+  # A signal arriving meanwhile is deferred by `_sley_ready_cancel_impl`;
+  # otherwise its recursive cleanup would return at once and exit, skipping the
+  # rest of this teardown, including restoring a `--fix` backup.
+  _sley_ready_cleanup_active=1
 
   # Snapshot each owned tree before signaling its root. Start-time identities
   # keep delayed escalation safe even if a descendant exits and its PID is
@@ -1411,7 +1503,7 @@ _sley_ready_cleanup() {
     "${active_child_pid:-}" \
     "${phase_pids[@]+"${phase_pids[@]}"}"; do
     [[ -n "$child_pid" ]] || continue
-    wait "$child_pid" 2>/dev/null || true
+    _sley_ready_reap "$child_pid"
   done
   [[ -z "${active_child_record:-}" ]] || rm -f -- "$active_child_record"
   active_child_pid=""
@@ -1461,6 +1553,14 @@ _sley_ready_cleanup() {
   stderr_file=""
   selected_cache_file=""
   _fix_batch_file=""
+  _sley_ready_cleanup_done=1
+  _sley_ready_cleanup_active=0
+  pending_status=${_sley_ready_pending_status:-0}
+  _sley_ready_pending_status=0
+  if [[ "$pending_status" != "0" ]]; then
+    trap '' INT TERM HUP
+    exit "$pending_status"
+  fi
 }
 
 _sley_ready_impl() {
@@ -1532,6 +1632,33 @@ _sley_ready_impl() {
 
   _sley_parse_scope "${scope_args[@]}" || return $?
   [[ "$_SLEY_SCOPE_JSON" == "0" ]] || _repo_require_json_encoder || return 2
+  # `--commit` is the commit-gate path used by native and agent hooks. There,
+  # a check or secrets phase that could not run must block instead of being
+  # reported as optional unavailability; see the rc 2 handling below.
+  local commit_gate=0 allow_unavailable=" "
+  local -a gate_unavailable=() gate_bypassed=()
+  local -a gate_unconfirmed=() gate_unconfirmed_reasons=()
+  _sley_scope_is_commit && commit_gate=1
+  # SLEY_ALLOW_UNAVAILABLE is the deliberate, per-phase override for that
+  # block. An invalid value fails the gate loudly; outside the gate, where rc
+  # 2 from these phases is already advisory, it only warns so a leaked value
+  # cannot break report callers. Unset it afterwards so verify commands and
+  # extensions (including a nested `sley ready --commit`) do not inherit it.
+  if [[ -n "${SLEY_ALLOW_UNAVAILABLE:-}" ]]; then
+    if ! allow_unavailable=$(
+      _sley_parse_allow_unavailable "sley ready" "$SLEY_ALLOW_UNAVAILABLE"
+    ); then
+      [[ "$commit_gate" == "1" ]] && return 2
+      allow_unavailable=" "
+    elif [[ "$commit_gate" == "1" ]]; then
+      # Announce every use, not only actual bypasses, so a value leaked
+      # into a shell profile or agent environment is visible before a
+      # tool goes missing.
+      printf 'sley ready: SLEY_ALLOW_UNAVAILABLE=%s is set; an exit 2 from those phases that reports no findings will not block this commit\n' \
+        "$SLEY_ALLOW_UNAVAILABLE" >&2
+    fi
+    unset SLEY_ALLOW_UNAVAILABLE
+  fi
   local progress=0
   [[ "$quiet" != "1" && "$_SLEY_SCOPE_JSON" != "1" ]] && progress=1
 
@@ -1547,6 +1674,7 @@ _sley_ready_impl() {
   local rc global=0 phase status phases_json="" first=1 blocking=0 unavailable=0 errors=0
   local phase_stdout phase_stderr phase_combined summary_line
   local phase_extra_json status_detail verify_cached verify_total
+  local phase_evidence phase_reason phase_reason_json evidence_file
   local _ready_report="" _verify_observed=0
   local stdout_file="" stderr_file="" pid phase_index child_identity child_group
   local child_control child_run child_abort child_had_monitor
@@ -1556,7 +1684,9 @@ _sley_ready_impl() {
   local -a phase_control_dirs=() phase_record_files=()
   local -a phase_stdout_files=() phase_stderr_files=()
   local extension_phases extension_phase
-  local _sley_ready_cleanup_done=0 _sley_ready_launching_child=0 _sley_ready_pending_status=0
+  local _sley_ready_cleanup_done=0 _sley_ready_cleanup_active=0
+  local _sley_ready_launching_child=0 _sley_ready_pending_status=0
+  local _sley_ready_deferred_signals=0
   local _sley_ready_supervision_failure=""
   local _fix_bak="" _fix_active_file="" _fix_preserve_backup=0
   local _fix_batch_file=""
@@ -1854,45 +1984,28 @@ _sley_ready_impl() {
     child_had_monitor=0
     [[ "$-" == *m* ]] && child_had_monitor=1
     set -m
-    (
-      _sley_ready_guardian_status=""
-      trap '_sley_ready_guardian_cancel 129' HUP
-      trap '_sley_ready_guardian_cancel 130' INT
-      trap '_sley_ready_guardian_cancel 143' TERM
-      while [[ ! -e "$child_run" && ! -e "$child_abort" && ! -e "$_sley_ready_worker_dead" ]]; do
-        sleep 0.01
-      done
-      [[ ! -e "$child_abort" && ! -e "$_sley_ready_worker_dead" ]] || exit 2
-      if (
-        # shellcheck disable=SC2034 # read by `_sley_init_repo` in this subshell.
-        SLEY_ORIGINAL_PWD="$_SLEY_CALLER_PWD"
-        _sley_ready_run_guarded_command \
-          _sley_ready_run_phase "$phase" "$full" "$force" "${scope_args[@]}"
-      ); then
-        rc=0
-      else
-        rc=$?
-      fi
-      if [[ -n "$_sley_ready_guardian_status" ]]; then
-        exit "$_sley_ready_guardian_status"
-      fi
-      exit "$rc"
-    ) </dev/null >"$stdout_file" 2>"$stderr_file" &
+    # The gate asks check and secrets what an exit 2 hides; see the rc 2
+    # handling below. The file lives in this phase's private control dir.
+    evidence_file=""
+    if [[ "$commit_gate" == "1" ]] &&
+      [[ "$phase" == "check" || "$phase" == "secrets" ]]; then
+      evidence_file=$child_control/evidence
+    fi
+    _sley_ready_guardian "$child_control" \
+      _sley_ready_phase_payload "$evidence_file" \
+      "$phase" "$full" "$force" "${scope_args[@]}" \
+      </dev/null >"$stdout_file" 2>"$stderr_file" &
     pid=$!
     [[ "$child_had_monitor" == "1" ]] || set +m
     if ! child_identity=$(_sley_ready_process_identity "$pid"); then
-      : >"$child_abort" 2>/dev/null || true
-      wait "$pid" 2>/dev/null || true
-      rm -rf -- "$child_control"
+      _sley_ready_abort_launch "$pid" "$child_control"
       _sley_ready_finish_child_launch
       _sley_ready_supervision_error "phase $phase" "process identity is unavailable"
       _sley_ready_cleanup
       return 2
     fi
     if ! child_group=$(_sley_ready_process_group "$pid") || [[ "$child_group" != "$pid" ]]; then
-      : >"$child_abort" 2>/dev/null || true
-      wait "$pid" 2>/dev/null || true
-      rm -rf -- "$child_control"
+      _sley_ready_abort_launch "$pid" "$child_control"
       _sley_ready_finish_child_launch
       _sley_ready_supervision_error "phase $phase" "dedicated process group is unavailable"
       _sley_ready_cleanup
@@ -1937,6 +2050,11 @@ _sley_ready_impl() {
     phase_groups[phase_index]=""
     rm -f -- "${phase_record_files[$phase_index]}"
     phase_record_files[phase_index]=""
+    phase_evidence=""
+    phase_reason=""
+    if [[ -f "${phase_control_dirs[$phase_index]}/evidence" ]]; then
+      IFS= read -r phase_evidence <"${phase_control_dirs[$phase_index]}/evidence" || true
+    fi
     rm -rf -- "${phase_control_dirs[$phase_index]}"
     phase_control_dirs[phase_index]=""
     phase_stdout=$(cat "$stdout_file")
@@ -1964,6 +2082,44 @@ _sley_ready_impl() {
           status="error"
           errors=$((errors + 1))
           global=2
+        elif [[ "$commit_gate" == "1" ]] &&
+          [[ "$phase" == "check" || "$phase" == "secrets" ]]; then
+          # In the commit gate, rc 2 means lint or secret scanning did not
+          # complete: a missing tool, or a tool error such as a broken linter
+          # config. Treating that as optional would let findings or a leaked
+          # secret land, so the gate fails closed and names the phase. Exit 2
+          # also outranks findings (Checkrun across and within files, the
+          # secret scan across files), so the status alone cannot say what it
+          # hides: the phase's evidence decides whether the override may apply.
+          case "$phase_evidence" in
+            "clean tool-unavailable") phase_reason=tool-unavailable ;;
+            "clean tool-error") phase_reason=tool-error ;;
+            findings) phase_reason=findings ;;
+            *) phase_reason=unconfirmed ;;
+          esac
+          if [[ "$phase_reason" == tool-* &&
+            "$allow_unavailable" == *" $phase "* ]]; then
+            # Allowed for this invocation only, and only because the phase
+            # confirmed it reported no findings. It stays visible as
+            # `bypassed` in the report and JSON.
+            status="bypassed"
+            unavailable=$((unavailable + 1))
+            gate_bypassed+=("$phase")
+          elif [[ "$phase_reason" == tool-* ]]; then
+            status="error"
+            errors=$((errors + 1))
+            global=2
+            gate_unavailable+=("$phase")
+          else
+            # Findings, or no proof of their absence (a lint hook override,
+            # an older Checkrun, or a secret scanner that ran and failed).
+            # The override never applies, so the hint must not offer it.
+            status="error"
+            errors=$((errors + 1))
+            global=2
+            gate_unconfirmed+=("$phase")
+            gate_unconfirmed_reasons+=("$phase_reason")
+          fi
         else
           # Direct phase invocations can fail hard for missing tools or
           # unsupported scopes, but `ready` is a report. Keep those gaps visible
@@ -2021,12 +2177,19 @@ _sley_ready_impl() {
     if [[ "$_SLEY_SCOPE_JSON" == "1" ]]; then
       [[ "$first" == "1" ]] || phases_json+=","
       first=0
+      # Commit-gate rows for a check or secrets exit 2 say why: `tool-
+      # unavailable` or `tool-error` (bypassable) versus `findings` or
+      # `unconfirmed` (never bypassable). Other rows keep their shape.
+      phase_reason_json=""
+      [[ -z "$phase_reason" ]] ||
+        phase_reason_json=",\"reason\":\"$phase_reason\""
       if [[ -n "$summary_line" ]]; then
-        phases_json+=$(printf '{"name":"%s","status":"%s","exit_code":%s,"summary":"%s"%s}' \
-          "$phase" "$status" "$rc" "$(_repo_json_escape "$summary_line")" "$phase_extra_json")
+        phases_json+=$(printf '{"name":"%s","status":"%s","exit_code":%s%s,"summary":"%s"%s}' \
+          "$phase" "$status" "$rc" "$phase_reason_json" \
+          "$(_repo_json_escape "$summary_line")" "$phase_extra_json")
       else
-        phases_json+=$(printf '{"name":"%s","status":"%s","exit_code":%s,"summary":null%s}' \
-          "$phase" "$status" "$rc" "$phase_extra_json")
+        phases_json+=$(printf '{"name":"%s","status":"%s","exit_code":%s%s,"summary":null%s}' \
+          "$phase" "$status" "$rc" "$phase_reason_json" "$phase_extra_json")
       fi
     else
       _ready_report+="$phase: $rc ($status_detail)"$'\n'
@@ -2061,5 +2224,40 @@ _sley_ready_impl() {
     printf '{"phases":[%s],"summary":{"blocking":%s,"unavailable":%s,"errors":%s,"exit_code":%s}}\n' \
       "$phases_json" "$blocking" "$unavailable" "$errors" "$global"
   fi
+  # stderr keeps `--json` stdout machine-readable, and both notes print even
+  # with --quiet. The phase's own diagnostic is already in the report.
+  if [[ "${#gate_bypassed[@]}" -gt 0 ]]; then
+    printf 'sley ready: commit gate: allowed %s to exit 2 via SLEY_ALLOW_UNAVAILABLE (no findings reported; the part its failed tool covers was not checked)\n' \
+      "$(_sley_ready_join_phases "${gate_bypassed[@]}")" >&2
+  fi
+  if [[ "${#gate_unavailable[@]}" -gt 0 ]]; then
+    local gate_phases gate_allow
+    gate_phases=$(_sley_ready_join_phases "${gate_unavailable[@]}")
+    if [[ "${#gate_unconfirmed[@]}" -gt 0 ]]; then
+      # Another phase blocks regardless, so retrying with the override
+      # would fail again; do not suggest it.
+      printf 'sley ready: commit gate blocked: %s exited 2 (missing tool or tool error; see its output above); fix it\n' \
+        "$gate_phases" >&2
+    else
+      # The suggested value keeps phases already allowed on this run, so
+      # retrying the printed command does not drop an earlier allowance.
+      gate_allow=$(_sley_ready_join_phases \
+        "${gate_bypassed[@]+"${gate_bypassed[@]}"}" "${gate_unavailable[@]}")
+      printf 'sley ready: commit gate blocked: %s exited 2 (missing tool or tool error; see its output above); fix it, or allow it for one commit deliberately: SLEY_ALLOW_UNAVAILABLE=%s %s\n' \
+        "$gate_phases" "${gate_allow//, /,}" "$(_sley_ready_gate_commit_command)" >&2
+    fi
+  fi
+  local gate_index
+  for gate_index in "${!gate_unconfirmed[@]}"; do
+    if [[ "${gate_unconfirmed_reasons[$gate_index]}" == findings ]]; then
+      printf 'sley ready: commit gate blocked: %s exited 2 and reported findings (see its output above); SLEY_ALLOW_UNAVAILABLE never bypasses findings\n' \
+        "${gate_unconfirmed[$gate_index]}" >&2
+    elif [[ "${gate_unconfirmed[$gate_index]}" == secrets ]]; then
+      printf 'sley ready: commit gate blocked: secrets exited 2 without confirming it found nothing (a scanner that ran and failed may have seen secrets); fix it, SLEY_ALLOW_UNAVAILABLE cannot bypass it\n' >&2
+    else
+      printf 'sley ready: commit gate blocked: %s exited 2 without confirming it found nothing (a lint hook override or an older Checkrun cannot report findings separately); fix it, SLEY_ALLOW_UNAVAILABLE cannot bypass it\n' \
+        "${gate_unconfirmed[$gate_index]}" >&2
+    fi
+  done
   return "$global"
 }

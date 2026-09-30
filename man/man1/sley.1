@@ -123,6 +123,35 @@ processes when a secret scan has multiple independent scan items. Defaults to
 the online CPU count (4 if unknown), capped at 8; a non-numeric or
 smaller-than-1 value means 1.
 .TP
+.B SLEY_ALLOW_UNAVAILABLE
+Comma-separated phases, from
+.B check
+and
+.BR secrets ,
+whose exit status of 2 (a missing tool or tool error) the
+.B ready --commit
+gate tolerates for this invocation, for example
+.BR "SLEY_ALLOW_UNAVAILABLE=secrets git commit" " or"
+.BR "SLEY_ALLOW_UNAVAILABLE=check sl commit" .
+The exit is tolerated only when the phase confirms it reported no findings:
+the linter is missing, or Checkrun's
+.B autolint
+reports no findings next to its tool error, or no secret scan reported leaks
+or failed (the exit came from sley itself, such as a missing gitleaks).
+Findings always block, including findings that an exit status of
+2 outranks; so does an exit 2 that the phase cannot vouch for, such as a lint
+hook extension that runs its own linter, an older Checkrun, or a secret
+scanner that ran and failed. A tolerated phase is reported as bypassed rather
+than hidden, and every other phase still gates the commit. The Git
+.B commit-msg
+hook's
+.B secrets --message-file
+scan honors the same value and rule. The variable covers every commit that the
+one VCS command creates, such as each commit a rebase or histedit replays. Any
+other value is a usage error for
+.B ready --commit
+and only a warning otherwise.
+.TP
 .B SLEY_GIT_COMMIT_GATE
 Executable path that the provider-owned Git hook launchers run instead of the
 bundled
@@ -237,7 +266,14 @@ For
 .BR ready ,
 an exit status of 2 from the status or verify phase, or any unexpected phase
 exit status, is an error; other phases that exit 2 are reported as unavailable
-without failing the aggregate report.
+without failing the aggregate report. With
+.BR --commit ,
+the commit-gate path, an exit status of 2 from the check or secrets phase is
+also an error: a missing or misconfigured linter or secret scanner blocks the
+commit instead of letting it land unchecked. To allow that for one commit
+deliberately when the phase reported no findings, set
+.B SLEY_ALLOW_UNAVAILABLE
+for the commit command.
 .SH SEE ALSO
 .BR checkrun (1),
 .BR autoformat (1),

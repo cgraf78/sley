@@ -206,6 +206,10 @@ sley_hook_format() {
 # sley_hook_lint <newline-separated-files>
 #   Lint a hook-selected file list in batch. Return 2 when the linter is
 #   unavailable so orchestrators can distinguish missing tools from lint errors.
+#   The commit gate lets SLEY_ALLOW_UNAVAILABLE bypass that 2 only when the
+#   stock hook confirms no findings were reported, so an override's own exit 2
+#   blocks; an override that delegates to `_sley_hook_lint` must return its
+#   status unchanged rather than merge it with another linter's findings.
 sley_hook_lint() {
   local -
   set -u
@@ -295,6 +299,55 @@ EOF
 _sley_die() {
   printf 'sley: %s\n' "$*" >&2
   return 2
+}
+
+# _sley_parse_allow_unavailable PREFIX VALUE
+#   Validate SLEY_ALLOW_UNAVAILABLE and print the allowed phases as a
+#   space-delimited list (" check secrets "). Only phases whose exit 2 a commit
+#   gate would otherwise block can be allowed; anything else is a usage error
+#   so a typo cannot silently leave the gate closed or open. Shared by
+#   `sley ready --commit` and the commit-message secret scan, which gate the
+#   same commit; PREFIX names the caller in diagnostics.
+_sley_parse_allow_unavailable() {
+  local prefix="$1" value="$2" entry allowed=" "
+  local -a entries=()
+  # `read` stops at a newline, which would silently drop later entries.
+  if [[ "$value" == *$'\n'* ]]; then
+    echo "$prefix: SLEY_ALLOW_UNAVAILABLE must be one comma-separated line" >&2
+    return 2
+  fi
+  IFS=, read -r -a entries <<<"$value"
+  for entry in "${entries[@]+"${entries[@]}"}"; do
+    entry=${entry#"${entry%%[![:space:]]*}"}
+    entry=${entry%"${entry##*[![:space:]]}"}
+    [[ -n "$entry" ]] || continue
+    case "$entry" in
+      check | secrets)
+        [[ "$allowed" == *" $entry "* ]] || allowed+="$entry "
+        ;;
+      *)
+        printf '%s: SLEY_ALLOW_UNAVAILABLE: phase cannot be allowed: %s (allowed: check, secrets)\n' \
+          "$prefix" "$entry" >&2
+        return 2
+        ;;
+    esac
+  done
+  printf '%s\n' "$allowed"
+}
+
+# _sley_phase_evidence LINE
+#   Tell a `sley ready --commit` parent what this check or secrets phase knows
+#   about findings when it exits 2. Exit 2 outranks findings in both phases, so
+#   the status alone cannot say whether a finding hides behind a tool error,
+#   and SLEY_ALLOW_UNAVAILABLE may bypass the exit only on positive evidence.
+#   LINE is `clean tool-unavailable` (the tool is missing), `clean tool-error`
+#   (it could not complete and reported no findings), or `findings`. Ready
+#   sets `_SLEY_PHASE_EVIDENCE_FILE` only in the phase's own process, so direct
+#   commands write nothing, and a missing or unwritable file reads as unknown,
+#   which never bypasses.
+_sley_phase_evidence() {
+  [[ -n "${_SLEY_PHASE_EVIDENCE_FILE:-}" ]] || return 0
+  printf '%s\n' "$1" 2>/dev/null >"$_SLEY_PHASE_EVIDENCE_FILE" || true
 }
 
 _sley_count_file_list() {
@@ -766,6 +819,36 @@ _sley_fix() {
 }
 
 _sley_check() {
+  # Every exit 2 before the lint hook runs has linted nothing, so it cannot
+  # hide a finding; `_sley_check_run` clears this before linting and restores
+  # it only on evidence from the lint hook.
+  local _sley_check_evidence="clean tool-error" rc=0
+  _sley_check_run "$@" || rc=$?
+  if [[ "$rc" -eq 2 && -n "$_sley_check_evidence" ]]; then
+    _sley_phase_evidence "$_sley_check_evidence"
+  fi
+  return "$rc"
+}
+
+# Classify a lint hook exit 2 for `_sley_phase_evidence`. Only the stock lint
+# hook can vouch for its result: it notes when autolint never ran, and it asks
+# autolint for a CHECKRUN_AUTOLINT_REPORT. An extension override that runs its
+# own linter, or an older Checkrun, leaves neither, which stays unknown.
+_sley_check_lint_evidence() {
+  local report="$1" line=""
+  if [[ -n "${_SLEY_LINT_NOT_RUN:-}" ]]; then
+    printf 'clean %s\n' "$_SLEY_LINT_NOT_RUN"
+    return 0
+  fi
+  [[ -n "$report" && -f "$report" ]] || return 0
+  IFS= read -r line <"$report" || true
+  case "$line" in
+    findings=0) printf 'clean tool-error\n' ;;
+    findings=1) printf 'findings\n' ;;
+  esac
+}
+
+_sley_check_run() {
   _sley_init_repo || return $?
   local SLEY_LINT_IGNORE="${SLEY_LINT_IGNORE:-1}"
   local -a scope_args=()
@@ -813,10 +896,35 @@ _sley_check() {
   lint_files="$_SLEY_LINT_FILTERED_FILES"
   checked_count=$(_sley_count_file_list "$lint_files")
   if [[ -n "$lint_files" ]]; then
-    sley_hook_lint "$lint_files"
-    case $? in
+    # Read by the stock `_sley_hook_lint` through dynamic scope. The report
+    # lives in ready's private phase directory, so a stale or foreign file
+    # cannot vouch for this run; direct `sley check` requests none.
+    local _SLEY_LINT_REPORT="" _SLEY_LINT_NOT_RUN="" lint_rc=0
+    if [[ -n "${_SLEY_PHASE_EVIDENCE_FILE:-}" ]]; then
+      _SLEY_LINT_REPORT="$_SLEY_PHASE_EVIDENCE_FILE.lint"
+      rm -f -- "$_SLEY_LINT_REPORT"
+    fi
+    _sley_check_evidence=""
+    sley_hook_lint "$lint_files" || lint_rc=$?
+    case "$lint_rc" in
       0) ;;
-      2) return 2 ;;
+      2)
+        # The default lint hook returns 2 silently when autolint is absent
+        # (hot hook paths treat that as a no-op). This human-facing command,
+        # and the commit gate built on it, must say why nothing was linted.
+        command -v autolint >/dev/null 2>&1 ||
+          echo "sley check: linter unavailable (autolint not found)" >&2
+        _sley_check_evidence=$(_sley_check_lint_evidence "$_SLEY_LINT_REPORT")
+        # A bypass skips only the broken linter. Validation normally runs
+        # after lint, so run it here too before vouching for the phase;
+        # its findings then block like any other.
+        if [[ "$_sley_check_evidence" == clean* ]] &&
+          [[ "$_SLEY_SCOPE_REPO_WIDE" == "1" || "${#_SLEY_SCOPE_PATHS[@]}" -eq 0 ]]; then
+          # shellcheck disable=SC2119 # validate is a no-arg lifecycle hook.
+          sley_hook_validate || _sley_check_evidence="findings"
+        fi
+        return 2
+        ;;
       *) return 1 ;;
     esac
   fi
@@ -855,6 +963,37 @@ _sley_secrets_default_jobs() {
     printf '1\n'
   else
     printf '%s\n' "$cores"
+  fi
+}
+
+# Classify one gitleaks result for the commit-gate override (see
+# `_sley_secrets_evidence`). gitleaks exits 1 for leaks and defines no exit 2
+# of its own, so any other failure of a scanner that ran may have hidden
+# leaks. Callers declare the flags; every scan result must pass through here
+# before the MAX-preserving aggregation can hide it.
+_sley_secrets_note_status() {
+  case "$1" in
+    0) ;;
+    1) _sley_secrets_findings=1 ;;
+    *) _sley_secrets_scanner_failed=1 ;;
+  esac
+}
+
+# What a secrets exit 2 knows about findings: `findings` when a scanner
+# reported leaks, nothing (unknown) when a scanner that ran failed, and
+# `clean ...` only when every scan that ran was clean, so the exit 2 came from
+# Sley itself: gitleaks missing, or scan setup or cleanup failing, which can
+# leave files unscanned. That is the "could not complete" case the override
+# exists for.
+_sley_secrets_evidence() {
+  if [[ "$_sley_secrets_findings" != 0 ]]; then
+    printf 'findings\n'
+  elif [[ "$_sley_secrets_scanner_failed" != 0 ]]; then
+    return 0
+  elif [[ "$_sley_secrets_unavailable" != 0 ]]; then
+    printf 'clean tool-unavailable\n'
+  else
+    printf 'clean tool-error\n'
   fi
 }
 
@@ -905,6 +1044,7 @@ _sley_secrets_scan_extra_config() {
       scan_rc=$?
       [[ -n "$out" ]] && printf '%s\n' "$out" >&2
     fi
+    _sley_secrets_note_status "$scan_rc"
     [[ "$scan_rc" -gt "$rc" ]] && rc=$scan_rc
   fi
   if [[ "${#wfiles[@]}" -gt 0 ]]; then
@@ -916,6 +1056,7 @@ _sley_secrets_scan_extra_config() {
         scan_rc=$?
         [[ -n "$out" ]] && printf '%s\n' "$out" >&2
       fi
+      _sley_secrets_note_status "$scan_rc"
       [[ "$scan_rc" -gt "$rc" ]] && rc=$scan_rc
     done
   fi
@@ -958,12 +1099,42 @@ _sley_clean_commit_message() {
 }
 
 # `sley secrets --message-file <path>`: scan a (to-be-committed) commit message
-# for secrets and any extension-provided extra rules. Runs the base config pass
-# plus one pass per extra config over the git-cleaned message text.
+# for secrets and any extension-provided extra rules. The Git commit-msg hook
+# runs this for the same commit that `sley ready --commit` gated, so it honors
+# SLEY_ALLOW_UNAVAILABLE=secrets with the same rule: an exit 2 is tolerated only
+# when it came from Sley itself (see `_sley_secrets_evidence`), never when a
+# scanner reported leaks or failed.
 _sley_secrets_message_file() {
+  local _sley_secrets_findings=0 _sley_secrets_scanner_failed=0
+  local _sley_secrets_unavailable=0 rc=0 allowed evidence
+  _sley_secrets_message_scan "$@" || rc=$?
+  [[ "$rc" -eq 2 && -n "${SLEY_ALLOW_UNAVAILABLE:-}" ]] || return "$rc"
+  allowed=$(_sley_parse_allow_unavailable "sley secrets" "$SLEY_ALLOW_UNAVAILABLE") ||
+    return 2
+  [[ "$allowed" == *" secrets "* ]] || return 2
+  evidence=$(_sley_secrets_evidence)
+  case "$evidence" in
+    clean*) ;;
+    findings)
+      echo "sley secrets: SLEY_ALLOW_UNAVAILABLE cannot bypass this exit 2: the message scan reported findings" >&2
+      return 2
+      ;;
+    *)
+      echo "sley secrets: SLEY_ALLOW_UNAVAILABLE cannot bypass this exit 2: a scanner that ran failed, so the message is not confirmed clean" >&2
+      return 2
+      ;;
+  esac
+  echo "sley secrets: commit message: allowed secrets to exit 2 via SLEY_ALLOW_UNAVAILABLE (no findings reported; the part its failed tool covers was not checked)" >&2
+  return 0
+}
+
+# Runs the base config pass plus one pass per extra config over the
+# git-cleaned message text.
+_sley_secrets_message_scan() {
   local msg_file="$1" extension_dir="$2"
   _sley_init_repo || return $?
   command -v gitleaks >/dev/null 2>&1 || {
+    _sley_secrets_unavailable=1
     _sley_die "gitleaks not found"
     return 2
   }
@@ -1010,10 +1181,12 @@ _sley_secrets_message_file() {
   base_args=("${_SLEY_GITLEAKS_ARGS[@]}" --verbose)
   _sley_gitleaks_scan_text "$cleaned" "${base_args[@]}" || scan_rc=$?
   scan_rc=${scan_rc:-0}
+  _sley_secrets_note_status "$scan_rc"
   [[ "$scan_rc" -gt "$rc" ]] && rc=$scan_rc
   for cfg in "${extra_configs[@]+"${extra_configs[@]}"}"; do
     scan_rc=0
     _sley_gitleaks_scan_text "$cleaned" --redact --no-banner --verbose --config "$cfg" || scan_rc=$?
+    _sley_secrets_note_status "$scan_rc"
     [[ "$scan_rc" -gt "$rc" ]] && rc=$scan_rc
   done
   return "$rc"
@@ -1408,6 +1581,7 @@ _sley_secrets_scan_batch() {
       _sley_secrets_print_failed_scan_output "$scan_rc" "$stdout_file" "$stderr_file"
     fi
     [[ "$_sley_secrets_parallel_signal_status" -eq 0 ]] || return 0
+    _sley_secrets_note_status "$scan_rc"
     # Preserve the MAX exit code across batch members. gitleaks's exit-code
     # protocol overloads severity onto the numeric value (1 = leaks found,
     # ≥2 = scanner / IO error). Last-non-zero-wins would let a later
@@ -1619,6 +1793,17 @@ _sley_secrets_scan_worktree_files() {
 }
 
 _sley_secrets() {
+  local _sley_secrets_findings=0 _sley_secrets_scanner_failed=0
+  local _sley_secrets_unavailable=0 rc=0 evidence
+  _sley_secrets_run "$@" || rc=$?
+  if [[ "$rc" -eq 2 ]]; then
+    evidence=$(_sley_secrets_evidence)
+    [[ -z "$evidence" ]] || _sley_phase_evidence "$evidence"
+  fi
+  return "$rc"
+}
+
+_sley_secrets_run() {
   local extension_dir
   _sley_extension_dir extension_dir || return $?
 
@@ -1649,6 +1834,7 @@ _sley_secrets() {
     return 0
   fi
   command -v gitleaks >/dev/null 2>&1 || {
+    _sley_secrets_unavailable=1
     _sley_die "gitleaks not found"
     return 2
   }
@@ -1683,6 +1869,7 @@ _sley_secrets() {
     else
       scan_rc=$?
     fi
+    _sley_secrets_note_status "$scan_rc"
     if [[ "$scan_rc" -ne 0 ]]; then
       [[ -n "$out" ]] && printf '%s\n' "$out" >&2
       # MAX-preserve at the outer aggregator too. The inner functions

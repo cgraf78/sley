@@ -68,6 +68,37 @@ formatting as a pre-step before those phases rather than as a phase. Ready
 should continue to call public Sley and Checkrun surfaces rather than
 duplicating their internals.
 
+An exit status of 2 from `status` or `verify` is always a ready error. From
+`check` or `secrets` it means the phase could not run, for example a missing
+linter or gitleaks, or a structural linter error that Checkrun lets win over
+findings. A report-only `sley ready` shows those phases as unavailable and
+continues. The `--commit` commit gate fails closed instead: it exits 2 and
+names each phase that could not run, so an unavailable tool cannot let lint
+findings or secrets land. The deliberate override is per phase and per
+invocation: `SLEY_ALLOW_UNAVAILABLE=check`, `=secrets`, or `=check,secrets`
+set on the commit command reaches the Git and Sapling hooks alike, including
+the Git `commit-msg` secret scan, and covers every commit that command
+creates (each commit a rebase or histedit replays). It tolerates only that
+phase's exit 2 and reports the phase as `bypassed` in the text and JSON
+output. It never tolerates findings or other phases.
+
+Exit 2 outranks findings: Checkrun reports a tool error over findings in the
+same run, and the secret scan keeps the highest status across its scans. The
+gate therefore bypasses an exit 2 only on positive evidence that the phase
+reported no findings. For `check`, the stock lint hook provides it when
+autolint is missing or when autolint's `CHECKRUN_AUTOLINT_REPORT` says
+`findings=0`; repo validation then runs anyway, since the bypass skips only
+the broken linter. For `secrets`, it holds only when no gitleaks scan
+reported leaks or failed, so the exit 2 came from Sley itself (gitleaks
+missing, or scan setup or cleanup failing, which may leave some files
+unscanned): gitleaks has no exit 2 of its own, and a scanner that ran and
+failed may have seen secrets. Anything else, including a
+lint hook extension that runs its own linter or an older Checkrun without the
+report, cannot be bypassed. `--json` rows for these exits carry a `reason`:
+`tool-unavailable` or `tool-error` (bypassable), `findings`, or `unconfirmed`.
+An invalid value is a usage error for the gate and only a warning for a
+report-only run.
+
 ## Low-Level Tool Invocation
 
 Sley should not directly invoke language tools such as `ruff`, `mypy`,

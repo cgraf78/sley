@@ -150,6 +150,15 @@ sley_hook_format_file() {
       "$SLEY_READY_FORMATTER"
       : >"$SLEY_READY_SYNC/formatter.runner-resumed"
       ;;
+    format-guardian-term)
+      : >"$SLEY_READY_SYNC/formatter.payload-started"
+      ;;
+    format-cleanup-signal)
+      # Mutate the partially staged file, then fail so the worker's error
+      # path must restore it from the backup during cleanup.
+      printf 'formatted by failing formatter\n' >"$1"
+      return 2
+      ;;
   esac
 }
 
@@ -165,6 +174,9 @@ sley_ext_ready_phase() {
         return 1
       fi
       printf '%s complete\n' "$phase"
+      ;;
+    guardian-term)
+      : >"$SLEY_READY_SYNC/$phase.payload-started"
       ;;
     stdin-probe)
       if IFS= read -r phase_input; then
@@ -284,6 +296,149 @@ if [[ "${SLEY_READY_TEST_MODE:-}" == "format-delayed" ]]; then
   }
 fi
 
+# Linux-only observation helpers for the deterministic cancellation races
+# below. Each poll is bounded so a regression reports a marker instead of
+# hanging the suite.
+_sley_ready_test_proc_field() {
+  local process_pid="$1" field="$2" line
+  [[ -r "/proc/$process_pid/status" ]] || return 1
+  while IFS= read -r line; do
+    if [[ "$line" == "$field:"* ]]; then
+      REPLY=${line#"$field:"}
+      REPLY=${REPLY//[[:space:]]/}
+      return 0
+    fi
+  done <"/proc/$process_pid/status" 2>/dev/null
+  return 1
+}
+
+_sley_ready_test_term_ignored() {
+  # SIGTERM is signal 15, bit 14 of the SigIgn mask. Only a guardian's
+  # cancellation handler ignores TERM, so this proves the handler started.
+  _sley_ready_test_proc_field "$1" SigIgn || return 1
+  ((16#$REPLY & 0x4000))
+}
+
+_sley_ready_test_in_gate() {
+  # A fresh fork can briefly keep the worker's caught TERM handler, so a TERM
+  # bit in SigCgt alone is not proof that the guardian's own trap exists.
+  # Also require the guardian to be blocked waiting for a child: before `run`
+  # its only child is the gate loop's `sleep`, which starts after the traps.
+  local wchan=""
+  _sley_ready_test_proc_field "$1" SigCgt || return 1
+  ((16#$REPLY & 0x4000)) || return 1
+  wchan=$(<"/proc/$1/wchan") 2>/dev/null || return 1
+  [[ "$wchan" == "do_wait" ]]
+}
+
+_sley_ready_test_poll() {
+  local attempt
+  for ((attempt = 0; attempt < 1000; attempt++)); do
+    "$@" && return 0
+    sleep 0.01
+  done
+  return 1
+}
+
+_sley_ready_test_pid_live() {
+  _sley_ready_test_proc_field "$1" State || return 1
+  [[ "$REPLY" != [ZX]* ]]
+}
+
+if [[ "${SLEY_READY_TEST_MODE:-}" == *guardian-term ]]; then
+  # Deliver TERM to each guardian while it waits for its launch gate, and wait
+  # until its handler has started, before the worker publishes `run`.
+  eval "$(declare -f _sley_ready_register_owned_process | sed \
+    '1s/_sley_ready_register_owned_process/_sley_ready_saved_register_owned_process/')"
+  _sley_ready_register_owned_process() {
+    local guardian_pid="$1"
+    if ! _sley_ready_test_poll _sley_ready_test_in_gate "$guardian_pid"; then
+      : >"$SLEY_READY_SYNC/guardian.not-gated"
+    else
+      printf '%s\n' "$guardian_pid" >>"$SLEY_READY_SYNC/guardian.pids"
+      kill -TERM "$guardian_pid" 2>/dev/null || true
+      _sley_ready_test_poll _sley_ready_test_term_ignored "$guardian_pid" ||
+        : >"$SLEY_READY_SYNC/guardian.handler-not-observed"
+    fi
+    _sley_ready_saved_register_owned_process "$@"
+  }
+fi
+
+if [[ "${SLEY_READY_TEST_MODE:-}" == *launch-fail-term ]]; then
+  # Fail the first launch's process-group validation with its guardian
+  # stopped before it can observe the abort file. A helper sends the worker
+  # TERM while it waits for that guardian, then resumes the guardian once the
+  # worker has either removed the control directory or kept waiting.
+  eval "$(declare -f _sley_ready_process_group | sed \
+    '1s/_sley_ready_process_group/_sley_ready_saved_process_group/')"
+  eval "$(declare -f _sley_ready_cancel_impl | sed \
+    '1s/_sley_ready_cancel_impl/_sley_ready_saved_cancel_impl/')"
+  _sley_ready_cancel_impl() {
+    if [[ "${_sley_ready_launching_child:-0}" == "1" ]]; then
+      : >"$SLEY_READY_SYNC/launch-fail.cancel-recorded"
+    fi
+    _sley_ready_saved_cancel_impl "$@"
+  }
+  _sley_ready_test_launch_fail_helper() {
+    local worker_pid="$1" guardian_pid="$2" control_dir="$3" wchan attempt
+    for ((attempt = 0; attempt < 1000; attempt++)); do
+      wchan=""
+      if [[ -e "$control_dir/abort" ]]; then
+        wchan=$(<"/proc/$worker_pid/wchan") 2>/dev/null || wchan=""
+      fi
+      [[ "$wchan" != "do_wait" ]] || break
+      sleep 0.01
+    done
+    kill -TERM "$worker_pid" 2>/dev/null || true
+    _sley_ready_test_poll test -e "$SLEY_READY_SYNC/launch-fail.cancel-recorded" ||
+      : >"$SLEY_READY_SYNC/launch-fail.cancel-not-recorded"
+    # The unfixed worker removes the control directory immediately after
+    # its interrupted wait. A fixed worker keeps waiting for the guardian.
+    for ((attempt = 0; attempt < 200; attempt++)); do
+      [[ -d "$control_dir" ]] || break
+      sleep 0.01
+    done
+    kill -CONT "$guardian_pid" 2>/dev/null || true
+  }
+  _sley_ready_process_group() {
+    local guardian_pid="$1" worker_pid stat_line
+    local _sley_ready_proc_pid="" _sley_ready_proc_parent="" _sley_ready_proc_group=""
+    local _sley_ready_proc_identity=""
+    if [[ "${_sley_ready_launching_child:-0}" != "1" ||
+      -e "$SLEY_READY_SYNC/launch-fail.injected" ]]; then
+      _sley_ready_saved_process_group "$@"
+      return
+    fi
+    : >"$SLEY_READY_SYNC/launch-fail.injected"
+    printf '%s\n' "$guardian_pid" >"$SLEY_READY_SYNC/launch-fail.guardian.pid"
+    _sley_ready_test_poll _sley_ready_test_in_gate "$guardian_pid" ||
+      : >"$SLEY_READY_SYNC/launch-fail.not-gated"
+    kill -STOP "$guardian_pid" 2>/dev/null || true
+    # This runs in the worker's command substitution; its parent is the
+    # worker that will wait for the guardian after this failure.
+    IFS= read -r stat_line <"/proc/$BASHPID/stat" || return 1
+    _sley_ready_parse_proc_stat "$BASHPID" "$stat_line" || return 1
+    worker_pid=$_sley_ready_proc_parent
+    _sley_ready_test_launch_fail_helper \
+      "$worker_pid" "$guardian_pid" "$child_control" </dev/null >/dev/null 2>&1 &
+    return 1
+  }
+fi
+
+if [[ "${SLEY_READY_TEST_MODE:-}" == "format-cleanup-signal" ]]; then
+  # Deliver TERM to the worker itself after its error-path cleanup starts and
+  # before that cleanup restores the partial-file backup.
+  eval "$(declare -f _sley_ready_wait_for_processes | sed \
+    '1s/_sley_ready_wait_for_processes/_sley_ready_saved_wait_for_processes/')"
+  _sley_ready_wait_for_processes() {
+    if [[ -n "${_fix_bak:-}" && ! -e "$SLEY_READY_SYNC/cleanup.signalled" ]]; then
+      : >"$SLEY_READY_SYNC/cleanup.signalled"
+      kill -TERM "$BASHPID"
+    fi
+    _sley_ready_saved_wait_for_processes "$@"
+  }
+fi
+
 trap 'printf "INT\n" >>"$SLEY_READY_TRAP_LOG"' INT
 trap 'printf "TERM\n" >>"$SLEY_READY_TRAP_LOG"' TERM
 trap 'printf "HUP\n" >>"$SLEY_READY_TRAP_LOG"' HUP
@@ -331,6 +486,7 @@ for name in \
   _sley_ready_cleanup_active \
   _sley_ready_launching_child \
   _sley_ready_pending_status \
+  _sley_ready_deferred_signals \
   phase_pids \
   phase_stdout_files \
   phase_stderr_files \
@@ -3400,5 +3556,168 @@ _assert_eq "ready cooperative TERM: phase cleanup handler completes" \
   "yes" "$(_result_value term_cleanup_done "$term_cleanup_data")"
 _assert_eq "ready cooperative TERM: leaves no temporary artifacts" \
   "0" "$(_result_value artifact_count "$term_cleanup_data")"
+
+# The following races are driven from inside the worker with procfs
+# observations, so each outcome is deterministic rather than timing-based.
+_run_sourced_ready_bounded() {
+  local mode="$1" output="$2" result="$3" trap_log="$4"
+  (
+    cd "$repo" || exit 1
+    _with_timeout 60 env -u TERM \
+      HOME="$home" \
+      XDG_CONFIG_HOME="$config" \
+      XDG_CACHE_HOME="$home/cache" \
+      GIT_CONFIG_GLOBAL="$repo/.gitconfig-test" \
+      SLEY_READY_TEST_MODE="$mode" \
+      SLEY_READY_SYNC="$sync_dir" \
+      SLEY_READY_FORMATTER="$formatter" \
+      SLEY_READY_TRAP_LOG="$trap_log" \
+      TMPDIR="$ready_tmp" \
+      bash --noprofile --norc "$harness" "$SLEY_REPO_ROOT" "$output" "$result"
+  )
+}
+
+_wait_for_pid_gone() {
+  local process_pid="$1" attempt state
+  for ((attempt = 0; attempt < 300; attempt++)); do
+    [[ -r "/proc/$process_pid/stat" ]] || return 0
+    state=$(awk '{sub(/^.*\) /, ""); print $1}' "/proc/$process_pid/stat" 2>/dev/null)
+    [[ -n "$state" && "$state" != [ZX] ]] || return 0
+    sleep 0.01
+  done
+  return 1
+}
+
+_stage_partial_tracked_file() {
+  printf 'staged content\n' >"$repo/tracked.txt"
+  git -C "$repo" add tracked.txt
+  printf 'unstaged content\n' >"$repo/tracked.txt"
+}
+
+_wchan_reports_wait() {
+  # Some kernels hide wait channels (reading `0`). Probe a shell that is
+  # known to be blocked in `wait` before relying on `do_wait` observations.
+  local probe_pid attempt wchan="" found=1
+  [[ -r /proc/self/status && -r /proc/self/wchan ]] || return 1
+  bash --noprofile --norc -c 'sleep 5 & wait' &
+  probe_pid=$!
+  for ((attempt = 0; attempt < 200; attempt++)); do
+    wchan=$(<"/proc/$probe_pid/wchan") 2>/dev/null || wchan=""
+    if [[ "$wchan" == "do_wait" ]]; then
+      found=0
+      break
+    fi
+    sleep 0.01
+  done
+  pkill -KILL -P "$probe_pid" 2>/dev/null || true
+  kill -KILL "$probe_pid" 2>/dev/null || true
+  wait "$probe_pid" 2>/dev/null || true
+  return "$found"
+}
+
+if _wchan_reports_wait; then
+  echo "=== sley: phase guardian honors TERM received during its launch gate ==="
+
+  rm -f "$sync_dir"/* "$ready_tmp"/sley-ready-* 2>/dev/null || true
+  gate_term_output=$(_tmpdir)/guardian-term.out
+  gate_term_result=$(_tmpdir)/guardian-term.result
+  gate_term_trap_log=$(_tmpdir)/guardian-term.traps
+  _run_sourced_ready_bounded guardian-term \
+    "$gate_term_output" "$gate_term_result" "$gate_term_trap_log"
+  gate_term_data=$(cat "$gate_term_result" 2>/dev/null)
+  _assert_file_exists "ready guardian TERM: guardians received TERM in the gate" \
+    "$sync_dir/guardian.pids"
+  _assert_file_missing "ready guardian TERM: each guardian was observed in its gate" \
+    "$sync_dir/guardian.not-gated"
+  _assert_file_missing "ready guardian TERM: each guardian handler started before run" \
+    "$sync_dir/guardian.handler-not-observed"
+  _assert_file_missing "ready guardian TERM: phase-a payload never starts" \
+    "$sync_dir/phase-a.payload-started"
+  _assert_file_missing "ready guardian TERM: phase-b payload never starts" \
+    "$sync_dir/phase-b.payload-started"
+  _assert_contains "ready guardian TERM: cancelled phase reports the signal status" \
+    "phase-a: 143 (error)" "$(cat "$gate_term_output")"
+  _assert_eq "ready guardian TERM: leaves no temporary artifacts" \
+    "0" "$(_result_value artifact_count "$gate_term_data")"
+
+  echo "=== sley: formatter guardian honors TERM received during its launch gate ==="
+
+  _stage_partial_tracked_file
+  rm -f "$sync_dir"/* "$ready_tmp"/sley-ready-* "$ready_tmp"/sley-fix-bak.* 2>/dev/null || true
+  format_gate_output=$(_tmpdir)/format-guardian-term.out
+  format_gate_result=$(_tmpdir)/format-guardian-term.result
+  format_gate_trap_log=$(_tmpdir)/format-guardian-term.traps
+  _run_sourced_ready_bounded format-guardian-term \
+    "$format_gate_output" "$format_gate_result" "$format_gate_trap_log"
+  format_gate_data=$(cat "$format_gate_result" 2>/dev/null)
+  _assert_file_exists "ready formatter guardian TERM: guardian received TERM in the gate" \
+    "$sync_dir/guardian.pids"
+  _assert_file_missing "ready formatter guardian TERM: handler started before run" \
+    "$sync_dir/guardian.handler-not-observed"
+  _assert_file_missing "ready formatter guardian TERM: formatter payload never starts" \
+    "$sync_dir/formatter.payload-started"
+  _assert_eq "ready formatter guardian TERM: partial worktree file is untouched" \
+    "unstaged content" "$(cat "$repo/tracked.txt")"
+  _assert_eq "ready formatter guardian TERM: removes backup artifact" \
+    "0" "$(_result_value fix_backup_count "$format_gate_data")"
+
+  for launch_fail_mode in launch-fail-term format-launch-fail-term; do
+    case "$launch_fail_mode" in
+      launch-fail-term) launch_fail_label="phase" ;;
+      *) launch_fail_label="formatter" ;;
+    esac
+    echo "=== sley: $launch_fail_label launch failure reaps its guardian under TERM ==="
+
+    _stage_partial_tracked_file
+    rm -f "$sync_dir"/* "$ready_tmp"/sley-ready-* "$ready_tmp"/sley-fix-bak.* 2>/dev/null || true
+    launch_fail_output=$(_tmpdir)/"$launch_fail_mode.out"
+    launch_fail_result=$(_tmpdir)/"$launch_fail_mode.result"
+    launch_fail_trap_log=$(_tmpdir)/"$launch_fail_mode.traps"
+    _run_sourced_ready_bounded "$launch_fail_mode" \
+      "$launch_fail_output" "$launch_fail_result" "$launch_fail_trap_log"
+    launch_fail_data=$(cat "$launch_fail_result" 2>/dev/null)
+    launch_fail_guardian=$(cat "$sync_dir/launch-fail.guardian.pid" 2>/dev/null)
+    _assert_file_missing "ready $launch_fail_label launch failure: guardian was gated before failure" \
+      "$sync_dir/launch-fail.not-gated"
+    _assert_file_missing "ready $launch_fail_label launch failure: TERM arrived during the failure wait" \
+      "$sync_dir/launch-fail.cancel-not-recorded"
+    _assert_eq "ready $launch_fail_label launch failure: returns the signal status" \
+      "143" "$(_result_value ready_rc "$launch_fail_data")"
+    if [[ -n "$launch_fail_guardian" ]] && _wait_for_pid_gone "$launch_fail_guardian"; then
+      _pass "ready $launch_fail_label launch failure: abandoned guardian does not survive"
+    else
+      _fail "ready $launch_fail_label launch failure: abandoned guardian ${launch_fail_guardian:-unknown} survives"
+      [[ -z "$launch_fail_guardian" ]] || kill -KILL "$launch_fail_guardian" 2>/dev/null || true
+    fi
+    _assert_eq "ready $launch_fail_label launch failure: leaves no temporary artifacts" \
+      "0" "$(_result_value artifact_count "$launch_fail_data")"
+    _assert_eq "ready $launch_fail_label launch failure: partial worktree file is untouched" \
+      "unstaged content" "$(cat "$repo/tracked.txt")"
+  done
+
+  echo "=== sley: signal during error-path cleanup still restores the --fix backup ==="
+
+  _stage_partial_tracked_file
+  rm -f "$sync_dir"/* "$ready_tmp"/sley-ready-* "$ready_tmp"/sley-fix-bak.* 2>/dev/null || true
+  cleanup_signal_output=$(_tmpdir)/format-cleanup-signal.out
+  cleanup_signal_result=$(_tmpdir)/format-cleanup-signal.result
+  cleanup_signal_trap_log=$(_tmpdir)/format-cleanup-signal.traps
+  _run_sourced_ready_bounded format-cleanup-signal \
+    "$cleanup_signal_output" "$cleanup_signal_result" "$cleanup_signal_trap_log"
+  cleanup_signal_data=$(cat "$cleanup_signal_result" 2>/dev/null)
+  _assert_file_exists "ready cleanup signal: TERM arrived during cleanup" \
+    "$sync_dir/cleanup.signalled"
+  _assert_eq "ready cleanup signal: returns the deferred signal status" \
+    "143" "$(_result_value ready_rc "$cleanup_signal_data")"
+  _assert_eq "ready cleanup signal: restores the partial worktree file" \
+    "unstaged content" "$(cat "$repo/tracked.txt")"
+  _assert_eq "ready cleanup signal: removes backup artifact" \
+    "0" "$(_result_value fix_backup_count "$cleanup_signal_data")"
+  cleanup_signal_artifacts=$(_result_value artifact_paths "$cleanup_signal_data")
+  _assert_eq "ready cleanup signal: leaves no temporary artifacts (${cleanup_signal_artifacts:-unknown})" \
+    "0" "$(_result_value artifact_count "$cleanup_signal_data")"
+else
+  echo "  SKIP: launch-gate and cleanup signal races (require procfs wait channels)"
+fi
 
 _test_summary

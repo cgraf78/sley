@@ -213,7 +213,19 @@ New integrations should source `sley.sh` through shdeps and call public
   proposed commit message through either a structural template or an external
   executable. They do not choose policy or require repository detection.
 - `sley ready --fix --quiet --commit` is the commit-gate API used by agent
-  hooks.
+  hooks. With `--commit`, a `check` or `secrets` phase that cannot run (exit
+  2, such as a missing gitleaks or a broken linter config) fails the gate
+  instead of being reported as unavailable; outside the gate those phases stay
+  advisory. `SLEY_ALLOW_UNAVAILABLE=check`, `=secrets`, or `=check,secrets`
+  on the commit command (for example `SLEY_ALLOW_UNAVAILABLE=secrets git
+  commit`, or `sl commit` for Sapling) tolerates that phase's exit 2 and
+  reports it as bypassed, but only when the phase confirms it reported no
+  findings. Findings always block, even when exit 2 outranks them, as does an
+  exit 2 the phase cannot vouch for (a lint hook extension running its own
+  linter, an older Checkrun, or a secret scanner that ran and failed); other
+  phases still gate. The Git `commit-msg` secret scan honors the same value,
+  and it covers every commit the one command creates, such as each commit a
+  rebase replays.
 - `_sley_shell_complete` and `_sley_zsh_complete` are the Bash and zsh
   completion functions installed by the shell loader.
 - `SLEY_VERIFY_SCHEMA` is exported by the shell loader as the absolute path to

@@ -17,6 +17,9 @@ CLEANUP_DIRS=()
 # Mark every suite, including suites run directly, so code that can reach
 # outside the mock HOME can avoid touching the real host during WSL tests.
 export REPO_TEST=1
+# A caller's one-commit gate override would change `sley ready` results (or
+# fail validation) in every suite, so never inherit it.
+unset SLEY_ALLOW_UNAVAILABLE
 
 # The repo test runner may set TEST_STYLE=1 for child suites when styled output is
 # appropriate. Individual suites keep exporting NO_COLOR for deterministic tool
