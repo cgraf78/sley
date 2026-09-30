@@ -4314,7 +4314,9 @@ _assert_contains "ready --commit: check rc 2 surfaces the tool diagnostic" \
   "autolint: ruff.toml: invalid configuration" "$__SLEY_OUT"
 _assert_contains "ready --commit: names the phase that could not run" \
   "sley ready: commit gate blocked: check exited 2" "$__SLEY_OUT"
-_assert_contains "ready --commit: names the deliberate bypass" \
+_assert_contains "ready --commit: names the per-phase override for git" \
+  "SLEY_ALLOW_UNAVAILABLE=check git commit" "$__SLEY_OUT"
+_assert_not_contains "ready --commit: does not advertise skipping every hook" \
   "--no-verify" "$__SLEY_OUT"
 _assert_not_contains "ready --commit: passing secrets phase is not blamed" \
   "blocked: check, secrets" "$__SLEY_OUT"
@@ -4353,6 +4355,8 @@ _assert_contains "ready --commit: missing gitleaks names the tool" \
   "gitleaks not found" "$__SLEY_OUT"
 _assert_contains "ready --commit: missing gitleaks names the phase" \
   "sley ready: commit gate blocked: secrets exited 2" "$__SLEY_OUT"
+_assert_contains "ready --commit: missing gitleaks names its override" \
+  "SLEY_ALLOW_UNAVAILABLE=secrets git commit" "$__SLEY_OUT"
 
 HOME="$gate_home" PATH="$gate_no_gitleaks_path" _run_sley "$gate_repo" \
   ready --exclude verify
@@ -4377,6 +4381,132 @@ _assert_exit "ready --commit: both phases unavailable blocks the commit" \
   2 "$__SLEY_RC"
 _assert_contains "ready --commit: names every phase that could not run" \
   "sley ready: commit gate blocked: check, secrets exited 2" "$__SLEY_OUT"
+_assert_contains "ready --commit: override lists every blocked phase" \
+  "SLEY_ALLOW_UNAVAILABLE=check,secrets git commit" "$__SLEY_OUT"
+
+echo "=== sley: SLEY_ALLOW_UNAVAILABLE narrows the commit-gate override ==="
+
+HOME="$gate_home" PATH="$gate_lint_error_path" SLEY_ALLOW_UNAVAILABLE=check \
+  _run_sley "$gate_repo" ready --fix --quiet --commit --exclude verify
+_assert_exit "allow check: tolerated check rc 2 passes the gate" 0 "$__SLEY_RC"
+_assert_contains "allow check: announces the bypass even with --quiet" \
+  "commit gate: allowed check to exit 2 via SLEY_ALLOW_UNAVAILABLE" "$__SLEY_OUT"
+_assert_contains "allow check: announces that the override is set" \
+  "SLEY_ALLOW_UNAVAILABLE=check is set" "$__SLEY_OUT"
+
+HOME="$gate_home" PATH="$gate_lint_error_path" SLEY_ALLOW_UNAVAILABLE=check \
+  _run_sley "$gate_repo" ready --commit --exclude verify
+_assert_exit "allow check: report run passes" 0 "$__SLEY_RC"
+_assert_contains "allow check: report marks the phase bypassed" \
+  "check: 2 (bypassed)" "$__SLEY_OUT"
+
+HOME="$gate_home" PATH="$gate_lint_error_path" SLEY_ALLOW_UNAVAILABLE=check \
+  _run_sley "$gate_repo" ready --commit --json --exclude verify
+_assert_contains "allow check --json: phase status is bypassed" \
+  '"name":"check","status":"bypassed","exit_code":2' "$__SLEY_OUT"
+_assert_contains "allow check --json: summary counts it unavailable" \
+  '"unavailable":1,"errors":0,"exit_code":0' "$__SLEY_OUT"
+
+HOME="$gate_home" PATH="$gate_both_bin:/usr/bin:/bin" SLEY_ALLOW_UNAVAILABLE=check \
+  _run_sley "$gate_repo" ready --commit --exclude verify
+_assert_exit "allow check: an unallowed secrets rc 2 still blocks" 2 "$__SLEY_RC"
+_assert_contains "allow check: blocked message names only secrets" \
+  "commit gate blocked: secrets exited 2" "$__SLEY_OUT"
+_assert_contains "allow check: retry hint keeps the existing allowance" \
+  "SLEY_ALLOW_UNAVAILABLE=check,secrets git commit" "$__SLEY_OUT"
+
+HOME="$gate_home" PATH="$gate_both_bin:/usr/bin:/bin" \
+  SLEY_ALLOW_UNAVAILABLE=' secrets , check ' \
+  _run_sley "$gate_repo" ready --commit --exclude verify
+_assert_exit "allow check,secrets: both tolerated phases pass" 0 "$__SLEY_RC"
+_assert_contains "allow check,secrets: announces both bypasses" \
+  "allowed check, secrets to exit 2" "$__SLEY_OUT"
+
+gate_findings_bin=$(_gate_tools_bin)
+_gate_mock_autolint "$gate_findings_bin" 1
+_gate_mock_gitleaks "$gate_findings_bin"
+HOME="$gate_home" PATH="$gate_findings_bin:/usr/bin:/bin" SLEY_ALLOW_UNAVAILABLE=check \
+  _run_sley "$gate_repo" ready --commit --exclude verify
+_assert_exit "allow check: lint findings (rc 1) still block" 1 "$__SLEY_RC"
+_assert_contains "allow check: findings stay blocking" \
+  "check: 1 (blocking)" "$__SLEY_OUT"
+_assert_not_contains "allow check: findings are never reported as bypassed" \
+  "bypassed" "$__SLEY_OUT"
+
+for gate_bad_value in verify status bogus 'check,review' 'check secrets' \
+  $'check\nverify'; do
+  HOME="$gate_home" PATH="$gate_lint_error_path" \
+    SLEY_ALLOW_UNAVAILABLE="$gate_bad_value" \
+    _run_sley "$gate_repo" ready --commit --exclude verify
+  _assert_exit "allow '$gate_bad_value': invalid phase is a usage error" 2 "$__SLEY_RC"
+  _assert_contains "allow '$gate_bad_value': explains the rejected value" \
+    "SLEY_ALLOW_UNAVAILABLE" "$__SLEY_OUT"
+  _assert_not_contains "allow '$gate_bad_value': runs no phases" \
+    "check: " "$__SLEY_OUT"
+done
+
+HOME="$gate_home" PATH="$gate_lint_error_path" SLEY_ALLOW_UNAVAILABLE=bogus \
+  _run_sley "$gate_repo" ready --exclude verify
+_assert_exit "allow bogus: report run outside the gate still succeeds" 0 "$__SLEY_RC"
+_assert_contains "allow bogus: report run warns about the value" \
+  "phase cannot be allowed: bogus" "$__SLEY_OUT"
+
+HOME="$gate_home" PATH="$gate_lint_error_path" SLEY_ALLOW_UNAVAILABLE=' check ' \
+  _run_sley "$gate_repo" ready --commit --exclude verify
+_assert_exit "allow ' check ': surrounding whitespace is trimmed" 0 "$__SLEY_RC"
+
+gate_sl_command=$(
+  # shellcheck disable=SC2016 # Inner bash expands the sourced API.
+  env -u SLEY_ALLOW_UNAVAILABLE SLEY_REPO_ROOT="$SLEY_REPO_ROOT" bash --noprofile --norc -c '
+    source "$SLEY_REPO_ROOT/lib/sley/sley.sh"
+    _REPO_TYPE=sl _sley_ready_gate_commit_command
+    printf "|"
+    _REPO_TYPE=git _sley_ready_gate_commit_command
+  '
+)
+_assert_eq "allow override: suggests the command for each VCS" \
+  "sl commit ...|git commit ..." "$gate_sl_command"
+
+echo "=== sley: SLEY_ALLOW_UNAVAILABLE through the native Git hook ==="
+
+# End to end through the shipped launcher: the variable set on `git commit`
+# must reach `sley ready --fix --commit` in the pre-commit hook.
+gate_hook_repo=$(_new_repo)
+cp "$SLEY_REPO_ROOT/share/sley/hooks/git/pre-commit" \
+  "$SLEY_REPO_ROOT/share/sley/hooks/git/sley-commit-gate" "$gate_hook_repo/.hooks/"
+gate_hook_bin=$(_gate_tools_bin)
+_gate_mock_autolint "$gate_hook_bin" 0
+ln -s "$SLEY" "$gate_hook_bin/sley"
+printf 'x = 1\n' >"$gate_hook_repo/hooked.py"
+(cd "$gate_hook_repo" && git add hooked.py)
+
+gate_hook_rc=0
+gate_hook_out=$(
+  cd "$gate_hook_repo" &&
+    HOME="$gate_home" XDG_CONFIG_HOME="$gate_home/.config" \
+      XDG_CACHE_HOME="$SLEY_TEST_XDG_CACHE_HOME" \
+      GIT_CONFIG_GLOBAL="$gate_hook_repo/.gitconfig-test" \
+      PATH="$gate_hook_bin:/usr/bin:/bin" \
+      git commit -q -m "blocked" 2>&1
+) || gate_hook_rc=$?
+_assert_exit "git hook: missing gitleaks blocks the commit" 1 "$gate_hook_rc"
+_assert_contains "git hook: block names the override" \
+  "SLEY_ALLOW_UNAVAILABLE=secrets git commit" "$gate_hook_out"
+
+gate_hook_rc=0
+gate_hook_out=$(
+  cd "$gate_hook_repo" &&
+    HOME="$gate_home" XDG_CONFIG_HOME="$gate_home/.config" \
+      XDG_CACHE_HOME="$SLEY_TEST_XDG_CACHE_HOME" \
+      GIT_CONFIG_GLOBAL="$gate_hook_repo/.gitconfig-test" \
+      PATH="$gate_hook_bin:/usr/bin:/bin" SLEY_ALLOW_UNAVAILABLE=secrets \
+      git commit -q -m "allowed" 2>&1
+) || gate_hook_rc=$?
+_assert_exit "git hook: allowed secrets rc 2 lets the commit land" 0 "$gate_hook_rc"
+_assert_contains "git hook: allowed commit announces the bypass" \
+  "allowed secrets to exit 2" "$gate_hook_out"
+_assert_eq "git hook: allowed commit exists" "allowed" \
+  "$(git -C "$gate_hook_repo" log -1 --format=%s 2>/dev/null)"
 
 repo=$(_new_repo)
 home=$(_tmpdir)

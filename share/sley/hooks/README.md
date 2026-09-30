@@ -73,3 +73,10 @@ or rewrite commits.
 Both VCS integrations fail closed when `sley` is unavailable. A missing
 readiness tool must be visible rather than silently turning a configured commit
 gate into a no-op.
+
+When a `check` or `secrets` tool is missing or broken, the gate blocks and
+names the phase. `SLEY_ALLOW_UNAVAILABLE=check`, `=secrets`, or
+`=check,secrets` on the commit command (for example
+`SLEY_ALLOW_UNAVAILABLE=secrets git commit` or `... sl commit`) tolerates only
+that phase's exit 2 for one invocation, which is narrower than skipping every
+hook with `git commit --no-verify`.

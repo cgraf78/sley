@@ -38,6 +38,54 @@ _sley_ready_phase_payload() {
   _sley_ready_run_phase "$@"
 }
 
+_sley_ready_parse_allow_unavailable() {
+  # Validate SLEY_ALLOW_UNAVAILABLE and print the allowed phases as a
+  # space-delimited list (" check secrets "). Only phases whose exit 2 the
+  # commit gate would otherwise block can be allowed; anything else is a
+  # usage error so a typo cannot silently leave the gate closed or open.
+  local value="$1" entry allowed=" "
+  local -a entries=()
+  # `read` stops at a newline, which would silently drop later entries.
+  if [[ "$value" == *$'\n'* ]]; then
+    echo "sley ready: SLEY_ALLOW_UNAVAILABLE must be one comma-separated line" >&2
+    return 2
+  fi
+  IFS=, read -r -a entries <<<"$value"
+  for entry in "${entries[@]+"${entries[@]}"}"; do
+    entry=${entry#"${entry%%[![:space:]]*}"}
+    entry=${entry%"${entry##*[![:space:]]}"}
+    [[ -n "$entry" ]] || continue
+    case "$entry" in
+      check | secrets)
+        [[ "$allowed" == *" $entry "* ]] || allowed+="$entry "
+        ;;
+      *)
+        printf 'sley ready: SLEY_ALLOW_UNAVAILABLE: phase cannot be allowed: %s (allowed: check, secrets)\n' \
+          "$entry" >&2
+        return 2
+        ;;
+    esac
+  done
+  printf '%s\n' "$allowed"
+}
+
+_sley_ready_gate_commit_command() {
+  # The one-commit override is an environment variable, so it reaches the
+  # native hook through the VCS command that runs it.
+  case "$_REPO_TYPE" in
+    sl) printf 'sl commit ...' ;;
+    *) printf 'git commit ...' ;;
+  esac
+}
+
+_sley_ready_join_phases() {
+  local joined="" phase
+  for phase in "$@"; do
+    joined+="${joined:+, }$phase"
+  done
+  printf '%s' "$joined"
+}
+
 _sley_ready_usage() {
   cat <<'EOF'
 Usage: sley ready [OPTIONS]
@@ -64,6 +112,11 @@ Scope:
   --repo-wide          consider all changed files in the repo
   --path PATH          restrict selected changed files to PATH
   --json               emit machine-readable output
+
+Environment:
+  SLEY_ALLOW_UNAVAILABLE=PHASES
+                       with --commit, tolerate exit 2 (missing tool or tool
+                       error) from check and/or secrets, comma-separated
 EOF
 }
 
@@ -1607,9 +1660,29 @@ _sley_ready_impl() {
   # `--commit` is the commit-gate path used by native and agent hooks. There,
   # a check or secrets phase that could not run must block instead of being
   # reported as optional unavailability; see the rc 2 handling below.
-  local commit_gate=0
-  local -a gate_unavailable=()
+  local commit_gate=0 allow_unavailable=" "
+  local -a gate_unavailable=() gate_bypassed=()
   _sley_scope_is_commit && commit_gate=1
+  # SLEY_ALLOW_UNAVAILABLE is the deliberate, per-phase override for that
+  # block. An invalid value fails the gate loudly; outside the gate, where rc
+  # 2 from these phases is already advisory, it only warns so a leaked value
+  # cannot break report callers. Unset it afterwards so verify commands and
+  # extensions (including a nested `sley ready --commit`) do not inherit it.
+  if [[ -n "${SLEY_ALLOW_UNAVAILABLE:-}" ]]; then
+    if ! allow_unavailable=$(
+      _sley_ready_parse_allow_unavailable "$SLEY_ALLOW_UNAVAILABLE"
+    ); then
+      [[ "$commit_gate" == "1" ]] && return 2
+      allow_unavailable=" "
+    elif [[ "$commit_gate" == "1" ]]; then
+      # Announce every use, not only actual bypasses, so a value leaked
+      # into a shell profile or agent environment is visible before a
+      # tool goes missing.
+      printf 'sley ready: SLEY_ALLOW_UNAVAILABLE=%s is set; exit 2 from those phases will not block this commit\n' \
+        "$SLEY_ALLOW_UNAVAILABLE" >&2
+    fi
+    unset SLEY_ALLOW_UNAVAILABLE
+  fi
   local progress=0
   [[ "$quiet" != "1" && "$_SLEY_SCOPE_JSON" != "1" ]] && progress=1
 
@@ -2026,10 +2099,19 @@ _sley_ready_impl() {
           # config, which Checkrun lets win over real findings in the same
           # run. Treating that as optional would let those findings or a
           # leaked secret land, so the gate fails closed and names the phase.
-          status="error"
-          errors=$((errors + 1))
-          global=2
-          gate_unavailable+=("$phase")
+          if [[ "$allow_unavailable" == *" $phase "* ]]; then
+            # Allowed for this invocation only. It stays visible as
+            # `bypassed` in the report and JSON; rc 1 findings never reach
+            # this branch, so they still block.
+            status="bypassed"
+            unavailable=$((unavailable + 1))
+            gate_bypassed+=("$phase")
+          else
+            status="error"
+            errors=$((errors + 1))
+            global=2
+            gate_unavailable+=("$phase")
+          fi
         else
           # Direct phase invocations can fail hard for missing tools or
           # unsupported scopes, but `ready` is a report. Keep those gaps visible
@@ -2127,17 +2209,21 @@ _sley_ready_impl() {
     printf '{"phases":[%s],"summary":{"blocking":%s,"unavailable":%s,"errors":%s,"exit_code":%s}}\n' \
       "$phases_json" "$blocking" "$unavailable" "$errors" "$global"
   fi
+  # stderr keeps `--json` stdout machine-readable, and both notes print even
+  # with --quiet. The phase's own diagnostic is already in the report.
+  if [[ "${#gate_bypassed[@]}" -gt 0 ]]; then
+    printf 'sley ready: commit gate: allowed %s to exit 2 via SLEY_ALLOW_UNAVAILABLE (not checked for this commit)\n' \
+      "$(_sley_ready_join_phases "${gate_bypassed[@]}")" >&2
+  fi
   if [[ "${#gate_unavailable[@]}" -gt 0 ]]; then
-    # stderr keeps `--json` stdout machine-readable. The phase's own
-    # diagnostic (for example `gitleaks not found`) is already in the report.
-    local gate_phases="" gate_phase gate_bypass="--exclude PHASE on a direct run"
-    for gate_phase in "${gate_unavailable[@]}"; do
-      gate_phases+="${gate_phases:+, }$gate_phase"
-    done
-    # Only Git has a documented native hook bypass; stay VCS-neutral otherwise.
-    [[ "$_REPO_TYPE" != "git" ]] || gate_bypass+=", or git commit --no-verify"
-    printf 'sley ready: commit gate blocked: %s exited 2 (missing tool or tool error; see its output above); fix it, or bypass the gate deliberately (%s)\n' \
-      "$gate_phases" "$gate_bypass" >&2
+    local gate_phases gate_allow
+    gate_phases=$(_sley_ready_join_phases "${gate_unavailable[@]}")
+    # The suggested value keeps phases already allowed on this run, so
+    # retrying the printed command does not drop an earlier allowance.
+    gate_allow=$(_sley_ready_join_phases \
+      "${gate_bypassed[@]+"${gate_bypassed[@]}"}" "${gate_unavailable[@]}")
+    printf 'sley ready: commit gate blocked: %s exited 2 (missing tool or tool error; see its output above); fix it, or allow it for one commit deliberately: SLEY_ALLOW_UNAVAILABLE=%s %s\n' \
+      "$gate_phases" "${gate_allow//, /,}" "$(_sley_ready_gate_commit_command)" >&2
   fi
   return "$global"
 }

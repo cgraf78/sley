@@ -215,7 +215,10 @@ New integrations should source `sley.sh` through shdeps and call public
   hooks. With `--commit`, a `check` or `secrets` phase that cannot run (exit
   2, such as a missing gitleaks or a broken linter config) fails the gate
   instead of being reported as unavailable; outside the gate those phases stay
-  advisory.
+  advisory. `SLEY_ALLOW_UNAVAILABLE=check`, `=secrets`, or `=check,secrets`
+  on the commit command (for example `SLEY_ALLOW_UNAVAILABLE=secrets git
+  commit`, or `sl commit` for Sapling) tolerates that phase's exit 2 for one
+  commit and reports it as bypassed; findings and other phases still block.
 - `_sley_shell_complete` and `_sley_zsh_complete` are the Bash and zsh
   completion functions installed by the shell loader.
 - `SLEY_VERIFY_SCHEMA` is exported by the shell loader as the absolute path to

@@ -21,6 +21,8 @@ git_log=$(_tmpdir)/git.log
 cat >"$mock_bin/sley" <<'EOF'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >>"$SLEY_TEST_LOG"
+[[ -z "${SLEY_TEST_ENV_LOG:-}" ]] ||
+  printf 'allow=%s\n' "${SLEY_ALLOW_UNAVAILABLE:-}" >>"$SLEY_TEST_ENV_LOG"
 case "${1:-}" in
   hook) exit "${SLEY_TEST_VALIDATE_RC:-${SLEY_TEST_RC:-0}}" ;;
   secrets) exit "${SLEY_TEST_SECRETS_RC:-${SLEY_TEST_RC:-0}}" ;;
@@ -66,6 +68,16 @@ SLEY_TEST_LOG="$sley_log" SLEY_TEST_RC=7 PATH="$mock_bin:$PATH" \
 _assert_exit "git gate: preserves sley status" 7 "$rc"
 _assert_file_content "git gate: preserves the readiness arguments" \
   "ready --fix --commit" "$sley_log"
+
+: >"$sley_log"
+git_env_log=$(_tmpdir)/git-env.log
+rc=0
+SLEY_TEST_LOG="$sley_log" SLEY_TEST_ENV_LOG="$git_env_log" \
+  SLEY_ALLOW_UNAVAILABLE=check PATH="$mock_bin:$PATH" \
+  "$git_hooks/sley-commit-gate" >/dev/null 2>&1 || rc=$?
+_assert_exit "git gate: override run succeeds" 0 "$rc"
+_assert_file_content "git gate: passes SLEY_ALLOW_UNAVAILABLE to sley ready" \
+  "allow=check" "$git_env_log"
 
 missing_bin=$(_mock_bin)
 ln -s "$(command -v bash)" "$missing_bin/bash"
@@ -289,6 +301,18 @@ SLEY_TEST_LOG="$sley_log" SLEY_TEST_RC=7 PATH="$mock_bin:$PATH" \
 _assert_exit "sapling gate: preserves sley status" 7 "$rc"
 _assert_file_content "sapling gate: blocking checks retain the readiness arguments" \
   "ready --fix --commit" "$sley_log"
+
+# The per-phase commit-gate override is an environment variable; the launcher
+# must hand it to `sley ready` unchanged rather than filtering the environment.
+: >"$sley_log"
+env_log=$(_tmpdir)/sapling-env.log
+rc=0
+SLEY_TEST_LOG="$sley_log" SLEY_TEST_ENV_LOG="$env_log" \
+  SLEY_ALLOW_UNAVAILABLE=secrets PATH="$mock_bin:$PATH" \
+  "$sapling_gate" commit -m message >/dev/null 2>&1 || rc=$?
+_assert_exit "sapling gate: override run succeeds" 0 "$rc"
+_assert_file_content "sapling gate: passes SLEY_ALLOW_UNAVAILABLE to sley ready" \
+  "allow=secrets" "$env_log"
 
 : >"$sley_log"
 SLEY_TEST_LOG="$sley_log" PATH="$mock_bin:$PATH" \

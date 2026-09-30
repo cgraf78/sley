@@ -74,8 +74,13 @@ linter or gitleaks, or a structural linter error that Checkrun lets win over
 findings. A report-only `sley ready` shows those phases as unavailable and
 continues. The `--commit` commit gate fails closed instead: it exits 2 and
 names each phase that could not run, so an unavailable tool cannot let lint
-findings or secrets land. Callers skip a phase deliberately with `--exclude`
-or the VCS hook bypass, not by leaving a tool uninstalled.
+findings or secrets land. The deliberate override is per phase and per
+invocation: `SLEY_ALLOW_UNAVAILABLE=check`, `=secrets`, or `=check,secrets`
+set on the commit command reaches the Git and Sapling hooks alike. It
+tolerates only that phase's exit 2, reports the phase as `bypassed` in the
+text and JSON output, and never tolerates findings (exit 1) or other phases.
+An invalid value is a usage error for the gate and only a warning for a
+report-only run.
 
 ## Low-Level Tool Invocation
 
