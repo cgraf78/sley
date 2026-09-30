@@ -24,7 +24,10 @@ from pathlib import Path
 from typing import Any
 
 SCHEMA = 1
-ALGORITHM = 1
+# Algorithm 2 adds the committed tree and untracked files to the key. Bumping
+# it keeps algorithm-1 receipts, whose keys could not see those inputs, from
+# ever satisfying a lookup.
+ALGORITHM = 2
 
 
 class IdentityInputError(ValueError):
@@ -33,6 +36,15 @@ class IdentityInputError(ValueError):
 
 def sha_bytes(data: bytes) -> str:
     return "sha256:" + hashlib.sha256(data).hexdigest()
+
+
+def sha_file(path: Path) -> str:
+    """Hash a file's content in chunks so large files are not read whole."""
+    digest = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            digest.update(chunk)
+    return "sha256:" + digest.hexdigest()
 
 
 def canon(obj: Any) -> bytes:
@@ -146,6 +158,75 @@ def sl_output(args: list[str], cwd: Path) -> str | None:
     return _vcs_output("sl", args, cwd)
 
 
+def _vcs_bytes(binary: str, args: list[str], cwd: Path, what: str) -> bytes:
+    """Run a VCS listing and return its raw stdout.
+
+    Failure raises `IdentityInputError`: an unknown input must disable the
+    cache proof for this invocation rather than silently hashing an empty
+    listing and producing a false hit.
+    """
+    try:
+        result = subprocess.run(
+            [binary, *args],
+            cwd=str(cwd),
+            check=True,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise IdentityInputError(f"{what} failed: {binary}") from exc
+    return result.stdout
+
+
+def _vcs_names(binary: str, args: list[str], cwd: Path) -> list[str]:
+    """Run a NUL-delimited untracked-file listing and return its entries."""
+    out = _vcs_bytes(binary, args, cwd, "untracked file listing")
+    return [os.fsdecode(name) for name in out.split(b"\0") if name]
+
+
+def git_committed_outside(root: Path, head: str | None, selected: list[str]) -> dict[str, Any]:
+    """Key material for committed files outside the selected set.
+
+    Selected files are already hashed from the worktree, so their committed
+    versions are left out: committing exactly the verified content keeps the
+    key. Every other committed path still counts, which is what catches a
+    commit that adds broken content elsewhere while the selected files stay
+    unchanged (on a branch with no upstream nothing else in the key moves).
+
+    One `git ls-tree` lists HEAD's tree only along the selected files'
+    directories: naming each ancestor directory with a trailing slash makes
+    ls-tree expand those directories and print every other entry as a single
+    blob or subtree id, which pins everything beneath it. Cost is
+    proportional to the directories on the selected paths, not the size of
+    the repository. Only a digest enters the key, so lookup output stays
+    small.
+    """
+    if not head:
+        return {"head": None}
+    selected_set = {os.fsencode(name) for name in selected}
+    directories = {"./"}
+    for name in selected:
+        parent = name
+        while "/" in parent:
+            parent = parent.rpartition("/")[0]
+            directories.add(parent + "/")
+    out = _vcs_bytes(
+        "git",
+        ["--literal-pathspecs", "ls-tree", "-z", str(head), "--", *sorted(directories)],
+        root,
+        "committed tree listing",
+    )
+    # Compare raw bytes: selected names come from JSON, listing paths from
+    # git. Entries are `<mode> <type> <oid>\t<path>`, NUL-terminated.
+    kept = [
+        entry
+        for entry in out.split(b"\0")
+        if entry and entry.partition(b"\t")[2] not in selected_set
+    ]
+    return {"tree": sha_bytes(b"\0".join(kept))}
+
+
 def repo_identity(payload: dict[str, Any], root: Path) -> dict[str, Any]:
     override = payload.get("repo_identity")
     if isinstance(override, dict):
@@ -176,6 +257,7 @@ def git_base_identity(
             "upstream_tip": override.get("upstream_tip"),
             "merge_base": override.get("merge_base"),
         }
+        head = override.get("head")
     else:
         upstream = git_output(
             ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"], root
@@ -184,12 +266,12 @@ def git_base_identity(
         head = git_output(["rev-parse", "--verify", "--quiet", "HEAD"], root)
         merge_base = None
         if upstream_tip and head:
+            # The raw merge base, even when it equals HEAD (a branch level with
+            # its upstream). Normalizing that case to null made the first commit
+            # on top of an upstream change the key although the committed tree
+            # is keyed separately (`git_committed_outside`), so committing
+            # already-verified content reran every cached command.
             merge_base = git_output(["merge-base", upstream_tip, head], root)
-            if merge_base == head:
-                # A branch with no semantic delta from upstream should not get a
-                # stronger base identity than an actually changed branch. The
-                # selected-content policy can still opt out of base identity.
-                merge_base = None
         metadata = {
             "upstream_ref": upstream,
             "upstream_tip": upstream_tip,
@@ -204,7 +286,7 @@ def git_base_identity(
         pass
     else:
         raise ValueError(f"unsupported base_policy: {policy}")
-    return {"key": key, "metadata": metadata}
+    return {"key": key, "metadata": metadata, "head": head}
 
 
 def sl_base_identity(
@@ -255,7 +337,7 @@ def file_record(root: Path, rel: str) -> dict[str, Any]:
             "path": rel,
             "kind": "file",
             "executable": bool(mode & 0o111),
-            "content": sha_bytes(path.read_bytes()),
+            "content": sha_file(path),
         }
     if stat.S_ISLNK(mode):
         # Hash the link itself, not the target contents. Following a symlink can
@@ -269,6 +351,72 @@ def file_record(root: Path, rel: str) -> dict[str, Any]:
     if stat.S_ISDIR(mode):
         return {"path": rel, "kind": "directory"}
     return {"path": rel, "kind": "unsupported", "mode": stat.S_IFMT(mode)}
+
+
+def _printable(name: str) -> str:
+    """Escape a filesystem name that is not valid UTF-8 for use in the key."""
+    return os.fsencode(name).decode("utf-8", "backslashreplace")
+
+
+def untracked_names(repo_type: str, root: Path, paths: list[str]) -> list[str]:
+    """List untracked, non-ignored files inside the selected path scope.
+
+    `paths` are the repo-relative `--path` filters (`.` or empty means the
+    whole repository), matching `_repo_filter_paths`: a filter selects itself
+    and everything below it. Both VCS listings take them as literal pathspecs.
+    """
+    whole_repo = not paths or "." in paths
+    if repo_type == "git":
+        args = ["--literal-pathspecs", "ls-files", "-z", "--others", "--exclude-standard"]
+        if not whole_repo:
+            args += ["--", *paths]
+        return _vcs_names("git", args, root)
+    if repo_type == "sl":
+        args = ["status", "--unknown", "--no-status", "--print0", "--config", "ui.color=never"]
+        if not whole_repo:
+            args += ["--", *(f"path:{p}" for p in paths)]
+        return _vcs_names("sl", args, root)
+    raise ValueError(f"unsupported repo_type: {repo_type}")
+
+
+def untracked_material(
+    payload: dict[str, Any], root: Path, policy: str, selected: list[str], paths: list[str]
+) -> dict[str, Any]:
+    """Key material for untracked files that are not already selected.
+
+    Test runners read the filesystem, so a new untracked module or test file
+    can change the outcome without touching any selected file. Their names and
+    content are key inputs unless the command opted into `selected-content`
+    (only the selected files matter) or the caller set `SLEY_SKIP_UNTRACKED`
+    because walking the worktree is too expensive (for example a bare-repo
+    worktree rooted at `$HOME`); that opt-out knowingly accepts the stale-hit
+    risk and is recorded in the key.
+    """
+    if policy == "selected-content":
+        return {"mode": "selected-content"}
+    if payload.get("skip_untracked"):
+        return {"mode": "skipped"}
+    selected_set = set(selected)
+    records = []
+    for name in sorted(untracked_names(payload["repo_type"], root, paths)):
+        if name in selected_set:
+            # Already hashed under `content` (`--include-untracked`).
+            continue
+        try:
+            record = file_record(root, name)
+        except OSError as exc:
+            # Content that cannot be read cannot be proven unchanged; run this
+            # command uncached instead of failing verification outright.
+            raise IdentityInputError(f"untracked file unreadable: {name}") from exc
+        # Names that are not valid UTF-8 cannot pass through `canon`.
+        record["path"] = _printable(name)
+        if "target" in record:
+            record["target"] = _printable(record["target"])
+        records.append(record)
+    # A digest, not the records: `lookup` returns the material as JSON that
+    # bash pipes through jq, and a worktree with thousands of untracked files
+    # would otherwise produce a document hundreds of KB long.
+    return {"mode": "listed", "count": len(records), "files": sha_bytes(canon(records))}
 
 
 def shell_args(shell_mode: str) -> list[str]:
@@ -350,6 +498,19 @@ def key_material(payload: dict[str, Any], root: Path, cache_dir: Path) -> dict[s
     # must model filesystem state rather than how the VCS happened to describe
     # the pending change.
     content_records = [file_record(root, rel) for rel in files]
+    committed = None
+    if payload["repo_type"] == "git" and policy != "selected-content":
+        # Sapling needs no equivalent: its base identity already carries the
+        # node ids of `.` and its draft ancestors (a commit or amend there
+        # already changes the key).
+        committed = git_committed_outside(root, base["head"], files)
+    try:
+        untracked = untracked_material(payload, root, str(policy), files, paths)
+    except IdentityInputError as exc:
+        # Keep the rest of the key computable: the post-run check must still
+        # tell a tracked-input change (a failure) from a problem confined to
+        # untracked files (the run passed but cannot be cached).
+        untracked = {"mode": "unavailable", "error": str(exc)}
 
     return {
         "algorithm": ALGORITHM,
@@ -365,6 +526,8 @@ def key_material(payload: dict[str, Any], root: Path, cache_dir: Path) -> dict[s
             "files": files,
         },
         "content": content_records,
+        "committed": committed,
+        "untracked": untracked,
         "command": {
             "command": command.get("command"),
             "kind": command.get("kind") or "test",
@@ -383,6 +546,13 @@ def key_material(payload: dict[str, Any], root: Path, cache_dir: Path) -> dict[s
     }
 
 
+def require_untracked(material: dict[str, Any]) -> None:
+    """Refuse to look up or write a receipt whose untracked input is unknown."""
+    untracked = material.get("untracked") or {}
+    if untracked.get("mode") == "unavailable":
+        raise IdentityInputError(str(untracked.get("error")))
+
+
 def receipt_paths(key: str, root: Path) -> tuple[Path, Path, Path]:
     hex_key = key.removeprefix("sha256:")
     receipts = root / "receipts"
@@ -390,7 +560,14 @@ def receipt_paths(key: str, root: Path) -> tuple[Path, Path, Path]:
     return receipts, tmp, receipts / f"sha256-{hex_key}.json"
 
 
-def compute(payload: dict[str, Any]) -> tuple[str, dict[str, Any], Path]:
+def compute(payload: dict[str, Any]) -> tuple[str, str, dict[str, Any], Path]:
+    """Return (key, generation, material, cache_dir) for one payload.
+
+    `generation` is the key without the untracked-file material. The post-run
+    check uses it to tell "tracked input changed while the command ran" (a
+    failure) apart from "the command created or rewrote untracked files" (the
+    run still passed, but its receipt would not describe the current tree).
+    """
     root = Path(payload["repo_root"])
     cache_dir = cache_root()
     material = key_material(payload, root, cache_dir)
@@ -400,32 +577,43 @@ def compute(payload: dict[str, Any]) -> tuple[str, dict[str, Any], Path]:
     key_input = dict(material)
     key_input.pop("metadata", None)
     key = sha_bytes(canon(key_input))
-    return key, material, cache_dir
+    key_input.pop("untracked", None)
+    generation = sha_bytes(canon(key_input))
+    return key, generation, material, cache_dir
 
 
 def lookup(payload: dict[str, Any]) -> dict[str, Any]:
-    key, material, root = compute(payload)
+    key, generation, material, root = compute(payload)
+    require_untracked(material)
     receipts, _tmp, receipt = receipt_paths(key, root)
+    result = {
+        "status": "miss",
+        "key": key,
+        "generation": generation,
+        "receipt": str(receipt),
+        "material": material,
+    }
     if receipt.is_symlink() or not receipt.is_file():
-        return {"status": "miss", "key": key, "receipt": str(receipt), "material": material}
+        return result
     try:
         data = json.loads(receipt.read_text())
     except (OSError, json.JSONDecodeError):
         # Corrupt receipts are treated like absent receipts. The next successful
         # run will rewrite them; failing open here would be the dangerous case.
-        return {"status": "miss", "key": key, "receipt": str(receipt), "material": material}
+        return result
     if (
         data.get("schema") == SCHEMA
         and data.get("cache_algorithm") == ALGORITHM
         and data.get("key") == key
         and data.get("status") == "passed"
     ):
-        return {"status": "hit", "key": key, "receipt": str(receipt), "material": material}
-    return {"status": "miss", "key": key, "receipt": str(receipt), "material": material}
+        result["status"] = "hit"
+    return result
 
 
 def write(payload: dict[str, Any]) -> dict[str, Any]:
-    key, material, root = compute(payload)
+    key, _generation, material, root = compute(payload)
+    require_untracked(material)
     receipts, tmp_dir, receipt = receipt_paths(key, root)
     ensure_private_dir(root)
     ensure_private_dir(receipts)
@@ -508,23 +696,52 @@ def prune(root: Path, keep: Path | None = None) -> None:
             pass
 
 
+def git_head_tree_moved(payload: dict[str, Any]) -> bool:
+    """True when HEAD's tree differs from the tree of the pinned HEAD.
+
+    The shell pins HEAD once per command, so recomputing the key after the
+    run cannot see a checkout, commit, or reset that happened meanwhile: the
+    command then ran against a moving tree, and a receipt for the pinned
+    commit would describe a tree it may never have tested.
+    """
+    base = payload.get("base_identity")
+    if payload.get("repo_type") != "git" or not isinstance(base, dict):
+        return False
+    command = payload.get("command") if isinstance(payload.get("command"), dict) else {}
+    cache = command.get("cache") if isinstance(command.get("cache"), dict) else {}
+    if cache.get("base_policy") == "selected-content":
+        # Only the selected files are key inputs under this policy.
+        return False
+    pinned = base.get("head")
+    if not pinned:
+        return False
+    out = git_output(["rev-parse", f"{pinned}^{{tree}}", "HEAD^{tree}"], Path(payload["repo_root"]))
+    trees = (out or "").split()
+    return len(trees) != 2 or trees[0] != trees[1]
+
+
 def write_if_same_generation(
-    payload: dict[str, Any], expected_key: str | None
+    payload: dict[str, Any], expected_key: str | None, expected_generation: str | None = None
 ) -> tuple[dict[str, Any], int]:
     """Recompute the key and write a receipt only if it still matches.
 
     This folds the shell's old post-run lookup plus write into one helper
-    invocation. Outcomes mirror the old two-call sequence exactly:
+    invocation. Outcomes:
     - key matches (and is non-empty): write the receipt, like `write`.
-    - key differs, key missing, or identity inputs fail: report `changed`
-      (the old post-run lookup yielded an empty/different key in exactly
-      these cases, and the shell failed closed with the same message).
+    - key differs only in untracked files, or they can no longer be listed
+      or read (generation still matches): report `untracked-changed` and
+      write nothing. Commands commonly create untracked artifacts; that
+      must not fail the run, but a receipt keyed on the pre-run tree would
+      no longer describe what is on disk.
+    - key differs otherwise, key missing, identity inputs fail, or HEAD's
+      tree moved during the run: report `changed`, and the shell fails
+      closed as it always has for a content change during the run.
     - recompute/write operational failure: report `error` with the phase
       so the shell keeps its distinct diagnostics.
     Returns (result, exit_code); errors exit nonzero like `write` does.
     """
     try:
-        key, _material, _root = compute(payload)
+        key, generation, material, _root = compute(payload)
     except IdentityInputError:
         return (
             {"status": "changed", "key": None, "expected": expected_key},
@@ -535,6 +752,17 @@ def write_if_same_generation(
             {"status": "error", "phase": "recompute", "error": str(exc)},
             1,
         )
+    if git_head_tree_moved(payload):
+        return ({"status": "changed", "key": key, "expected": expected_key}, 0)
+    untracked_known = (material.get("untracked") or {}).get("mode") != "unavailable"
+    if (
+        expected_key
+        and expected_generation == generation
+        and (key != expected_key or not untracked_known)
+    ):
+        return ({"status": "untracked-changed", "key": key, "expected": expected_key}, 0)
+    if not untracked_known:
+        return ({"status": "changed", "key": None, "expected": expected_key}, 0)
     if not expected_key or key != expected_key:
         return ({"status": "changed", "key": key, "expected": expected_key}, 0)
     try:
@@ -570,6 +798,7 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("action", choices=["lookup", "write", "stats", "write-if-same-generation"])
     parser.add_argument("expected_key", nargs="?")
+    parser.add_argument("expected_generation", nargs="?")
     args = parser.parse_args()
     try:
         if args.action == "stats":
@@ -587,7 +816,9 @@ def main() -> int:
         elif args.action == "write":
             result = write(payload)
         elif args.action == "write-if-same-generation":
-            result, verb_rc = write_if_same_generation(payload, args.expected_key)
+            result, verb_rc = write_if_same_generation(
+                payload, args.expected_key, args.expected_generation
+            )
             print(json.dumps(result, separators=(",", ":")))
             return verb_rc
     except Exception as exc:  # noqa: BLE001 - shell caller needs one message.

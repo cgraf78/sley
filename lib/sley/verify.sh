@@ -756,12 +756,11 @@ _sley_verify_cache_helper() {
 # path used to pay 4× ~5 VCS spawns per cached command). Values mirror the
 # helper precisely — same commands, same working directory, same
 # failure-to-null mapping (a null flag per value, since
-# success-with-empty-output and failure must stay distinct), same
-# merge_base==head normalization. Identity is intentionally NOT memoized
-# across commands (the only caller runs in command substitution, so a
-# memoized value could not persist anyway): every cached command
-# re-probes, so a base that moves mid-gate is always observed fresh and
-# no stale window exists.
+# success-with-empty-output and failure must stay distinct). Identity is
+# intentionally NOT memoized across commands (the only caller runs in
+# command substitution, so a memoized value could not persist anyway):
+# every cached command re-probes, so a base that moves mid-gate is always
+# observed fresh and no stale window exists.
 _sley_verify_cache_identity_json() {
   local identity=""
   if [[ "$_REPO_TYPE" == "git" ]]; then
@@ -788,12 +787,14 @@ _sley_verify_cache_identity_json() {
     else
       upstream_tip=""
     fi
-    # `head` only gates the merge-base query below (as in the helper); it is
-    # not part of the identity itself, so no null flag is needed.
+    # `head` gates the merge-base query below (as in the helper) and lets the
+    # helper key on committed files outside the selection. It is pinned here
+    # once per command; the helper's post-run check refuses the receipt if
+    # HEAD's tree moved while the command ran. It is not key material by
+    # itself, so an empty string stands for "absent".
     head=$(git -C "$_REPO_ROOT" rev-parse --verify --quiet HEAD 2>/dev/null || true)
     if [[ -n "$upstream_tip" && -n "$head" ]]; then
-      if merge_base=$(git -C "$_REPO_ROOT" merge-base "$upstream_tip" "$head" 2>/dev/null) &&
-        [[ "$merge_base" != "$head" ]]; then
+      if merge_base=$(git -C "$_REPO_ROOT" merge-base "$upstream_tip" "$head" 2>/dev/null); then
         merge_base_null=0
       else
         merge_base=""
@@ -806,6 +807,7 @@ _sley_verify_cache_identity_json() {
       --arg upstream "$upstream" --argjson upstream_null "$upstream_null" \
       --arg upstream_tip "$upstream_tip" --argjson upstream_tip_null "$upstream_tip_null" \
       --arg merge_base "$merge_base" --argjson merge_base_null "$merge_base_null" \
+      --arg head "$head" \
       '{
         repo_identity: {
           type: "git",
@@ -816,7 +818,8 @@ _sley_verify_cache_identity_json() {
         base_identity: {
           upstream_ref: (if $upstream_null == 1 then null else $upstream end),
           upstream_tip: (if $upstream_tip_null == 1 then null else $upstream_tip end),
-          merge_base: (if $merge_base_null == 1 then null else $merge_base end)
+          merge_base: (if $merge_base_null == 1 then null else $merge_base end),
+          head: (if $head == "" then null else $head end)
         }
       }') || return 1
   elif [[ "$_REPO_TYPE" == "sl" ]]; then
@@ -866,7 +869,7 @@ _sley_verify_cache_identity_json() {
 }
 
 _sley_verify_cache_payload() {
-  local files="$1" command_item="$2" paths include_untracked repo_wide identity_json
+  local files="$1" command_item="$2" paths include_untracked repo_wide skip_untracked identity_json
   paths=$(_sley_path_filters) || return $?
   identity_json=$(_sley_verify_cache_identity_json) || return 1
   # Keep the cache helper's input as JSON. The selected-file stream is still
@@ -875,12 +878,16 @@ _sley_verify_cache_payload() {
   # `--rawfile` feeds both streams into one jq call instead of three.
   [[ "$_SLEY_SCOPE_INCLUDE_UNTRACKED" == "1" ]] && include_untracked=true || include_untracked=false
   [[ "$_SLEY_SCOPE_REPO_WIDE" == "1" ]] && repo_wide=true || repo_wide=false
+  # The helper hashes untracked files into the key; honor the same opt-out
+  # that keeps status and readiness from walking huge bare-repo worktrees.
+  [[ "${SLEY_SKIP_UNTRACKED:-0}" == "1" ]] && skip_untracked=true || skip_untracked=false
   jq -cn \
     --arg repo_type "$_REPO_TYPE" \
     --arg repo_root "$_REPO_ROOT" \
     --arg scope_change "$_SLEY_SCOPE_CHANGE" \
     --argjson include_untracked "$include_untracked" \
     --argjson repo_wide "$repo_wide" \
+    --argjson skip_untracked "$skip_untracked" \
     --rawfile files_text <(printf '%s\n' "$files") \
     --rawfile paths_text <(printf '%s\n' "$paths") \
     --argjson command "$command_item" \
@@ -891,6 +898,7 @@ _sley_verify_cache_payload() {
       scope_change: $scope_change,
       include_untracked: $include_untracked,
       repo_wide: $repo_wide,
+      skip_untracked: $skip_untracked,
       files: ($files_text | split("\n") | map(select(length > 0))),
       paths: ($paths_text | split("\n") | map(select(length > 0))),
       command: $command,
@@ -899,114 +907,203 @@ _sley_verify_cache_payload() {
     }'
 }
 
-# Parse one helper lookup document into cache_status/receipt/pre_key. One jq
-# call (used to be three per lookup, six per cached command); `@sh` quoting
-# keeps this exact for arbitrary paths. Plain assignments land in the
-# caller's locals via dynamic scope — the run-required loop pre-declares
-# all three. Defaults are pre-set so malformed input behaves exactly like
+# Parse one helper lookup document into cache_status/receipt/pre_key/
+# pre_generation. One jq call (used to be three per lookup, six per cached
+# command); `@sh` quoting keeps this exact for arbitrary paths. Plain
+# assignments land in the caller's locals via dynamic scope — the
+# run-required loop pre-declares all four. Defaults are pre-set so malformed input behaves exactly like
 # the old per-field extraction (empty status, treated as a miss below).
 _sley_verify_cache_parse_lookup() {
   cache_status=""
   receipt=""
   pre_key=""
+  pre_generation=""
   if lookup_assignments=$(printf '%s' "$1" | jq -r \
-    '"cache_status=\(.status|@sh)", "receipt=\(.receipt // ""|@sh)", "pre_key=\(.key // ""|@sh)"'); then
+    '"cache_status=\(.status|@sh)", "receipt=\(.receipt // ""|@sh)", "pre_key=\(.key // ""|@sh)", "pre_generation=\(.generation // ""|@sh)"'); then
     eval "$lookup_assignments"
   fi
 }
 
+# Cache locks serialize same-key runs across concurrent `sley verify`
+# invocations (for example agents running `sley ready` in parallel). A lock
+# is the directory `<cache>/locks/<receipt>.lock` holding `owner.meta` lines
+# `pid=`, `host=`, `started=`, and a per-acquisition `token=`. mkdir is the
+# cross-platform primitive: stock macOS does not ship the Linux `flock(1)`
+# CLI, and a short best-effort lock is enough to avoid duplicate same-key
+# executions without making cache unavailability fatal.
+#
+# Ownership rules that keep one invocation from destroying another's lock:
+#   - Only the holder removes its own lock, and only after reading its token
+#     back from owner.meta (`_sley_verify_cache_lock_release`).
+#   - Anyone else removes a lock only through `_sley_verify_cache_lock_reclaim`,
+#     which re-judges it abandoned while holding a per-lock reclaim mutex.
+#   - The holder writes owner.meta right after mkdir, from content prepared
+#     beforehand, so a lock without metadata exists only for an instant
+#     unless its creator was killed there; the grace period recovers that.
+_SLEY_VERIFY_CACHE_LOCK_GRACE_SECONDS=60
+
+# Acquire the cache lock for `receipt`, polling for up to ~5s. On success,
+# set the caller's `lock_dir` and `lock_token` (dynamic scope) and return 0;
+# otherwise leave both empty and return 1 so the caller runs unlocked.
+#
+# Call this directly from the process that owns the INT/TERM/HUP trap, never
+# from `$(...)`: a lock created in a subshell is invisible to the trap and
+# leaks when a signal lands before the path reaches the parent. Both
+# variables are published before mkdir so a signal at any point finds them;
+# release checks the token, so a signal that arrives while this process is
+# still waiting on another owner's lock removes nothing.
 _sley_verify_cache_lock_acquire() {
-  local receipt="$1" lock_root lock_dir attempts=0
+  local receipt="$1" lock_root target token meta started attempts=0
+  lock_dir="" lock_token=""
   [[ -n "$receipt" ]] || return 1
   lock_root="$(dirname "$(dirname "$receipt")")/locks"
   mkdir -p "$lock_root" 2>/dev/null || return 1
-  lock_dir="$lock_root/$(basename "$receipt").lock"
-  # Use mkdir as the cross-platform lock primitive. Stock macOS does not ship
-  # the Linux `flock(1)` CLI, and a short best-effort lock is enough to avoid
-  # duplicate same-key executions without making cache unavailability fatal.
+  target="$lock_root/$(basename "$receipt").lock"
+  started=$(date +%s 2>/dev/null)
+  token="${BASHPID:-$$}.$RANDOM$RANDOM.$started"
+  # BASHPID, not $$: when verify runs inside a subshell (a readiness phase),
+  # $$ names the parent, which can outlive a killed holder and keep its lock
+  # from ever looking abandoned. Hostname is recorded alongside the PID
+  # because a network-mounted cache (rare) would otherwise let one host
+  # reclaim a still-alive PID on another.
+  printf -v meta 'pid=%s\nhost=%s\nstarted=%s\ntoken=%s\n' \
+    "${BASHPID:-$$}" "${HOSTNAME:-$(uname -n 2>/dev/null)}" "$started" "$token"
+  lock_dir="$target" lock_token="$token"
   while [[ "$attempts" -lt 50 ]]; do
-    if mkdir "$lock_dir" 2>/dev/null; then
-      # Stamp owner metadata so a future invocation can reclaim a stale lock
-      # whose holder was SIGKILLed (or died to OOM / power loss) before
-      # reaching the release path. Hostname is recorded alongside the PID
-      # because lock files live under `XDG_CACHE_HOME` — per-user and
-      # per-machine in practice, but a network-mounted cache (rare) would
-      # otherwise let one host reclaim a still-alive PID on another. Failure
-      # to write metadata is non-fatal: the lock still works, it just falls
-      # back to the pre-fix behavior (no stale reclaim) for this acquisition.
-      {
-        printf 'pid=%s\n' "$$"
-        printf 'host=%s\n' "${HOSTNAME:-$(uname -n 2>/dev/null)}"
-        printf 'started=%s\n' "$(date +%s 2>/dev/null)"
-      } >"$lock_dir/owner.meta" 2>/dev/null || true
-      printf '%s\n' "$lock_dir"
-      return 0
+    if mkdir "$target" 2>/dev/null; then
+      printf '%s' "$meta" >"$target/owner.meta" 2>/dev/null && return 0
+      # Without metadata neither the trap nor other waiters could tell whose
+      # lock this is; drop it and run unlocked instead. Nobody reclaims a
+      # metadata-less lock within the grace period, so it is still ours.
+      rm -rf "$target" 2>/dev/null
+      break
     fi
-    # An existing lock dir may be stale (holder SIGKILLed, OOM, power loss
-    # between acquire and release, or the SIGINT/SIGTERM trap in
-    # `_sley_verify_run_required` did not get to run). If `owner.meta` names a
-    # PID that is no longer alive on this host, treat the lock as abandoned
-    # and reclaim it. Without this every future run for the same cache key
-    # paid the full 5-second mkdir-polling penalty before falling through
-    # unlocked AND a duplicate same-key execution could occur.
-    #
-    # CRITICAL: reclaim uses an atomic `mv`-to-tombstone, NOT `rm -rf` + retry.
-    # Two waiters can both pass `_sley_verify_cache_lock_is_stale` (the meta
-    # is unchanged until someone removes the dir), so a naive
-    # `is_stale ? rm -rf` lets the second waiter's `rm` destroy the FIRST
-    # waiter's freshly-acquired lock — exactly the duplicate-execution bug
-    # this whole fix is meant to eliminate. `mv` is atomic on the same
-    # filesystem: only one waiter's rename wins; the loser's `mv` fails
-    # cleanly (source already gone) and falls through to retry mkdir.
-    # The winner deletes a private tombstone path that can never collide
-    # with a subsequent fresh acquire on the original `$lock_dir`.
-    if _sley_verify_cache_lock_is_stale "$lock_dir"; then
-      local tombstone="$lock_dir.stale.$$.$RANDOM"
-      if mv "$lock_dir" "$tombstone" 2>/dev/null; then
-        printf 'sley verify: reclaiming stale cache lock (owner PID gone): %s\n' "$lock_dir" >&2
-        rm -rf "$tombstone" 2>/dev/null || true
-      fi
-      # Fall through to the next iteration's mkdir attempt.
-    fi
+    # The existing lock may be abandoned (holder SIGKILLed, OOM, power loss,
+    # or a signal the trap never saw). Without reclaim every later run for
+    # the key paid the full polling budget and then ran unlocked.
+    _sley_verify_cache_lock_reclaim "$target"
     attempts=$((attempts + 1))
     sleep 0.1
   done
+  lock_dir="" lock_token=""
   return 1
 }
 
+# Remove the lock at `lock_path` only if its owner.meta still carries
+# `token`. The signal trap passes whatever `lock_dir`/`lock_token` hold when
+# it fires, which can be a lock this process is still waiting on, or one it
+# already released that a successor has since acquired; the token check
+# leaves both alone. No other process removes a lock whose owner is alive,
+# so checking and then removing is not racy.
 _sley_verify_cache_lock_release() {
-  local lock_dir="$1"
-  [[ -n "$lock_dir" ]] || return 0
-  # `rm -rf` (not `rmdir`) because the lock dir now contains the owner.meta
-  # stamp; rmdir would fail on non-empty dirs and silently leak the lock.
-  rm -rf "$lock_dir" 2>/dev/null || true
+  local lock_path="$1" token="$2" owner_pid owner_host owner_token
+  [[ -n "$lock_path" && -n "$token" ]] || return 0
+  _sley_verify_cache_lock_owner "$lock_path" || return 0
+  [[ "$owner_token" == "$token" ]] || return 0
+  rm -rf "$lock_path" 2>/dev/null || true
 }
 
-# Return success (rc=0) iff `lock_dir` looks abandoned by a dead PID on this
-# host. The caller is expected to remove the directory and retry mkdir.
-# Conservative: locks without metadata, locks owned by another host, and
-# locks whose recorded PID is still alive all return rc=1 (NOT stale).
+# Release the lock the run-required loop holds and forget it. Uses the
+# loop's `lock_dir`/`lock_token` via dynamic scope.
+_sley_verify_cache_lock_drop() {
+  _sley_verify_cache_lock_release "$lock_dir" "$lock_token"
+  lock_dir="" lock_token=""
+}
+
+# Load a lock's owner.meta into the caller's `owner_pid`, `owner_host`, and
+# `owner_token` (dynamic scope). Builtins only: waiters run this on every
+# 0.1s poll. Returns nonzero when there is no readable metadata.
+_sley_verify_cache_lock_owner() {
+  local meta_key meta_value
+  owner_pid="" owner_host="" owner_token=""
+  [[ -f "$1/owner.meta" ]] || return 1
+  while IFS='=' read -r meta_key meta_value; do
+    case "$meta_key" in
+      pid) owner_pid="$meta_value" ;;
+      host) owner_host="$meta_value" ;;
+      token) owner_token="$meta_value" ;;
+    esac
+  done 2>/dev/null <"$1/owner.meta"
+}
+
+# Return 0 iff the lock at `lock_path` looks abandoned: its recorded owner
+# PID is gone on this host, or it has had no usable metadata for longer than
+# the grace period (creator killed between mkdir and the owner.meta write).
+# Locks owned by another host or by a live PID, including one this user
+# cannot signal, are never stale. Leaves the metadata in the caller's
+# `owner_pid`/`owner_host`/`owner_token`.
 _sley_verify_cache_lock_is_stale() {
-  # Split the locals so `meta_file` actually sees `$lock_dir` — same-statement
-  # `local a="$1" b="$a/..."` does not take effect for `b` (shellcheck SC2318).
-  local lock_dir="$1"
-  local meta_file="$lock_dir/owner.meta"
-  local pid host current_host
-  [[ -f "$meta_file" ]] || return 1
-  pid=$(awk -F= '$1=="pid" {print $2; exit}' "$meta_file" 2>/dev/null)
-  host=$(awk -F= '$1=="host" {print $2; exit}' "$meta_file" 2>/dev/null)
-  [[ -n "$pid" && "$pid" =~ ^[0-9]+$ ]] || return 1
-  current_host="${HOSTNAME:-$(uname -n 2>/dev/null)}"
-  # Cross-host lock — may still be held by a live process elsewhere. Don't
-  # reclaim. The shared-cache scenario is rare but worth the conservatism.
-  [[ -n "$host" && -n "$current_host" && "$host" != "$current_host" ]] && return 1
-  # `kill -0 PID` is the POSIX way to test "is this process still alive and
-  # signalable from here". Success means alive (not stale); failure means
-  # ESRCH (no such PID, i.e. stale) or EPERM (alive but unsignalable, treated
-  # as not-stale to stay conservative — `kill -0` returns rc=1 for EPERM but
-  # the only way to distinguish that from ESRCH is `errno`, which bash can't
-  # see, so we accept the false-negative).
-  kill -0 "$pid" 2>/dev/null && return 1
+  local lock_path="$1"
+  [[ -d "$lock_path" ]] || return 1
+  if ! _sley_verify_cache_lock_owner "$lock_path" || [[ ! "$owner_pid" =~ ^[0-9]+$ ]]; then
+    _sley_verify_cache_lock_expired "$lock_path"
+    return
+  fi
+  # Cross-host lock: it may still be held by a live process elsewhere.
+  [[ -n "$owner_host" && "$owner_host" != "${HOSTNAME:-$(uname -n 2>/dev/null)}" ]] && return 1
+  ! _sley_verify_pid_alive "$owner_pid"
+}
+
+# `kill -0` fails both for a dead PID (ESRCH) and for a live process owned
+# by another user (EPERM), and bash cannot see errno. Ask the process table
+# before calling a PID dead. Where neither /proc nor `ps -p` works (some
+# busybox systems), EPERM still reads as dead.
+_sley_verify_pid_alive() {
+  kill -0 "$1" 2>/dev/null && return 0
+  [[ -e "/proc/$1" ]] && return 0
+  ps -p "$1" >/dev/null 2>&1
+}
+
+# True when `path` was last modified longer ago than the lock grace period.
+# GNU/busybox `stat -c` first, then BSD/macOS `stat -f`; an unreadable mtime
+# is never expired, which keeps the pre-grace behavior (no reclaim).
+_sley_verify_cache_lock_expired() {
+  local mtime now
+  mtime=$(stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null) || return 1
+  [[ "$mtime" =~ ^[0-9]+$ ]] || return 1
+  now=$(date +%s 2>/dev/null) || return 1
+  ((now - mtime > _SLEY_VERIFY_CACHE_LOCK_GRACE_SECONDS))
+}
+
+# Remove the lock at `lock_path` if it is abandoned. Judging and removing
+# happen under the `<lock>.reclaim` mutex. Without it, waiter A could judge a
+# dead owner's lock stale, waiter B could reclaim it, process C could then
+# acquire a fresh lock at the same path, and A's rename would move C's live
+# lock away: two runs of one command at once, and C's release would later
+# delete A's lock. Under the mutex only the dead owner could remove the
+# judged lock, so the directory A renames is the one it judged. Comparing
+# the renamed tombstone's token with the judged one is a second check for
+# the case where an expired mutex was taken over mid-reclaim.
+_sley_verify_cache_lock_reclaim() {
+  local lock_path="$1" mutex="$1.reclaim" tombstone judged
+  local owner_pid owner_host owner_token
+  # Pre-check without the mutex so waiting on a live lock never touches it.
+  _sley_verify_cache_lock_is_stale "$lock_path" || return 0
+  if ! mkdir "$mutex" 2>/dev/null; then
+    # A reclaimer killed inside this short critical section leaks the
+    # mutex; past the grace period treat it as abandoned too.
+    if _sley_verify_cache_lock_expired "$mutex"; then
+      rmdir "$mutex" 2>/dev/null
+    fi
+    return 0
+  fi
+  if _sley_verify_cache_lock_is_stale "$lock_path"; then
+    judged="$owner_token"
+    tombstone="$lock_path.stale.${BASHPID:-$$}.$RANDOM"
+    if mv "$lock_path" "$tombstone" 2>/dev/null; then
+      _sley_verify_cache_lock_owner "$tombstone"
+      if [[ "$owner_token" == "$judged" ]]; then
+        printf 'sley verify: reclaiming stale cache lock (owner gone): %s\n' "$lock_path" >&2
+      elif [[ ! -e "$lock_path" ]] && mv "$tombstone" "$lock_path" 2>/dev/null; then
+        # Put the live lock back. If a mkdir wins the path first, mv nests
+        # the tombstone inside the new lock, whose owner's release removes
+        # it: no worse than not restoring.
+        tombstone=""
+      fi
+      [[ -z "$tombstone" ]] || rm -rf "$tombstone" 2>/dev/null
+    fi
+  fi
+  rmdir "$mutex" 2>/dev/null
   return 0
 }
 
@@ -1082,7 +1179,8 @@ _sley_verify_emit_cache_hit() {
 _sley_verify_run_required_impl() {
   local commands="$1" files="$2" full="$3" json="$4" force="$5" explain_cache="$6"
   local required command_item command tier exit_code failed=0 status result_status
-  local results_json="" first=1 cache_enabled payload lookup cache_status receipt pre_key write_result write_status write_phase lock_dir
+  local results_json="" first=1 cache_enabled payload lookup cache_status receipt pre_key pre_generation write_result write_status write_phase
+  local lock_dir="" lock_token=""
   local passed_count=0 cached_count=0 failed_count=0 skipped_slow_count=0
   local shell_mode shell_flag shell_field
   local cached_raw top_shell cache_shell field_assignments lookup_assignments
@@ -1093,20 +1191,21 @@ _sley_verify_run_required_impl() {
   # would otherwise leak the lock dir. Every future run for the same cache
   # key then paid the full 5-second mkdir-polling penalty before falling
   # through unlocked AND a duplicate same-key execution could occur. The
-  # PID-based stale reclaim in `_sley_verify_cache_lock_acquire` is the
-  # defensive backstop for the SIGKILL / power-loss case where the trap
-  # cannot fire.
+  # stale reclaim in `_sley_verify_cache_lock_reclaim` is the defensive
+  # backstop for the SIGKILL / power-loss case where the trap cannot fire.
   #
   # Each handler clears the trap first (so a signal during cleanup doesn't
-  # recurse), releases the current `$lock_dir` (idempotent — empty value is
-  # a no-op), then exits with the conventional `128 + signum` code so the
-  # caller sees a real signal-style exit rather than a swallowed Ctrl-C.
+  # recurse), releases `$lock_dir` only if it still carries this run's
+  # `$lock_token` (a no-op when empty, while still waiting on another
+  # owner's lock, or after a successor re-acquired the path), then exits
+  # with the conventional `128 + signum` code so the caller sees a real
+  # signal-style exit rather than a swallowed Ctrl-C.
   # The wrapper above restores the caller's prior trap state on normal
   # return; signal exits bypass that restore, which is correct for an
   # interactive sley CLI (the shell is terminating anyway).
-  trap 'trap - INT TERM HUP; _sley_verify_cache_lock_release "$lock_dir"; exit 130' INT
-  trap 'trap - INT TERM HUP; _sley_verify_cache_lock_release "$lock_dir"; exit 143' TERM
-  trap 'trap - INT TERM HUP; _sley_verify_cache_lock_release "$lock_dir"; exit 129' HUP
+  trap 'trap - INT TERM HUP; _sley_verify_cache_lock_release "$lock_dir" "$lock_token"; exit 130' INT
+  trap 'trap - INT TERM HUP; _sley_verify_cache_lock_release "$lock_dir" "$lock_token"; exit 143' TERM
+  trap 'trap - INT TERM HUP; _sley_verify_cache_lock_release "$lock_dir" "$lock_token"; exit 129' HUP
 
   command -v jq >/dev/null 2>&1 || {
     echo "sley verify: jq is required to run required verification commands" >&2
@@ -1140,7 +1239,7 @@ _sley_verify_run_required_impl() {
 
   while IFS= read -r command_item; do
     [[ -n "$command_item" ]] || continue
-    lock_dir=""
+    lock_dir="" lock_token=""
     # One jq call extracts every per-command field this loop needs (it used
     # to be up to four). `@sh` quoting round-trips arbitrary command text
     # exactly — quotes, newlines, tabs, backslashes, unicode — because the
@@ -1201,30 +1300,26 @@ _sley_verify_run_required_impl() {
         _sley_verify_emit_cache_hit "$tier" "$command" "$receipt"
         continue
       fi
-      if [[ "$cache_enabled" != "1" ]]; then
-        lock_dir=""
-      else
-        lock_dir=$(_sley_verify_cache_lock_acquire "$receipt" || true)
-      fi
+      # Acquire in this process (not `$(...)`) so the signal trap can see
+      # and release the lock from the moment it exists.
+      [[ "$cache_enabled" != "1" ]] || _sley_verify_cache_lock_acquire "$receipt" || true
       if [[ "$force" != "1" && -n "$lock_dir" ]]; then
         # Re-check after acquiring the lock. If another agent finished the same
         # command while we were waiting, use its receipt instead of rerunning.
         lookup=$(printf '%s\n' "$payload" | _sley_verify_cache_helper lookup) || {
-          _sley_verify_cache_lock_release "$lock_dir"
+          _sley_verify_cache_lock_drop
           echo "sley verify: failed to compute cache key for command: $command" >&2
           printf '%s\n' "$lookup" >&2
           return 1
         }
         _sley_verify_cache_parse_lookup "$lookup"
         if [[ "$cache_status" == "identity-error" ]]; then
-          _sley_verify_cache_lock_release "$lock_dir"
-          lock_dir=""
+          _sley_verify_cache_lock_drop
           echo "sley verify: cache disabled for $tier command: $(printf '%s' "$lookup" | jq -r '.error')" >&2
           cache_enabled=0
         fi
         if [[ "$cache_status" == "hit" ]]; then
-          _sley_verify_cache_lock_release "$lock_dir"
-          lock_dir=""
+          _sley_verify_cache_lock_drop
           _sley_verify_emit_cache_hit "$tier" "$command" "$receipt"
           continue
         fi
@@ -1236,8 +1331,7 @@ _sley_verify_run_required_impl() {
         # Cache lookup deliberately happens before this slow gate. A slow
         # command that already passed for this exact input should satisfy a
         # normal readiness run without requiring `--full` every time.
-        _sley_verify_cache_lock_release "$lock_dir"
-        lock_dir=""
+        _sley_verify_cache_lock_drop
         echo "sley verify: slow required command not run (use --full): $command" >&2
         failed=1
         skipped_slow_count=$((skipped_slow_count + 1))
@@ -1260,16 +1354,20 @@ _sley_verify_run_required_impl() {
         shell_flag="-lc"
         ;;
       *)
-        _sley_verify_cache_lock_release "$lock_dir"
-        lock_dir=""
+        _sley_verify_cache_lock_drop
         echo "sley verify: unsupported $shell_field for command: $command" >&2
         return 1
         ;;
     esac
+    # This loop reads its command list from the here-string on stdin. A
+    # command that reads stdin (cat, ssh, `docker -i`, some test runners)
+    # would otherwise consume the remaining list, silently skip every later
+    # required command, and let the gate pass. Required commands are
+    # non-interactive by contract, so they get an empty stdin.
     if [[ "$json" == "1" ]]; then
-      bash "$shell_flag" "$command" >&2
+      bash "$shell_flag" "$command" </dev/null >&2
     else
-      bash "$shell_flag" "$command"
+      bash "$shell_flag" "$command" </dev/null
     fi
     exit_code=$?
     [[ "$json" == "1" ]] || echo "sley verify: exit code: $exit_code"
@@ -1282,9 +1380,8 @@ _sley_verify_run_required_impl() {
         # folds the old post-run lookup plus write; outcomes (including the
         # identity-error → changed mapping and the distinct recompute/write
         # diagnostics) match the old two-call sequence exactly.
-        write_result=$(printf '%s\n' "$payload" | _sley_verify_cache_helper write-if-same-generation "$pre_key") || {
-          _sley_verify_cache_lock_release "$lock_dir"
-          lock_dir=""
+        write_result=$(printf '%s\n' "$payload" | _sley_verify_cache_helper write-if-same-generation "$pre_key" "$pre_generation") || {
+          _sley_verify_cache_lock_drop
           write_phase=$(printf '%s' "$write_result" | jq -r '.phase // "recompute"')
           if [[ "$write_phase" == "write" ]]; then
             echo "sley verify: failed to write success receipt for command: $command" >&2
@@ -1300,9 +1397,13 @@ _sley_verify_run_required_impl() {
           failed=1
           failed_count=$((failed_count + 1))
           result_status="failed"
+        elif [[ "$write_status" == "untracked-changed" ]]; then
+          # The command passed; it just created or rewrote untracked files
+          # (build or test artifacts), so a receipt for the pre-run tree
+          # would not describe the tree a later lookup sees.
+          echo "sley verify: untracked files changed during required command; not caching receipt: $command" >&2
         elif [[ "$write_status" != "written" ]]; then
-          _sley_verify_cache_lock_release "$lock_dir"
-          lock_dir=""
+          _sley_verify_cache_lock_drop
           echo "sley verify: failed to write success receipt for command: $command" >&2
           printf '%s\n' "$write_result" >&2
           return 1
@@ -1313,8 +1414,7 @@ _sley_verify_run_required_impl() {
       failed=1
       failed_count=$((failed_count + 1))
     fi
-    _sley_verify_cache_lock_release "$lock_dir"
-    lock_dir=""
+    _sley_verify_cache_lock_drop
     [[ "$result_status" == "passed" ]] && passed_count=$((passed_count + 1))
     if [[ "$json" == "1" ]]; then
       [[ "$first" == "1" ]] || results_json+=","

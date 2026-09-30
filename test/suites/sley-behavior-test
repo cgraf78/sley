@@ -3153,6 +3153,9 @@ cat >"$repo/.sley/verify.json" <<'EOF'
   ]
 }
 EOF
+# Untracked files are cache-key inputs; keep the in-repo run counter ignored
+# like any test artifact so it does not invalidate the receipt it proves.
+printf 'tests/count\n' >"$repo/.gitignore"
 (cd "$repo" && git add . && git commit -q -m "seed cacheable verify")
 echo "changed" >>"$repo/src/app.txt"
 
@@ -3286,6 +3289,7 @@ cat >"$repo/.sley/verify.json" <<'EOF'
   ]
 }
 EOF
+printf 'tests/count\n' >"$repo/.gitignore"
 (cd "$repo" && git add . && git commit -q -m "seed identity env verify")
 echo "changed" >>"$repo/src/app.txt"
 
@@ -3462,6 +3466,7 @@ cat >"$repo/.sley/verify.json" <<'EOF'
   ]
 }
 EOF
+printf 'tests/count\n' >"$repo/.gitignore"
 (cd "$repo" && git add . && git commit -q -m "seed identity failure verify")
 echo "changed" >>"$repo/src/app.txt"
 
@@ -3508,6 +3513,7 @@ cat >"$repo/.sley/verify.json" <<'EOF'
   ]
 }
 EOF
+printf 'tests/count\n' >"$repo/.gitignore"
 (cd "$repo" && git add . && git commit -q -m "seed malformed receipt verify")
 echo "changed" >>"$repo/src/app.txt"
 
@@ -3609,6 +3615,258 @@ COUNT_FILE="$counter" _run_sley "$repo" verify --run-required --include-untracke
 _assert_exit "verify registry cache: untracked content change exits 0" 0 "$__SLEY_RC"
 _assert_contains "verify registry cache: untracked content change reruns" '"status":"passed"' "$__SLEY_OUT"
 _assert_eq "verify registry cache: untracked content change increments count" "2" "$(cat "$counter")"
+
+# Cache keys must cover inputs outside the selected files that a test runner
+# still reads: untracked files (without --include-untracked) and, for a
+# branch with no upstream, the committed tree. The command fails whenever any
+# file under src/ says "broken", so a stale receipt shows up as a cached pass.
+_new_stale_cache_repo() {
+  local repo="$1" policy="${2:-}" cache
+  mkdir -p "$repo/src" "$repo/tests" "$repo/.sley"
+  printf 'initial\n' >"$repo/src/app.txt"
+  cat >"$repo/tests/run.sh" <<'EOF'
+#!/usr/bin/env bash
+count=0
+[[ -f "$COUNT_FILE" ]] && count=$(cat "$COUNT_FILE")
+printf '%s\n' "$((count + 1))" >"$COUNT_FILE"
+! grep -rq broken src
+EOF
+  chmod +x "$repo/tests/run.sh"
+  cache='"enabled": true, "salt": "stale-cache-test"'
+  [[ -z "$policy" ]] || cache+=", \"base_policy\": \"$policy\""
+  cat >"$repo/.sley/verify.json" <<EOF
+{"rules": [{"paths": ["src/**"], "commands": [{"cmd": "./tests/run.sh", "required": true, "cache": {$cache}}]}]}
+EOF
+  (cd "$repo" && git add . && git commit -q -m "seed stale cache verify")
+  printf 'changed\n' >>"$repo/src/app.txt"
+}
+
+repo=$(_new_repo)
+_new_stale_cache_repo "$repo"
+counter=$(_tmpdir)/stale-untracked-counter
+COUNT_FILE="$counter" _run_sley "$repo" verify --run-required --json
+_assert_exit "verify registry cache: stale untracked setup passes" 0 "$__SLEY_RC"
+printf 'broken\n' >"$repo/src/new.txt"
+COUNT_FILE="$counter" _run_sley "$repo" verify --run-required --json
+_assert_exit "verify registry cache: new untracked file is not a cached pass" 1 "$__SLEY_RC"
+_assert_not_contains "verify registry cache: new untracked file misses the receipt" '"cached-pass"' "$__SLEY_OUT"
+_assert_eq "verify registry cache: new untracked file reruns command" "2" "$(cat "$counter")"
+rm -f "$repo/src/new.txt"
+COUNT_FILE="$counter" _run_sley "$repo" verify --run-required --json
+_assert_contains "verify registry cache: removing the untracked file restores the hit" '"cached-pass"' "$__SLEY_OUT"
+
+# Untracked files outside an explicit --path scope are outside the key.
+mkdir -p "$repo/other"
+COUNT_FILE="$counter" _run_sley "$repo" verify --run-required --json --path src
+_assert_exit "verify registry cache: path-scoped setup passes" 0 "$__SLEY_RC"
+printf 'scratch\n' >"$repo/other/scratch.txt"
+COUNT_FILE="$counter" _run_sley "$repo" verify --run-required --json --path src
+_assert_contains "verify registry cache: untracked file outside --path keeps the hit" '"cached-pass"' "$__SLEY_OUT"
+printf 'broken\n' >"$repo/src/scoped.txt"
+COUNT_FILE="$counter" _run_sley "$repo" verify --run-required --json --path src
+_assert_exit "verify registry cache: untracked file inside --path is not a cached pass" 1 "$__SLEY_RC"
+rm -f "$repo/src/scoped.txt"
+
+# SLEY_SKIP_UNTRACKED opts out of the untracked walk (huge bare worktrees)
+# and knowingly keeps the old stale-hit tradeoff.
+repo=$(_new_repo)
+_new_stale_cache_repo "$repo"
+counter=$(_tmpdir)/skip-untracked-counter
+SLEY_SKIP_UNTRACKED=1 COUNT_FILE="$counter" _run_sley "$repo" verify --run-required --json
+_assert_exit "verify registry cache: skip-untracked setup passes" 0 "$__SLEY_RC"
+printf 'broken\n' >"$repo/src/new.txt"
+SLEY_SKIP_UNTRACKED=1 COUNT_FILE="$counter" _run_sley "$repo" verify --run-required --json
+_assert_contains "verify registry cache: SLEY_SKIP_UNTRACKED leaves untracked files out of the key" \
+  '"cached-pass"' "$__SLEY_OUT"
+
+# An untracked file the helper cannot read leaves the key unprovable: the
+# command runs uncached instead of verify failing on the cache helper.
+if [[ "$(id -u)" == "0" ]]; then
+  echo "  SKIP: verify cache unreadable untracked file (running as root)"
+else
+  repo=$(_new_repo)
+  _new_stale_cache_repo "$repo"
+  counter=$(_tmpdir)/unreadable-untracked-counter
+  printf 'secret\n' >"$repo/src/unreadable.txt"
+  chmod 000 "$repo/src/unreadable.txt"
+  COUNT_FILE="$counter" _run_sley "$repo" verify --run-required --json
+  chmod 600 "$repo/src/unreadable.txt"
+  _assert_exit "verify registry cache: unreadable untracked file still runs command" 0 "$__SLEY_RC"
+  _assert_contains "verify registry cache: unreadable untracked file disables cache" \
+    "cache disabled" "$__SLEY_OUT"
+  _assert_not_contains "verify registry cache: unreadable untracked file is not a helper failure" \
+    "failed to compute cache key" "$__SLEY_OUT"
+fi
+
+# selected-content declares that only the selected files matter.
+repo=$(_new_repo)
+_new_stale_cache_repo "$repo" selected-content
+counter=$(_tmpdir)/selected-untracked-counter
+COUNT_FILE="$counter" _run_sley "$repo" verify --run-required --json
+_assert_exit "verify registry cache: selected-content untracked setup passes" 0 "$__SLEY_RC"
+printf 'scratch\n' >"$repo/src/new.txt"
+COUNT_FILE="$counter" _run_sley "$repo" verify --run-required --json
+_assert_contains "verify registry cache: selected-content ignores unselected untracked files" \
+  '"cached-pass"' "$__SLEY_OUT"
+
+# No upstream means no merge base; a commit that adds broken content while
+# the selected dirty file stays unchanged must still miss.
+repo=$(_new_repo)
+_new_stale_cache_repo "$repo"
+counter=$(_tmpdir)/stale-commit-counter
+COUNT_FILE="$counter" _run_sley "$repo" verify --run-required --json
+_assert_exit "verify registry cache: no-upstream setup passes" 0 "$__SLEY_RC"
+printf 'broken\n' >"$repo/src/committed.txt"
+(cd "$repo" && git add src/committed.txt && git commit -q -m "commit broken file")
+COUNT_FILE="$counter" _run_sley "$repo" verify --run-required --json
+_assert_exit "verify registry cache: no-upstream commit is not a cached pass" 1 "$__SLEY_RC"
+_assert_not_contains "verify registry cache: no-upstream commit misses the receipt" '"cached-pass"' "$__SLEY_OUT"
+_assert_eq "verify registry cache: no-upstream commit reruns command" "2" "$(cat "$counter")"
+
+# With an upstream, committing exactly the verified content must keep the
+# receipt: selected files are keyed by worktree content, and only committed
+# files outside the selection count as committed-tree input.
+_push_stale_cache_upstream() {
+  local repo="$1" origin branch
+  origin=$(_tmpdir)
+  git init -q --bare "$origin"
+  git -C "$repo" remote add origin "$origin"
+  branch=$(git -C "$repo" branch --show-current)
+  git -C "$repo" push -q -u origin "$branch"
+}
+
+repo=$(_new_repo)
+_new_stale_cache_repo "$repo"
+_push_stale_cache_upstream "$repo"
+# Level with the upstream: this first commit on top of it must hit too.
+counter=$(_tmpdir)/commit-verified-counter
+COUNT_FILE="$counter" _run_sley "$repo" verify --run-required --json
+_assert_exit "verify registry cache: pre-commit verify passes" 0 "$__SLEY_RC"
+(cd "$repo" && git commit -q -am "commit verified content")
+COUNT_FILE="$counter" _run_sley "$repo" verify --run-required --json
+_assert_contains "verify registry cache: committing the verified content hits" '"cached-pass"' "$__SLEY_OUT"
+_assert_eq "verify registry cache: committing the verified content does not rerun" "1" "$(cat "$counter")"
+printf 'more\n' >>"$repo/src/app.txt"
+COUNT_FILE="$counter" _run_sley "$repo" verify --run-required --json
+_assert_exit "verify registry cache: second verified change passes" 0 "$__SLEY_RC"
+(cd "$repo" && git commit -q -am "commit more verified content")
+COUNT_FILE="$counter" _run_sley "$repo" verify --run-required --json
+_assert_contains "verify registry cache: committing on an ahead branch hits" '"cached-pass"' "$__SLEY_OUT"
+_assert_eq "verify registry cache: committing on an ahead branch does not rerun" "2" "$(cat "$counter")"
+
+# A committed change outside a --path selection is still an input: the test
+# reads all of src/, and the old key (unchanged merge base plus selected
+# content) kept hitting.
+mkdir -p "$repo/src/one" "$repo/src/two"
+printf 'one\n' >"$repo/src/one/a.txt"
+printf 'two\n' >"$repo/src/two/b.txt"
+(cd "$repo" && git add src && git commit -q -m "add subdirs")
+printf 'one changed\n' >"$repo/src/one/a.txt"
+COUNT_FILE="$counter" _run_sley "$repo" verify --run-required --json --path src/one
+_assert_exit "verify registry cache: path-scoped upstream setup passes" 0 "$__SLEY_RC"
+printf 'broken\n' >"$repo/src/two/b.txt"
+(cd "$repo" && git commit -q -m "break unselected file" src/two/b.txt)
+COUNT_FILE="$counter" _run_sley "$repo" verify --run-required --json --path src/one
+_assert_exit "verify registry cache: committed change outside --path is not a cached pass" 1 "$__SLEY_RC"
+_assert_not_contains "verify registry cache: committed change outside --path misses the receipt" \
+  '"cached-pass"' "$__SLEY_OUT"
+
+# merge-base policy on a branch level with its upstream: a fast-forward pull
+# that brings broken content into an unselected file must miss. The old key
+# normalized the level merge base to null on both sides and kept hitting.
+repo=$(_new_repo)
+_new_stale_cache_repo "$repo" merge-base
+_push_stale_cache_upstream "$repo"
+counter=$(_tmpdir)/merge-base-pull-counter
+COUNT_FILE="$counter" _run_sley "$repo" verify --run-required --json
+_assert_exit "verify registry cache: merge-base level setup passes" 0 "$__SLEY_RC"
+other=$(_tmpdir)
+# Keep the runner's global git config (and any commit hooks it installs)
+# out of the second clone.
+(
+  export GIT_CONFIG_GLOBAL="$repo/.gitconfig-test"
+  git clone -q -b "$(git -C "$repo" branch --show-current)" "$(git -C "$repo" remote get-url origin)" "$other" &&
+    cd "$other" &&
+    printf 'broken\n' >src/pulled.txt &&
+    git add src/pulled.txt &&
+    git -c user.email=test@test.local -c user.name="Test User" commit -q -m "break upstream" &&
+    git push -q &&
+    cd "$repo" &&
+    git stash -q &&
+    git pull -q --ff-only &&
+    git stash pop -q
+)
+_assert_file_exists "verify registry cache: merge-base setup pulled the upstream change" "$repo/src/pulled.txt"
+COUNT_FILE="$counter" _run_sley "$repo" verify --run-required --json
+_assert_exit "verify registry cache: merge-base pulled broken file is not a cached pass" 1 "$__SLEY_RC"
+
+# HEAD is pinned once per command, so the post-run check must notice a
+# checkout or commit that moved HEAD's tree while the command ran.
+repo=$(_new_repo)
+mkdir -p "$repo/src" "$repo/.sley"
+printf 'initial\n' >"$repo/src/app.txt"
+cat >"$repo/.sley/verify.json" <<'JSON'
+{"rules": [{"paths": ["src/**"], "commands": [{"cmd": "echo $$ >>moved.txt && git add moved.txt && git commit -q -m moved", "required": true, "cache": {"enabled": true, "salt": "head-move-test"}}]}]}
+JSON
+(cd "$repo" && git add . && git commit -q -m "seed head move verify")
+printf 'changed\n' >>"$repo/src/app.txt"
+_run_sley "$repo" verify --run-required --json
+_assert_exit "verify registry cache: HEAD tree moving during the run blocks the receipt" 1 "$__SLEY_RC"
+_assert_contains "verify registry cache: HEAD tree move explains mismatch" \
+  "changes changed during required command; not caching receipt" "$__SLEY_OUT"
+
+# selected-content keys only the selected files, so the same HEAD move is
+# not a key change there and the passed run stays a pass.
+sed -i.bak 's/"salt": "head-move-test"/"salt": "head-move-test", "base_policy": "selected-content"/' \
+  "$repo/.sley/verify.json"
+rm -f "$repo/.sley/verify.json.bak"
+(cd "$repo" && git commit -q -m "selected-content policy" .sley/verify.json)
+_run_sley "$repo" verify --run-required --json
+_assert_exit "verify registry cache: selected-content ignores a HEAD move during the run" 0 "$__SLEY_RC"
+
+# A command that writes an untracked artifact still passes; the receipt is
+# only written once a run leaves the untracked set as it found it.
+repo=$(_new_repo)
+mkdir -p "$repo/src" "$repo/.sley"
+printf 'initial\n' >"$repo/src/app.txt"
+cat >"$repo/.sley/verify.json" <<'EOF'
+{"rules": [{"paths": ["src/**"], "commands": [{"cmd": "echo artifact >build.log", "required": true, "cache": {"enabled": true, "salt": "artifact-test"}}]}]}
+EOF
+(cd "$repo" && git add . && git commit -q -m "seed artifact verify")
+printf 'changed\n' >>"$repo/src/app.txt"
+_run_sley "$repo" verify --run-required --json
+_assert_exit "verify registry cache: untracked artifact does not fail the run" 0 "$__SLEY_RC"
+_assert_contains "verify registry cache: untracked artifact run reports passed" '"status":"passed"' "$__SLEY_OUT"
+_assert_contains "verify registry cache: untracked artifact explains skipped receipt" \
+  "untracked files changed during required command; not caching receipt" "$__SLEY_OUT"
+_run_sley "$repo" verify --run-required --json
+_assert_exit "verify registry cache: stable artifact rerun passes" 0 "$__SLEY_RC"
+_assert_not_contains "verify registry cache: stable artifact rerun writes receipt" \
+  "not caching receipt" "$__SLEY_OUT"
+_run_sley "$repo" verify --run-required --json
+_assert_contains "verify registry cache: stable artifact then hits" '"cached-pass"' "$__SLEY_OUT"
+
+# An artifact the helper cannot read after the run leaves the untracked
+# input unknown; the passed run must stay a pass, just uncached.
+if [[ "$(id -u)" == "0" ]]; then
+  echo "  SKIP: verify cache unreadable untracked artifact (running as root)"
+else
+  repo=$(_new_repo)
+  mkdir -p "$repo/src" "$repo/.sley"
+  printf 'initial\n' >"$repo/src/app.txt"
+  cat >"$repo/.sley/verify.json" <<'JSON'
+{"rules": [{"paths": ["src/**"], "commands": [{"cmd": "rm -f locked.out; touch locked.out; chmod 000 locked.out", "required": true, "cache": {"enabled": true, "salt": "unreadable-artifact-test"}}]}]}
+JSON
+  (cd "$repo" && git add . && git commit -q -m "seed unreadable artifact verify")
+  printf 'changed\n' >>"$repo/src/app.txt"
+  _run_sley "$repo" verify --run-required --json
+  chmod 600 "$repo/locked.out" 2>/dev/null
+  _assert_exit "verify registry cache: unreadable untracked artifact does not fail the run" 0 "$__SLEY_RC"
+  _assert_contains "verify registry cache: unreadable untracked artifact skips the receipt" \
+    "not caching receipt" "$__SLEY_OUT"
+  _assert_not_contains "verify registry cache: unreadable untracked artifact is not a content change" \
+    "changes changed during required command" "$__SLEY_OUT"
+fi
 
 home=$(_tmpdir)
 mkdir -p "$home/.local/bin"
@@ -3724,6 +3982,34 @@ echo "changed" >>"$repo/src/app.txt"
 _run_sley "$repo" verify --run-required
 _assert_exit "verify registry: failing mapped command blocks readiness" 1 "$__SLEY_RC"
 _assert_contains "verify registry: failing command exit recorded" "exit code: 7" "$__SLEY_OUT"
+
+# The run loop reads the required-command list from a here-string. A command
+# that reads stdin (cat, ssh, docker -i, some test runners) must not consume
+# the rest of that list: the later failing command has to run and block.
+repo=$(_new_repo)
+mkdir -p "$repo/src" "$repo/.sley"
+printf 'initial\n' >"$repo/src/app.txt"
+stdin_log=$(_tmpdir)/verify-stdin.log
+cat >"$repo/.sley/verify.json" <<'EOF'
+{"rules":[{"paths":["src/**"],"commands":[
+  "cat >/dev/null; echo first-ran >>\"$STDIN_LOG\"",
+  "echo second-ran >>\"$STDIN_LOG\"; exit 5"
+]}]}
+EOF
+(cd "$repo" && git add . && git commit -q -m "seed stdin-reading verify registry")
+echo "changed" >>"$repo/src/app.txt"
+
+STDIN_LOG="$stdin_log" _run_sley "$repo" verify --run-required
+_assert_exit "verify registry: stdin-reading command does not swallow later commands" 1 "$__SLEY_RC"
+_assert_contains "verify registry: stdin-reading command runs" "first-ran" "$(cat "$stdin_log" 2>/dev/null)"
+_assert_contains "verify registry: command after stdin reader still runs" "second-ran" "$(cat "$stdin_log" 2>/dev/null)"
+_assert_contains "verify registry: command after stdin reader reports its exit" "exit code: 5" "$__SLEY_OUT"
+
+: >"$stdin_log"
+STDIN_LOG="$stdin_log" _run_sley "$repo" verify --run-required --json
+_assert_exit "verify registry: json stdin-reading command does not swallow later commands" 1 "$__SLEY_RC"
+_assert_contains "verify registry: json command after stdin reader still runs" "second-ran" "$(cat "$stdin_log" 2>/dev/null)"
+_assert_contains "verify registry: json reports command after stdin reader" '"exit_code":5' "$__SLEY_OUT"
 
 repo=$(_new_repo)
 cat >"$repo/file.go" <<'EOF'
@@ -3993,6 +4279,7 @@ case "$1" in
       *'--change lowerrev'*) printf 'base/lower.txt\n' ;;
       *'--change tiprev'*) printf 'tip/tip.txt\n' ;;
       *'--change .'*) printf 'tip/tip.txt\n' ;;
+      *'--unknown'*) [[ ! -e "$SL_REPO/scratch.txt" ]] || printf 'scratch.txt\0' ;;
       *) printf 'tip/pending.txt\n' ;;
     esac
     ;;
@@ -4053,6 +4340,12 @@ SL_REPO="$repo" PATH="$mockbin:$PATH" _run_sley "$repo" verify --run-required --
 _assert_exit "verify registry cache: sl lower stack change exits 0" 0 "$__SLEY_RC"
 _assert_contains "verify registry cache: sl lower stack change reruns" '"status":"passed"' "$__SLEY_OUT"
 _assert_eq "verify registry cache: sl lower stack change invalidates receipt" "2" "$(cat "$repo/tests/count")"
+
+SL_REPO="$repo" PATH="$mockbin:$PATH" _run_sley "$repo" verify --run-required --json
+_assert_contains "verify registry cache: sl unchanged stack hits" '"cached-pass"' "$__SLEY_OUT"
+printf 'scratch\n' >"$repo/scratch.txt"
+SL_REPO="$repo" PATH="$mockbin:$PATH" _run_sley "$repo" verify --run-required --json
+_assert_eq "verify registry cache: sl new untracked file invalidates receipt" "3" "$(cat "$repo/tests/count")"
 
 repo=$(_new_repo)
 mkdir -p "$repo/src" "$repo/.sley"
@@ -5053,7 +5346,8 @@ lock_stdout=$(
     source "$SLEY_REPO_ROOT/lib/sley/scope.sh"
     source "$SLEY_REPO_ROOT/lib/sley/hooks.sh"
     source "$SLEY_REPO_ROOT/lib/sley/verify.sh"
-    _sley_verify_cache_lock_acquire "'"$verify_receipt"'"
+    _sley_verify_cache_lock_acquire "'"$verify_receipt"'" || exit
+    printf "%s\n" "$lock_dir"
   ' 2>"$lock_stderr_file"
 )
 # Capture the bash -c subprocess's rc IMMEDIATELY after the command
@@ -5108,7 +5402,8 @@ lock_live_stdout=$(
     source "$SLEY_REPO_ROOT/lib/sley/scope.sh"
     source "$SLEY_REPO_ROOT/lib/sley/hooks.sh"
     source "$SLEY_REPO_ROOT/lib/sley/verify.sh"
-    _sley_verify_cache_lock_acquire "'"$verify_receipt"'"
+    _sley_verify_cache_lock_acquire "'"$verify_receipt"'" || exit
+    printf "%s\n" "$lock_dir"
   ' 2>"$lock_live_stderr_file"
 )
 lock_live_rc=$?
@@ -5128,6 +5423,185 @@ else
 fi
 
 rm -rf "$verify_expected_lock_dir" 2>/dev/null || true
+
+# Run a lock scenario (script on stdin) in a fresh bash with the verify
+# library sourced. VERIFY_RECEIPT / VERIFY_LOCK_DIR name the lock under test.
+_verify_lock_script() {
+  local script
+  script=$(mktemp "$(_tmpdir)/lock-script.XXXXXX")
+  {
+    # shellcheck disable=SC2016 # expanded by the generated script, not here.
+    printf 'source "$SLEY_REPO_ROOT/lib/sley/%s"\n' repo.sh scope.sh hooks.sh verify.sh
+    cat
+  } >"$script"
+  VERIFY_RECEIPT="$verify_receipt" VERIFY_LOCK_DIR="$verify_expected_lock_dir" bash "$script"
+}
+
+_verify_lock_token() {
+  awk -F= '$1=="token" {print $2; exit}' "$1/owner.meta" 2>/dev/null
+}
+
+echo "=== sley: verify cache lock is acquired in the calling process ==="
+
+# The run-required loop's signal trap releases `lock_dir`. When the lock was
+# created inside `$(...)`, a signal between mkdir and the assignment left a
+# lock the trap could not see. Acquisition must publish the lock (and the
+# token that proves ownership) in the caller's own shell.
+rm -rf "$verify_expected_lock_dir"
+lock_proc_out=$(
+  _verify_lock_script <<'EOF'
+_sley_verify_cache_lock_acquire "$VERIFY_RECEIPT" >/dev/null || exit 9
+printf 'dir=%s\ntoken=%s\npid=%s\n' "$lock_dir" "${lock_token:-}" "$$"
+EOF
+)
+lock_proc_token=$(_verify_lock_token "$verify_expected_lock_dir")
+_assert_contains "verify lock: acquire sets lock_dir in the calling shell" \
+  "dir=$verify_expected_lock_dir" "$lock_proc_out"
+if [[ -n "$lock_proc_token" && "$lock_proc_out" == *"token=$lock_proc_token"* ]]; then
+  _pass "verify lock: acquire sets lock_token matching owner.meta"
+else
+  _fail "verify lock: acquire sets lock_token matching owner.meta (meta '$lock_proc_token', got '$lock_proc_out')"
+fi
+lock_proc_pid=$(awk -F= '$1=="pid" {print $2; exit}' "$verify_expected_lock_dir/owner.meta" 2>/dev/null)
+_assert_contains "verify lock: owner.meta names the acquiring process" "pid=$lock_proc_pid" "$lock_proc_out"
+rm -rf "$verify_expected_lock_dir"
+
+echo "=== sley: verify cache lock signal cleanup spares a successor's lock ==="
+
+# Normal release removes the lock before the loop clears `lock_dir`. If a
+# signal lands in between and another process has already re-acquired the
+# same path, the trap's second release must leave the successor's lock alone.
+lock_aba_rc=0
+_verify_lock_script <<'EOF' || lock_aba_rc=$?
+trap '_sley_verify_cache_lock_release "$VERIFY_LOCK_DIR" "${lock_token:-}"; exit 143' TERM
+_sley_verify_cache_lock_acquire "$VERIFY_RECEIPT" >/dev/null || exit 9
+_sley_verify_cache_lock_release "$VERIFY_LOCK_DIR" "${lock_token:-}"
+[[ ! -e "$VERIFY_LOCK_DIR" ]] || exit 8
+mkdir "$VERIFY_LOCK_DIR"
+printf 'pid=%s\nhost=%s\nstarted=0\ntoken=successor\n' "$PPID" "${HOSTNAME:-$(uname -n)}" \
+  >"$VERIFY_LOCK_DIR/owner.meta"
+kill -TERM "$$"
+exit 7
+EOF
+_assert_eq "verify lock: trap exits with the signal status" "143" "$lock_aba_rc"
+_assert_eq "verify lock: trap cleanup leaves the successor's lock" \
+  "successor" "$(_verify_lock_token "$verify_expected_lock_dir")"
+rm -rf "$verify_expected_lock_dir"
+
+echo "=== sley: verify cache lock reclaim cannot take a fresh lock ==="
+
+# Two waiters can both judge a dead owner's lock stale. If the other one
+# reclaims it and a third process acquires a fresh lock at the same path
+# before this waiter renames "the stale lock", the rename used to move the
+# live lock away and run the same command twice. The hook below injects that
+# interleaving right after the first stale verdict, then plays the fresh
+# holder: it checks its lock on every later probe and releases after three.
+lock_toctou_out=$(
+  _verify_lock_script 2>&1 <<'EOF'
+host=${HOSTNAME:-$(uname -n)}
+mkdir -p "$VERIFY_LOCK_DIR"
+printf 'pid=999999999\nhost=%s\nstarted=0\ntoken=dead\n' "$host" >"$VERIFY_LOCK_DIR/owner.meta"
+eval "$(declare -f _sley_verify_cache_lock_is_stale | sed '1s/^_sley_verify_cache_lock_is_stale/_orig_lock_is_stale/')"
+phase=stale probes=0
+_sley_verify_cache_lock_is_stale() {
+  local rc=0
+  _orig_lock_is_stale "$@" || rc=$?
+  case "$phase" in
+    stale)
+      if [[ "$rc" -eq 0 ]]; then
+        rm -rf "$1"
+        mkdir "$1"
+        printf 'pid=%s\nhost=%s\nstarted=0\ntoken=fresh\n' "$$" "$host" >"$1/owner.meta"
+        phase=held
+      fi
+      ;;
+    held)
+      probes=$((probes + 1))
+      grep -qx 'token=fresh' "$1/owner.meta" 2>/dev/null || echo "fresh-lock-disturbed"
+      if [[ "$probes" -ge 3 ]]; then
+        rm -rf "$1"
+        phase=released
+      fi
+      ;;
+  esac
+  return "$rc"
+}
+if _sley_verify_cache_lock_acquire "$VERIFY_RECEIPT" >/dev/null; then
+  echo "acquired-after=$phase"
+else
+  echo "not-acquired phase=$phase"
+fi
+EOF
+)
+_assert_contains "verify lock: waiter acquires only after the fresh holder releases" \
+  "acquired-after=released" "$lock_toctou_out"
+_assert_not_contains "verify lock: fresh lock is never moved while held" \
+  "fresh-lock-disturbed" "$lock_toctou_out"
+_assert_not_contains "verify lock: fresh lock is not reported as reclaimed" \
+  "reclaiming stale" "$lock_toctou_out"
+rm -rf "$verify_expected_lock_dir"
+
+echo "=== sley: verify cache lock treats an unsignalable live owner as alive ==="
+
+# `kill -0` also fails with EPERM for a live process owned by another user.
+# PID 1 is alive and, for a non-root user, unsignalable.
+if kill -0 1 2>/dev/null; then
+  echo "  SKIP: verify lock EPERM owner (PID 1 is signalable by this user)"
+else
+  lock_eperm_out=$(
+    _verify_lock_script <<'EOF'
+mkdir -p "$VERIFY_LOCK_DIR"
+printf 'pid=1\nhost=%s\nstarted=0\ntoken=other-user\n' "${HOSTNAME:-$(uname -n)}" >"$VERIFY_LOCK_DIR/owner.meta"
+_sley_verify_cache_lock_is_stale "$VERIFY_LOCK_DIR" && echo stale || echo live
+EOF
+  )
+  _assert_eq "verify lock: EPERM owner PID is not stale" "live" "$lock_eperm_out"
+  rm -rf "$verify_expected_lock_dir"
+fi
+
+echo "=== sley: verify cache lock recovers a lock left without owner metadata ==="
+
+# A holder killed between mkdir and writing owner.meta leaves a lock with no
+# owner to check. It must not block every later run forever, but a fresh one
+# is a live acquirer mid-stamp and must be left alone.
+lock_metaless_out=$(
+  _verify_lock_script <<'EOF'
+mkdir -p "$VERIFY_LOCK_DIR"
+_sley_verify_cache_lock_is_stale "$VERIFY_LOCK_DIR" && echo fresh=stale || echo fresh=live
+EOF
+)
+_assert_eq "verify lock: fresh lock without metadata is not stale" "fresh=live" "$lock_metaless_out"
+touch -t 200001010000 "$verify_expected_lock_dir"
+lock_metaless_stderr_file=$(_tmpdir)/verify_lock_metaless_stderr.txt
+lock_metaless_rc=0
+lock_metaless_out=$(
+  _verify_lock_script 2>"$lock_metaless_stderr_file" <<'EOF'
+_sley_verify_cache_lock_acquire "$VERIFY_RECEIPT" || exit
+printf '%s\n' "$lock_dir"
+EOF
+) || lock_metaless_rc=$?
+_assert_eq "verify lock: expired lock without metadata is reclaimed" "0" "$lock_metaless_rc"
+_assert_eq "verify lock: reclaimed metadata-less lock is re-acquired" \
+  "$verify_expected_lock_dir" "$lock_metaless_out"
+_assert_contains "verify lock: metadata-less reclaim is reported" \
+  "reclaiming stale cache lock" "$(cat "$lock_metaless_stderr_file")"
+rm -rf "$verify_expected_lock_dir"
+
+echo "=== sley: verify cache lock recovers a leaked reclaim mutex ==="
+
+# A reclaimer killed inside the reclaim critical section leaks the mutex; an
+# expired one must not block reclaiming a dead owner's lock forever.
+mkdir -p "$verify_expected_lock_dir" "$verify_expected_lock_dir.reclaim"
+printf 'pid=999999999\nhost=%s\nstarted=0\ntoken=dead\n' "${HOSTNAME:-$(uname -n)}" \
+  >"$verify_expected_lock_dir/owner.meta"
+touch -t 200001010000 "$verify_expected_lock_dir.reclaim"
+lock_mutex_rc=0
+_verify_lock_script >/dev/null 2>&1 <<'EOF' || lock_mutex_rc=$?
+_sley_verify_cache_lock_acquire "$VERIFY_RECEIPT"
+EOF
+_assert_eq "verify lock: expired reclaim mutex does not block reclaim" "0" "$lock_mutex_rc"
+_assert_file_missing "verify lock: expired reclaim mutex is removed" "$verify_expected_lock_dir.reclaim"
+rm -rf "$verify_expected_lock_dir" "$verify_expected_lock_dir.reclaim"
 
 echo "=== sley: secrets worktree scan preserves max-severity rc across files/batches ==="
 
@@ -6219,6 +6693,7 @@ chmod +x "$cache_edge_repo/tests/run.sh"
 cat >"$cache_edge_repo/.sley/verify.json" <<'EOF'
 {"rules": [{"paths": ["src/**"], "commands": [{"cmd": "./tests/run.sh", "required": true, "cache": {"enabled": true, "salt": "symlink-receipt-test"}}]}]}
 EOF
+printf 'tests/count\n' >"$cache_edge_repo/.gitignore"
 (cd "$cache_edge_repo" && git add . && git commit -qm "seed symlink receipt verify")
 printf 'changed\n' >>"$cache_edge_repo/src/app.txt"
 
@@ -6300,6 +6775,7 @@ chmod +x "$cache_race_repo/tests/run.sh"
 cat >"$cache_race_repo/.sley/verify.json" <<'EOF'
 {"rules": [{"paths": ["src/**"], "commands": [{"cmd": "./tests/run.sh", "required": true, "cache": {"enabled": true, "salt": "post-lock-hit-test"}}]}]}
 EOF
+printf 'tests/count\n' >"$cache_race_repo/.gitignore"
 (cd "$cache_race_repo" && git add . && git commit -qm "seed post-lock verify")
 printf 'changed\n' >>"$cache_race_repo/src/app.txt"
 
@@ -6356,5 +6832,49 @@ _assert_contains "cache race: waiter reports cached pass" \
 _assert_eq "cache race: waiter does not rerun command" \
   "1" "$(cat "$cache_race_repo/tests/count")"
 rm -rf "$cache_race_lock_dir" 2>/dev/null || true
+
+echo "=== sley: verify signal while waiting on another run's cache lock ==="
+
+# The trap can fire while this run still polls for another agent's lock. It
+# must exit with the signal status and leave that agent's lock in place:
+# `lock_dir` already names the path, but the lock is not ours.
+printf 'changed again\n' >>"$cache_race_repo/src/app.txt"
+_run_sley "$cache_race_repo" verify --run-required --explain-cache
+_assert_exit "cache signal: setup run exits 0" 0 "$__SLEY_RC"
+cache_sig_receipt=$(printf '%s\n' "$__SLEY_OUT" | sed -n 's/^sley verify: cache receipt: //p' | head -1)
+rm -f "$cache_sig_receipt"
+cache_sig_lock_dir="$(dirname "$(dirname "$cache_sig_receipt")")/locks/$(basename "$cache_sig_receipt").lock"
+mkdir -p "$cache_sig_lock_dir"
+printf 'pid=%s\nhost=%s\nstarted=0\ntoken=holder\n' "$$" "${HOSTNAME:-$(uname -n)}" \
+  >"$cache_sig_lock_dir/owner.meta"
+cache_sig_count=$(cat "$cache_race_repo/tests/count")
+cache_sig_out=$(_tmpdir)/signal-out.txt
+: >"$cache_sig_out"
+(cd "$cache_race_repo" &&
+  XDG_CONFIG_HOME="$(_sley_test_xdg_config_home)" \
+  XDG_CACHE_HOME="$SLEY_TEST_XDG_CACHE_HOME" \
+  GIT_CONFIG_GLOBAL="$cache_race_repo/.gitconfig-test" \
+    exec "$SLEY" verify --run-required --explain-cache >"$cache_sig_out" 2>&1) &
+cache_sig_pid=$!
+cache_sig_seen=0
+for ((cache_sig_i = 0; cache_sig_i < 300; cache_sig_i++)); do
+  # The receipt line is the last output before lock acquisition starts.
+  if grep -q "cache receipt: " "$cache_sig_out" 2>/dev/null; then
+    cache_sig_seen=1
+    break
+  fi
+  kill -0 "$cache_sig_pid" 2>/dev/null || break
+  sleep 0.1
+done
+_assert_eq "cache signal: waiter reached the held lock" "1" "$cache_sig_seen"
+kill -TERM "$cache_sig_pid" 2>/dev/null
+cache_sig_rc=0
+wait "$cache_sig_pid" || cache_sig_rc=$?
+_assert_eq "cache signal: waiter exits with the TERM status" "143" "$cache_sig_rc"
+_assert_eq "cache signal: other run's lock survives the waiter's trap" \
+  "holder" "$(awk -F= '$1=="token" {print $2}' "$cache_sig_lock_dir/owner.meta" 2>/dev/null)"
+_assert_eq "cache signal: interrupted waiter did not run the command" \
+  "$cache_sig_count" "$(cat "$cache_race_repo/tests/count")"
+rm -rf "$cache_sig_lock_dir" 2>/dev/null || true
 
 _test_summary

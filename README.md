@@ -159,7 +159,8 @@ workflow commands in verify registries.
 Consumers that want Sley to operate on a bare Git worktree can set the standard
 `GIT_DIR` and `GIT_WORK_TREE` environment variables before invoking it. Set
 `SLEY_SKIP_UNTRACKED=1` when the worktree is large and untracked-file discovery
-would be too expensive for status or readiness checks.
+would be too expensive for status or readiness checks; it also leaves untracked
+files out of `sley verify` cache keys.
 
 For shells and editor integrations that want the PATH-visible `sley` command to
 fall back to a bare Git worktree when no normal repo owns the current directory,
@@ -246,6 +247,15 @@ User verify registries live at `$XDG_CONFIG_HOME/sley/verify.json` and
 directory before those defaults. Success receipts live under
 `$XDG_CACHE_HOME/sley/verify`, falling back to `~/.cache/sley/verify`; set
 `SLEY_VERIFY_CACHE_DIR` to choose an explicit cache directory.
+
+A receipt's key covers the selected files' content, the base identity chosen
+by `cache.base_policy`, the committed versions of files outside the selection
+(Git), and the names and content of untracked, non-ignored files inside the
+path scope (the whole repository unless `--path` narrows it). With a Git upstream, committing exactly the verified content keeps
+the receipt as long as the selection is unchanged. The
+`selected-content` policy limits the key to the selected files. A command that
+leaves a changed untracked artifact behind still passes but is not cached, so
+ignore such artifacts to make the command cacheable.
 
 Sley uses an XDG root only when it is non-empty and absolute. A missing, empty,
 or relative root falls back to `HOME`, and resolution fails with an actionable
