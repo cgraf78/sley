@@ -49,6 +49,15 @@ CHECK_300_P95_BUDGET_MS=3500
 CHECK_300_DARWIN_P95_BUDGET_MS=5000
 READY_FIX_300_MEDIAN_BUDGET_MS=5000
 READY_FIX_300_DARWIN_MEDIAN_BUDGET_MS=7000
+# Android (Termux) budgets are the base budgets doubled. CI runs Termux on
+# an emulator whose speed depends on the runner instance: three attempts of
+# the same commit measured every path here about 1.6-2.8x slower on two
+# instances than on the third (verify discovery median 2578 and 2774ms
+# against 1351ms; hook format-file 58 and 61ms against 33ms). A budget that
+# a real host meets with room to spare cannot also absorb that spread. Every
+# other platform keeps its budgets and still gates each path, so a regression
+# that shows on every platform cannot hide behind the Android allowance.
+ANDROID_PERF_BUDGET_FACTOR=2
 READY_FIX_FORMAT_CHUNK_FILES=256
 FIX_FORMAT_CHUNK_FILES=256
 
@@ -154,10 +163,25 @@ _new_perf_repo() {
   (cd "$repo" && pwd -P)
 }
 
+# The platform whose budgets apply: `uname -s`, except that Android reports
+# `Linux` there and is told apart by `uname -o`.
+_perf_platform() {
+  if [[ "$(uname -o 2>/dev/null)" == "Android" ]]; then
+    printf 'Android\n'
+  else
+    uname -s
+  fi
+}
+
+# Usage: _perf_budget_ms BASE_MS [DARWIN_MS] [PLATFORM]
+# PLATFORM defaults to the running host's (`_perf_platform`).
 _perf_budget_ms() {
-  local base_ms="$1" darwin_ms="${2:-}" multiplier
-  if [[ "$(uname -s)" == "Darwin" && -n "$darwin_ms" ]]; then
+  local base_ms="$1" darwin_ms="${2:-}" platform="${3:-}" multiplier
+  [[ -n "$platform" ]] || platform=$(_perf_platform)
+  if [[ "$platform" == "Darwin" && -n "$darwin_ms" ]]; then
     base_ms="$darwin_ms"
+  elif [[ "$platform" == "Android" ]]; then
+    base_ms=$((base_ms * ANDROID_PERF_BUDGET_FACTOR))
   fi
   multiplier="${!SLEY_PERF_BUDGET_MULTIPLIER_ENV:-1}"
   if ! [[ "$multiplier" =~ ^[1-9][0-9]*$ ]]; then
@@ -371,6 +395,68 @@ _combine_perf_batches() {
   __PERF_MAX=$(tail -n 1 "$sorted_file")
   __PERF_RUNS="$total_runs"
 }
+
+echo "=== sley: performance budget policy ==="
+
+# Each call pins SLEY_PERF_BUDGET_MULTIPLIER to 1 so a slow host that sets it
+# still checks the platform policy exactly.
+_assert_eq "perf budget: Linux keeps the base budget" \
+  "2500" "$(SLEY_PERF_BUDGET_MULTIPLIER=1 _perf_budget_ms 2500 3500 Linux)"
+_assert_eq "perf budget: Darwin uses its own budget" \
+  "3500" "$(SLEY_PERF_BUDGET_MULTIPLIER=1 _perf_budget_ms 2500 3500 Darwin)"
+_assert_eq "perf budget: Darwin without its own budget keeps the base" \
+  "1000" "$(SLEY_PERF_BUDGET_MULTIPLIER=1 _perf_budget_ms 1000 "" Darwin)"
+_assert_eq "perf budget: Android doubles the base budget" \
+  "5000" "$(SLEY_PERF_BUDGET_MULTIPLIER=1 _perf_budget_ms 2500 3500 Android)"
+_assert_eq "perf budget: the multiplier composes with the Android factor" \
+  "10000" "$(SLEY_PERF_BUDGET_MULTIPLIER=2 _perf_budget_ms 2500 3500 Android)"
+
+# The slow emulator instances' verify medians on CI (discovery 2578 and
+# 2774ms, registry 2624 and 2739ms) pass on Android and still fail on Linux.
+_check_slow_android_median() {
+  local label="$1" median_ms="$2" base_ms="$3" darwin_ms="$4"
+  local android_ms linux_ms
+  android_ms=$(SLEY_PERF_BUDGET_MULTIPLIER=1 \
+    _perf_budget_ms "$base_ms" "$darwin_ms" Android)
+  linux_ms=$(SLEY_PERF_BUDGET_MULTIPLIER=1 \
+    _perf_budget_ms "$base_ms" "$darwin_ms" Linux)
+  _assert_ms_le "perf budget: slow emulator $label median passes on Android" \
+    "$median_ms" "$android_ms"
+  if ((median_ms > linux_ms)); then
+    _pass "perf budget: slow emulator $label median still fails on Linux"
+  else
+    _fail "perf budget: slow emulator $label median still fails on Linux"
+  fi
+}
+for slow_android_ms in 2578 2774; do
+  _check_slow_android_median "verify discovery" "$slow_android_ms" \
+    "$VERIFY_DISCOVERY_MEDIAN_BUDGET_MS" \
+    "$VERIFY_DISCOVERY_DARWIN_MEDIAN_BUDGET_MS"
+done
+for slow_android_ms in 2624 2739; do
+  _check_slow_android_median "verify registry" "$slow_android_ms" \
+    "$VERIFY_REQUIRED_REGISTRY_MEDIAN_BUDGET_MS" \
+    "$VERIFY_REQUIRED_REGISTRY_DARWIN_MEDIAN_BUDGET_MS"
+done
+
+# Platform detection: Android reports `Linux` from `uname -s`.
+platform_bin=$(_mock_bin)
+cat >"$platform_bin/uname" <<'EOF'
+#!/usr/bin/env bash
+case "${1:-}" in
+  -o) printf '%s\n' "${SLEY_PERF_FAKE_UNAME_O:-GNU/Linux}" ;;
+  -s) printf '%s\n' "${SLEY_PERF_FAKE_UNAME_S:-Linux}" ;;
+  *) exit 1 ;;
+esac
+EOF
+chmod +x "$platform_bin/uname"
+_assert_eq "perf platform: Android is told apart by uname -o" "Android" \
+  "$(PATH="$platform_bin:$PATH" SLEY_PERF_FAKE_UNAME_O=Android _perf_platform)"
+_assert_eq "perf platform: GNU/Linux keeps uname -s" "Linux" \
+  "$(PATH="$platform_bin:$PATH" _perf_platform)"
+_assert_eq "perf platform: Darwin keeps uname -s" "Darwin" \
+  "$(PATH="$platform_bin:$PATH" SLEY_PERF_FAKE_UNAME_O=Darwin \
+    SLEY_PERF_FAKE_UNAME_S=Darwin _perf_platform)"
 
 echo "=== sley: performance confirmation policy ==="
 
@@ -622,7 +708,7 @@ discovery_report_runs="$SLEY_PERF_RUNS"
 # batch medians lets one transient slow batch be outvoted while two slow batches
 # remain a failure. The maximum still covers all 21 observed samples.
 if _should_confirm_perf \
-  "$(uname -s)" \
+  "$(_perf_platform)" \
   "$discovery_median" \
   "$discovery_max" \
   "$discovery_median_budget" \
