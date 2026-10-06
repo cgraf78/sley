@@ -798,13 +798,54 @@ registry_median_budget=$(_perf_budget_ms \
 registry_max_budget=$(_perf_budget_ms \
   "$VERIFY_REQUIRED_REGISTRY_MAX_BUDGET_MS" \
   "$VERIFY_REQUIRED_REGISTRY_DARWIN_MAX_BUDGET_MS")
-echo "  PERF: verify required registry median ${registry_median}ms / ${registry_median_budget}ms, maximum ${registry_max}ms / ${registry_max_budget}ms (files ${SLEY_PERF_CHANGED_FILES}, runs ${SLEY_PERF_RUNS})"
+registry_report_runs="$SLEY_PERF_RUNS"
+
+# Same contention policy as the discovery path above: hosted macOS runners can
+# occasionally sustain contention across an entire seven-sample batch. A
+# median-only breach on Darwin gets two confirmation batches on the same
+# already-warm fixture; the median of three batch medians lets one transient
+# slow batch be outvoted while two slow batches remain a failure. The maximum
+# still covers every observed sample.
+if _should_confirm_perf \
+  "$(_perf_platform)" \
+  "$registry_median" \
+  "$registry_max" \
+  "$registry_median_budget" \
+  "$registry_max_budget"; then
+  registry_initial_median="$registry_median"
+  registry_initial_max="$registry_max"
+  registry_initial_durations="$repo/.sley-perf-durations.initial"
+  cp "$repo/.sley-perf-durations" "$registry_initial_durations"
+  registry_confirmation_files=()
+
+  echo "  PERF: verify registry median-only breach; collecting two confirmation batches"
+  for registry_confirmation_batch in 1 2; do
+    _measure_perf_stats "verify perf: large registry confirmation" 15 \
+      "$repo" "$SLEY_PERF_RUNS" verify --run-required --json
+    registry_confirmation_file="$repo/.sley-perf-durations.confirmation-$registry_confirmation_batch"
+    cp "$repo/.sley-perf-durations" "$registry_confirmation_file"
+    registry_confirmation_files+=("$registry_confirmation_file")
+    echo "  PERF: verify registry confirmation ${registry_confirmation_batch} median ${__PERF_MEDIAN}ms, maximum ${__PERF_MAX}ms"
+  done
+
+  _combine_perf_batches \
+    "$SLEY_PERF_RUNS" \
+    "$repo/.sley-perf-durations.combined" \
+    "$registry_initial_durations" \
+    "${registry_confirmation_files[@]}"
+  registry_report_runs="$__PERF_RUNS"
+  registry_median="$__PERF_MEDIAN"
+  registry_max="$__PERF_MAX"
+  echo "  PERF: verify registry initial median ${registry_initial_median}ms, maximum ${registry_initial_max}ms; three-batch median ${registry_median}ms, maximum across ${registry_report_runs} samples ${registry_max}ms"
+fi
+
+echo "  PERF: verify required registry median ${registry_median}ms / ${registry_median_budget}ms, maximum ${registry_max}ms / ${registry_max_budget}ms (files ${SLEY_PERF_CHANGED_FILES}, runs ${registry_report_runs})"
 _assert_ms_le "verify perf: large registry median" \
   "$registry_median" "$registry_median_budget"
 _assert_ms_le "verify perf: large registry maximum" \
   "$registry_max" "$registry_max_budget"
 _assert_checkrun_invocations "verify perf: fixture-owned Checkrun measured runs" \
-  "$((SLEY_PERF_RUNS + 1))" "$checkrun_state/expected-args" "$repo/.home"
+  "$((registry_report_runs + 1))" "$checkrun_state/expected-args" "$repo/.home"
 
 echo "=== sley: hook performance ==="
 
