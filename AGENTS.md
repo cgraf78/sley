@@ -41,7 +41,7 @@ tool selection, and diagnostic shape. Keep that split; the contract is
   `base,jq,python,zsh`.
 - Some suites skip silently, so a green CI run does not cover them:
   - `nvim-test` skips without Neovim (CI installs none);
-  - `vscode-test` runs its behavior checks only when `node` is available;
+  - `vscode-test` skips its behavior checks where `node` is missing;
   - `checkrun-cancellation-integration-test` and `vscode-vocab-sync-test`
     need a Checkrun checkout. CI has none. Locally, set
     `SLEY_TEST_CHECKRUN_ROOT=<absolute checkrun checkout>`; without it,

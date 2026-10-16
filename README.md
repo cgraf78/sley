@@ -49,7 +49,8 @@ Sley drives other tools, so install these too (details under
 
 - `jq` and `python3`;
 - [checkrun](https://github.com/cgraf78/checkrun) for `fix` and `check`, which
-  needs `yq` v4 and the formatters and linters you want it to run;
+  needs Python 3.11 or newer, `yq` v4, and the formatters and linters you want
+  it to run;
 - `gitleaks` for `sley secrets`.
 
 Install them before you activate the commit hook: while checkrun, `yq`, or
@@ -166,12 +167,14 @@ shipped hooks. For the curl installation, the checkout is
 clone, use its path instead:
 
 ```bash
-git config core.hooksPath "$HOME/.local/share/cgraf78/checkouts/sley/share/sley/hooks/git"
+git config core.hooksPath "${XDG_DATA_HOME:-$HOME/.local/share}/cgraf78/checkouts/sley/share/sley/hooks/git"
 ```
 
 `core.hooksPath` replaces the repository's `.git/hooks` directory, so any hooks
 there stop running. The hooks run `sley ready --fix --commit` on the staged
-files. If formatting changes a staged file, the commit stops and asks you to
+files for ordinary commits, merge commits, `git am`, and the commits that
+cherry-pick, revert, and rebase replay, and they secret-scan each commit
+message. If formatting changes a staged file, the commit stops and asks you to
 stage the result. Sapling users and anyone composing hooks with other tools
 should read [`share/sley/hooks/README.md`](share/sley/hooks/README.md).
 
