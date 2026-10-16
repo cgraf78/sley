@@ -5,20 +5,30 @@
 [![Bash Version](https://img.shields.io/badge/bash-%3E%3D4.0-blue.svg)](https://www.gnu.org/software/bash/)
 [![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20WSL-lightgrey.svg)](#)
 
-`sley` owns the repo workflow API used by humans, editors, agent hooks, Git
-hooks, and Sapling hooks. The generic CLI entry point is `bin/sley`; the shared
-API is `sley.sh`.
+**Check only what you changed, the same way in your editor, your commit hook,
+and your AI agent.**
 
-See [`docs/workflow-contract.md`](docs/workflow-contract.md) for the ownership
-contract between Sley, Checkrun, editor adapters, dotfiles, humans, and agents.
-See [`examples/README.md`](examples/README.md) for copyable consumer-owned
-configuration and hook-policy examples. Sley-owned runtime launchers remain
-under `share/sley/` so consumers can activate them without maintaining copies.
+`sley ready` selects the files in your current change, not the whole
+repository, and runs these phases on just those files:
 
-`shdeps` installs `bin/sley` as the PATH-visible `~/.local/bin/sley` symlink
-and links the bundled `man/man1/` page into the user-local manpath. The entry
-point is self-contained and resolves its dependency libraries through that
-symlink.
+- lint and validation through [checkrun](https://github.com/cgraf78/checkrun),
+  which picks the tool for each file type from the ones already on your `PATH`;
+- a redacted secret scan through [gitleaks](https://github.com/gitleaks/gitleaks);
+- the verification commands your repository marks as required in
+  `.sley/verify.json`, plus Checkrun's project analyzers (`checkrun verify`)
+  when they apply.
+
+`sley fix` formats the same files, and `sley ready --fix` formats before it
+checks. `sley verify` also lists test commands it finds in manifests such as
+`package.json`, `Cargo.toml`, `go.mod`, `Makefile`, and `justfile`, but those
+are suggestions: `sley ready` runs only required commands.
+
+The same entry point backs the shipped Git and Sapling commit hooks, Neovim and
+VS Code save-time adapters, and AI-agent edit hooks such as
+[agentguard](https://github.com/cgraf78/agentguard). Unlike pre-commit,
+lefthook, or lint-staged, there is no per-repository hook list or tool-version
+pinning to maintain for formatting and linting, and editors, hooks, and agents
+share one definition of "ready to commit".
 
 ## Installation
 
@@ -33,6 +43,17 @@ absolute, or under `$HOME/.local/share` otherwise, and publishes its command
 and manual-page links. It does not use a release asset or copy a second runtime
 tree. Git and Bash 4 or newer are required; the supported Bash must be the first
 `bash` on `PATH`.
+
+Sley drives other tools, so install these too (details under
+[Dependencies](#dependencies)):
+
+- `jq` and `python3`;
+- [checkrun](https://github.com/cgraf78/checkrun) for `fix` and `check`, which
+  needs `yq` v4 and the formatters and linters you want it to run;
+- `gitleaks` for `sley secrets`.
+
+Install them before you activate the commit hook: while checkrun, `yq`, or
+`gitleaks` is missing, the hook blocks every commit.
 
 To choose and manage the checkout yourself instead:
 
@@ -54,7 +75,8 @@ links.
 The command resolves `lib/sley/` from the checkout. The installer leaves that
 library and `share/sley/` checkout-owned and creates no completion tree. Sley's
 Bash and zsh completion functions remain in `share/sley/shell.sh`; source that
-loader through shdeps, or use its absolute path in this checkout. Git and
+loader by its absolute path in the checkout, or through
+[shdeps](https://github.com/cgraf78/shdeps) if you use it. Git and
 Sapling hook activation likewise continues to select the provider-owned
 launchers under `share/sley/hooks/` explicitly.
 
@@ -69,6 +91,55 @@ sley secrets      # redacted secret scan where supported
 sley verify       # local verification command discovery and execution
 sley ready        # aggregate pre-submit readiness report
 sley hook         # low-level editor, agent, and VCS hook plumbing
+```
+
+For example, take a Git repository whose `.sley/verify.json` requires
+`make test` for Python files:
+
+```json
+{
+  "rules": [
+    { "paths": ["*.py"], "commands": [{ "cmd": "make test", "kind": "test", "required": true, "tier": "fast" }] }
+  ]
+}
+```
+
+After adding an unused import to `calc.py`, `sley ready` checks only that file
+and exits 1 because the lint finding blocks:
+
+```text
+$ sley ready
+sley ready: selecting changed files
+sley ready: selected 1 changed files
+sley ready: running phases: status, check, secrets, verify
+status: 0 (pass)
+  repo: git
+  root: /tmp/sley-demo
+  ref: main
+  dirty: true
+check: 1 (blocking)
+  F401 [*] `os` imported but unused
+   --> calc.py:1:8
+    |
+  1 | import os
+    |        ^^
+  help: Remove unused import: `os`
+    |
+    - import os
+  1 |
+    |
+  Found 1 error.
+  [*] 1 fixable with `--fix`.
+secrets: 0 (pass)
+  sley secrets: scanned 1 file
+verify: 0 (pass)
+  sley verify: running required fast command: make test
+  sley verify: selected changed files:
+    calc.py
+  sley verify: required verification commands:
+    fast: make test
+  python3 -c "import calc; assert calc.add(2, 2) == 4"
+  sley verify: exit code: 0
 ```
 
 `sley verify` reports where each suggested command came from. Human output labels
@@ -86,6 +157,28 @@ directory. Use `--path .`, `--path PATH`, `--repo-wide`, and
 No default `sley` command formats or checks the whole repository. In large
 repos, the active diff is the useful project signal even when commands are run
 from the repo root.
+
+## Commit hook
+
+To run the gate on every commit in a Git repository, point Git at Sley's
+shipped hooks. For the curl installation, the checkout is
+`${XDG_DATA_HOME:-$HOME/.local/share}/cgraf78/checkouts/sley`; for a manual
+clone, use its path instead:
+
+```bash
+git config core.hooksPath "$HOME/.local/share/cgraf78/checkouts/sley/share/sley/hooks/git"
+```
+
+`core.hooksPath` replaces the repository's `.git/hooks` directory, so any hooks
+there stop running. The hooks run `sley ready --fix --commit` on the staged
+files. If formatting changes a staged file, the commit stops and asks you to
+stage the result. Sapling users and anyone composing hooks with other tools
+should read [`share/sley/hooks/README.md`](share/sley/hooks/README.md).
+
+Further reading: [`docs/workflow-contract.md`](docs/workflow-contract.md)
+describes how Sley, Checkrun, and editor adapters divide responsibilities, and
+[`examples/README.md`](examples/README.md) has copyable configuration and
+hook-policy examples.
 
 ## Lint exclusions
 
@@ -142,7 +235,7 @@ changes, it refuses the whole operation to preserve partial-staging intent.
 - `cgraf78/checkrun` is the default formatting and linting backend. Base Sley
   invokes the PATH-visible `autoformat` and `autolint` CLIs for `sley fix`,
   `sley check`, and `sley hook` commands unless an extension overrides the hook
-  policy.
+  policy. Checkrun itself requires `yq` v4.
 - `gitleaks` is required for `sley secrets`.
 
 Optional workflow commands such as `pytest`, `cargo test`, `go test`, `make`,
@@ -155,6 +248,8 @@ required `checkrun verify -- <changed-files>` command when `checkrun` is
 available, so generic Checkrun-owned analyzers are selected automatically from
 the same changed-file scope as the rest of readiness. Keep repo-specific
 workflow commands in verify registries.
+
+### Bare Git worktrees (advanced)
 
 Consumers that want Sley to operate on a bare Git worktree can set the standard
 `GIT_DIR` and `GIT_WORK_TREE` environment variables before invoking it. Set
@@ -179,8 +274,8 @@ Editor probes that need to ask only "is this a normal repo?" can set
 
 ## Public API
 
-New integrations should source `sley.sh` through shdeps and call public
-`sley_*` functions:
+New integrations should source `lib/sley/sley.sh` from the checkout and call
+public `sley_*` functions. With shdeps, resolve the path through it:
 
 ```bash
 . "$(shdeps dep-file cgraf78/sley lib/sley/sley.sh)"
@@ -356,9 +451,6 @@ descendants that remain in that group. Extension hooks and phases must remain in
 that managed process group through completion and cancellation. Code that
 daemonizes, creates a new session, or otherwise leaves the group is unsupported;
 cleanup remains the extension author's responsibility.
-
-The former `repo-check` surface has been removed. New code should not introduce
-`_repo_*` or `_REPO_CHECK_*` hook APIs.
 
 ## Implementation Layout
 
