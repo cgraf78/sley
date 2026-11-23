@@ -16,7 +16,8 @@ if ! command -v nvim >/dev/null 2>&1; then
   _test_summary
 fi
 
-lua_test=$(_tmpdir)/sley-nvim-test.lua
+nvim_fixture=$(_tmpdir)
+lua_test="$nvim_fixture/sley-nvim-test.lua"
 cat >"$lua_test" <<'LUA'
 local root = assert(os.getenv("SLEY_REPO_ROOT"), "SLEY_REPO_ROOT missing")
 local sley_nvim = dofile(root .. "/lib/sley/nvim.lua")
@@ -90,11 +91,28 @@ assert_eq("diagnostic default severity", vim.diagnostic.severity.WARN, diags[2].
 print("sley nvim adapter lua checks passed")
 LUA
 
+run_adapter() {
+  # A clean Neovim startup still initializes the native logger.
+  XDG_STATE_HOME="$nvim_fixture/state" NVIM_LOG_FILE="$nvim_fixture/native.log" \
+    SLEY_REPO_ROOT="$SLEY_REPO_ROOT" nvim --headless --clean -n -u NONE -i NONE -l "$lua_test"
+}
+
+caller=$(_tmpdir)
+caller_log="$caller/native.log"
+control_rc=0
+XDG_STATE_HOME="$caller/state" NVIM_LOG_FILE="$caller_log" \
+  nvim --headless --clean -n -u NONE -i NONE -c 'qa!' >/dev/null 2>&1 || control_rc=$?
+_assert_exit "nvim adapter: native logging control exits successfully" 0 "$control_rc"
+_assert_file_exists "nvim adapter: native logging control writes the selected file" "$caller_log"
+rm -f -- "$caller_log"
+
 set +e
-output=$(SLEY_REPO_ROOT="$SLEY_REPO_ROOT" nvim --headless --clean -n -u NONE -i NONE -l "$lua_test" 2>&1)
+output=$(XDG_STATE_HOME="$caller/state" NVIM_LOG_FILE="$caller_log" run_adapter 2>&1)
 rc=$?
 set -e
 _assert_exit "nvim adapter: lua checks pass" 0 "$rc"
 _assert_contains "nvim adapter: reports success" "sley nvim adapter lua checks passed" "$output"
+_assert_file_exists "nvim adapter: native log belongs to the fixture" "$nvim_fixture/native.log"
+_assert_file_missing "nvim adapter: caller-selected log remains absent" "$caller_log"
 
 _test_summary
