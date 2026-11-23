@@ -57,10 +57,9 @@ tool selection, and diagnostic shape. Keep that split; the contract is
 Suites source `test/helpers.sh`, which exports `REPO_TEST=1` and unsets
 `SLEY_ALLOW_UNAVAILABLE`. Use `_mock_home` (scratch `HOME` and an empty
 `GIT_CONFIG_GLOBAL`), `_mock_bin` fake commands, and temporary repositories,
-never the caller's config or workspace. Run the suite with `BASH_ENV` and
-`ENV` unset (`env -u BASH_ENV -u ENV test/sley-test`): the hook suites start
-Bash with a minimal `PATH`, and an inherited startup file breaks their
-missing-`sley` cases.
+never the caller's config or workspace. The test runner and common helper
+clear `BASH_ENV` and `ENV` before starting child processes. This keeps
+caller startup files from rewriting the hook fixtures' minimal `PATH`.
 
 ## CI and generated files
 

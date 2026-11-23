@@ -13,6 +13,10 @@
 # shellcheck source=test/git-fixture-env.sh
 . "$(dirname -- "${BASH_SOURCE[0]}")/git-fixture-env.sh"
 
+# A directly invoked suite must keep caller startup code out of its children.
+# In particular, startup code can repopulate a deliberately restricted PATH.
+unset BASH_ENV ENV
+
 PASS=0
 FAIL=0
 CLEANUP_DIRS=()

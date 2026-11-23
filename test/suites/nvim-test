@@ -3,7 +3,7 @@
 
 set -euo pipefail
 
-SLEY_TEST_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
+SLEY_TEST_DIR="$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
 SLEY_REPO_ROOT="$(cd -- "$SLEY_TEST_DIR/.." && pwd -P)"
 
 # shellcheck source=../helpers.sh
