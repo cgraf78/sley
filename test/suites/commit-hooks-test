@@ -4,7 +4,7 @@
 set -euo pipefail
 export NO_COLOR=1
 
-SLEY_TEST_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
+SLEY_TEST_DIR="$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
 SLEY_REPO_ROOT="$(cd -- "$SLEY_TEST_DIR/.." && pwd -P)"
 
 # shellcheck source=../helpers.sh
@@ -86,6 +86,34 @@ missing_output=$(PATH="$missing_bin" "$git_hooks/sley-commit-gate" 2>&1) || rc=$
 _assert_exit "git gate: missing sley fails closed" 1 "$rc"
 _assert_contains "git gate: missing sley explains the requirement" \
   "sley not found on PATH" "$missing_output"
+
+# An installed Sley must stay unavailable to the deliberately restricted
+# PATH, even if the caller normally adds it from a Bash startup file.
+startup_dir=$(_tmpdir)
+startup_marker=$startup_dir/startup-ran
+mkdir "$startup_dir/bin"
+printf '#!%s\nexit 88\n' "$BASH" >"$startup_dir/bin/sley"
+chmod +x "$startup_dir/bin/sley"
+# The fixture must expand PATH when Bash sources it.
+# shellcheck disable=SC2016
+printf ': >%q\nexport PATH=%q:"$PATH"\n' \
+  "$startup_marker" "$startup_dir/bin" >"$startup_dir/startup.sh"
+rc=0
+# Bash -p preserves the startup variables for the fixture without sourcing
+# the startup file before the fixture has a chance to isolate its children.
+# shellcheck disable=SC2016
+BASH_ENV="$startup_dir/startup.sh" ENV="$startup_dir/startup.sh" \
+  "$BASH" -p -c '
+    . "$1"
+    PATH="$2" exec "$3"
+  ' bash "$SLEY_TEST_DIR/helpers.sh" "$missing_bin" "$git_hooks/sley-commit-gate" \
+  >/dev/null 2>&1 || rc=$?
+_assert_exit "git gate: startup isolation preserves the missing-tool status" 1 "$rc"
+if [[ -e "$startup_marker" ]]; then
+  _fail "hook fixture: child Bash sourced the caller startup file"
+else
+  _pass "hook fixture: child Bash ignored the caller startup file"
+fi
 
 for hook_name in pre-commit pre-merge-commit pre-applypatch; do
   SLEY_TEST_HOOK_NAME="$hook_name" \
