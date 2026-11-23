@@ -19,11 +19,13 @@ program	share/sley/hooks/git/sley-commit-gate
 program	share/sley/hooks/sapling/sley-commit-gate
 program	share/sley/shell.sh
 program	support/install-checkout.sh
+program	test/git-fixture-env.sh
 program	test/helpers.sh
 program	test/sley-test
 program	test/suites/checkrun-cancellation-integration-test
 program	test/suites/commit-hooks-test
 program	test/suites/examples-test
+program	test/suites/git-fixture-isolation-test
 program	test/suites/install-test
 program	test/suites/lint-ignore-test
 program	test/suites/manpage-test
