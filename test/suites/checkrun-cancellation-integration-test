@@ -9,10 +9,34 @@ root="${test_dir%/test}"
 # shellcheck source=../helpers.sh
 source "$test_dir/helpers.sh"
 
+fixture=$(_tmpdir)
+run_fixture() {
+  # The driver and its real tools should start from the same private policy
+  # whether invoked by CI, a hook, or a configured interactive shell.
+  env -i PATH="$PATH" HOME="$fixture" TMPDIR="$fixture" \
+    GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null "$@"
+}
+
+startup_marker="$fixture/startup-ran"
+printf 'printf sourced >%q\n' "$startup_marker" >"$fixture/caller.bash"
+
+# This check runs even when no Checkrun checkout was supplied. A Sley or
+# Checkrun policy from the caller can otherwise prevent the real test from
+# launching either backend, and BASH_ENV can silently replace fixture tools.
+fixture_status=0
+# shellcheck disable=SC2016 # The child tests its own environment.
+fixture_output=$(BASH_ENV="$fixture/caller.bash" CHECKRUN_SCHEMA_POLICY_REQUIRED=1 \
+  run_fixture "$BASH" -c '
+    [[ -z ${BASH_ENV+x} && -z ${CHECKRUN_SCHEMA_POLICY_REQUIRED+x} ]]
+  ' 2>&1) || fixture_status=$?
+_assert_exit "Checkrun fixture excludes caller startup and policy" 0 "$fixture_status"
+_assert_file_missing "Checkrun fixture did not source the caller startup file" "$startup_marker"
+[[ -z $fixture_output ]] || printf '%s\n' "$fixture_output" >&2
+
 checkrun_root=${SLEY_TEST_CHECKRUN_ROOT:-}
 if [[ -z "$checkrun_root" ]]; then
   echo "SKIP: checkrun-cancellation-integration-test (set SLEY_TEST_CHECKRUN_ROOT)"
-  exit 0
+  _test_summary
 fi
 if [[ "$checkrun_root" != /* || ! -x "$checkrun_root/bin/autolint" ]]; then
   echo "checkrun integration: SLEY_TEST_CHECKRUN_ROOT must name an absolute Checkrun checkout" >&2
@@ -25,7 +49,6 @@ for dependency in getconf git ps python3; do
   }
 done
 
-fixture=$(_tmpdir)
 orchestrator="$fixture/orchestrator.py"
 
 cat >"$orchestrator" <<'PY'
@@ -399,7 +422,7 @@ PY
 echo "=== Sley ready -> Checkrun autolint cancellation ==="
 output=""
 rc=0
-output=$(python3 "$orchestrator" "$root" "$checkrun_root" "$fixture" 2>&1) || rc=$?
+output=$(run_fixture python3 -IB "$orchestrator" "$root" "$checkrun_root" "$fixture" 2>&1) || rc=$?
 if [[ "$rc" -eq 0 ]]; then
   _pass "nested real-Checkrun cancellation is contained and reaped"
 else
