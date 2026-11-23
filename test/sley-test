@@ -32,17 +32,26 @@ runtime_shell_files=(
 )
 
 check_runtime_shell_inventory() {
-  local file first_line listed discovered
+  local file first_line listed discovered inventory
   listed=$(
-    for file in "${runtime_shell_files[@]}"; do
-      printf '%s\n' "${file#"$root"/}"
+    for file in "$@"; do
+      printf '%q\n' "${file#"$root"/}"
     done | LC_ALL=C sort
   )
   discovered=$(
-    while IFS= read -r file; do
+    # Git can print useful paths before rejecting an incomplete index read.
+    # Stage its literal filenames and start the classification after success.
+    if [[ -n ${TMPDIR:-} ]]; then
+      inventory=$(mktemp -- "${TMPDIR%/}/runtime-inventory.XXXXXX") || return
+    else
+      inventory=$(mktemp) || return
+    fi
+    trap 'rm -f -- "$inventory"' EXIT
+    git -C "$root" ls-files -z -- bin lib share >"$inventory" || return
+    while IFS= read -r -d '' file; do
       case "$file" in
         *.sh | *.sh.template)
-          printf '%s\n' "$file"
+          printf '%q\n' "$file"
           continue
           ;;
       esac
@@ -59,10 +68,13 @@ check_runtime_shell_inventory() {
         "$first_line" == '# shellcheck shell=dash' ||
         "$first_line" == '# shellcheck shell=ksh' ||
         "$first_line" == '# shellcheck shell=sh' ]]; then
-        printf '%s\n' "$file"
+        printf '%q\n' "$file"
       fi
-    done < <(git -C "$root" ls-files -- bin lib share)
-  )
+    done <"$inventory"
+  ) || {
+    printf '%s\n' 'sley-test: cannot enumerate runtime shell files' >&2
+    return 1
+  }
   discovered=$(printf '%s\n' "$discovered" | sed '/^$/d' | LC_ALL=C sort)
 
   if [[ "$listed" != "$discovered" ]]; then
@@ -74,7 +86,35 @@ check_runtime_shell_inventory() {
   fi
 }
 
-check_runtime_shell_inventory
+inventory_status=0
+inventory_error=$(
+  # shellcheck disable=SC2329 # Used by check_runtime_shell_inventory below.
+  git() {
+    command git "$@" || return
+    return 17
+  }
+  check_runtime_shell_inventory "${runtime_shell_files[@]}" 2>&1
+) || inventory_status=$?
+if [[ "$inventory_status" != 1 ||
+  "$inventory_error" != 'sley-test: cannot enumerate runtime shell files' ]]; then
+  printf '%s\n' 'sley-test: runtime shell inventory did not reject a Git error' >&2
+  exit 1
+fi
+
+# One unusual pathname must not stand in for two intended entries.
+inventory_status=0
+inventory_error=$(
+  # shellcheck disable=SC2329 # Used by check_runtime_shell_inventory below.
+  git() {
+    printf '%s\0' $'lib/first.sh\nlib/second.sh'
+  }
+  check_runtime_shell_inventory "$root/lib/first.sh" "$root/lib/second.sh" 2>&1
+) || inventory_status=$?
+if [[ "$inventory_status" != 1 || "$inventory_error" != *'runtime shell inventory is stale'* ]]; then
+  printf '%s\n' 'sley-test: runtime shell inventory did not preserve pathname boundaries' >&2
+  exit 1
+fi
+check_runtime_shell_inventory "${runtime_shell_files[@]}"
 # Shared CI lints once in its dedicated job; local runs still lint by default.
 if [[ "${SLEY_SKIP_SHELLCHECK:-0}" != 1 ]]; then
   shellcheck -x -P SCRIPTDIR \
