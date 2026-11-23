@@ -10,6 +10,9 @@ SLEY="$SLEY_REPO_ROOT/bin/sley"
 # shellcheck source=../helpers.sh
 . "$SLEY_TEST_DIR/helpers.sh"
 
+# The lint-ignore workload sets its own input file below.
+unset SLEY_PERF_STDIN_FILE
+
 SLEY_PERF_RUNS=${SLEY_PERF_RUNS:-7}
 SLEY_HOOK_PERF_RUNS=${SLEY_HOOK_PERF_RUNS:-20}
 SLEY_READY_FIX_PERF_RUNS=${SLEY_READY_FIX_PERF_RUNS:-3}
@@ -277,35 +280,55 @@ _median_ms() {
   '
 }
 
-_run_perf_sley_timed() {
-  local timeout_secs="$1" repo="$2"
-  shift 2
-  local home xdg_config_home xdg_cache_home output_file rc_file
-  home="$repo/.home"
-  xdg_config_home="$repo/.xdg-config"
-  xdg_cache_home="$repo/.xdg-cache"
-  output_file="$repo/.sley-perf-output"
-  rc_file="$repo/.sley-perf-rc"
-  mkdir -p "$home" "$xdg_config_home" "$xdg_cache_home"
-  __SLEY_MS=$(
-    cd "$repo" &&
-      HOME="$home" \
-        XDG_CONFIG_HOME="$xdg_config_home" \
-        XDG_CACHE_HOME="$xdg_cache_home" \
-        GIT_CONFIG_GLOBAL="$repo/.gitconfig-test" \
-        python3 - "$timeout_secs" "$output_file" "$rc_file" "$SLEY" "$@" <<'PY'
+_perf_sample() {
+  python3 - "$@" <<'PY'
+import math
 import os
 import subprocess
 import sys
 import time
 
-timeout = float(sys.argv[1])
-output_file = sys.argv[2]
-rc_file = sys.argv[3]
-cmd = sys.argv[4:]
+
+def scheduling_delay():
+    """Measure how long an independent runnable process waits for CPU time."""
+    wall_started = time.perf_counter_ns()
+    cpu_started = time.process_time_ns()
+    cpu_elapsed = 0
+    while cpu_elapsed < 20_000_000:
+        cpu_elapsed = time.process_time_ns() - cpu_started
+    return (time.perf_counter_ns() - wall_started) / cpu_elapsed
+
+
+def median_sample(wall_ms, before, after):
+    """Adjust only sustained contention, keeping at least half the wall time."""
+    scale = min(before, after, 2.0)
+    if scale < 1.5:
+        return wall_ms, 0
+    return math.ceil(wall_ms / scale), 1
+
+
+if sys.argv[1] == "--test-policy":
+    for label, sample, expected in (
+        ("quiet runner", (5422, 1.0, 1.0), (5422, 0)),
+        ("quiet late control", (5422, 2.0, 1.49), (5422, 0)),
+        ("quiet early control", (5422, 1.49, 2.0), (5422, 0)),
+        ("both controls contended", (5422, 1.6, 1.8), (3389, 1)),
+        ("2x correction cap", (7200, 3.0, 4.0), (3600, 1)),
+    ):
+        actual = median_sample(*sample)
+        if actual != expected:
+            raise SystemExit(f"{label}: expected {expected}, got {actual}")
+    raise SystemExit(0)
+
+calibrate = sys.argv[1] == "1"
+timeout = float(sys.argv[2])
+output_file = sys.argv[3]
+rc_file = sys.argv[4]
+cmd = sys.argv[5:]
 input_path = os.environ.get("SLEY_PERF_STDIN_FILE")
 input_handle = open(input_path, "r", encoding="utf-8") if input_path else None
 
+before = scheduling_delay() if calibrate else 1.0
 started = time.perf_counter_ns()
 try:
     try:
@@ -330,13 +353,40 @@ finally:
         input_handle.close()
 
 elapsed_ms = max(1, (time.perf_counter_ns() - started) // 1_000_000)
+after = scheduling_delay() if calibrate and rc == 0 else 1.0
+gated_ms, contended = median_sample(elapsed_ms, before, after)
 with open(output_file, "w", encoding="utf-8") as handle:
     handle.write(output)
 with open(rc_file, "w", encoding="utf-8") as handle:
     handle.write(str(rc))
-print(elapsed_ms)
+print(elapsed_ms, gated_ms, contended)
 PY
+}
+
+_run_perf_sley_timed() {
+  local timeout_secs="$1" repo="$2"
+  shift 2
+  local calibrate=0
+  if [[ ${1:-} == --calibrate ]]; then
+    calibrate=1
+    shift
+  fi
+  local home xdg_config_home xdg_cache_home output_file rc_file timing
+  home="$repo/.home"
+  xdg_config_home="$repo/.xdg-config"
+  xdg_cache_home="$repo/.xdg-cache"
+  output_file="$repo/.sley-perf-output"
+  rc_file="$repo/.sley-perf-rc"
+  mkdir -p "$home" "$xdg_config_home" "$xdg_cache_home"
+  timing=$(
+    cd "$repo" &&
+      HOME="$home" \
+        XDG_CONFIG_HOME="$xdg_config_home" \
+        XDG_CACHE_HOME="$xdg_cache_home" \
+        GIT_CONFIG_GLOBAL="$repo/.gitconfig-test" \
+        _perf_sample "$calibrate" "$timeout_secs" "$output_file" "$rc_file" "$SLEY" "$@"
   )
+  read -r __SLEY_MS __SLEY_GATED_MS __SLEY_CONTENDED <<<"$timing"
   __SLEY_OUT=$(cat "$output_file")
   __SLEY_RC=$(cat "$rc_file")
 }
@@ -344,10 +394,13 @@ PY
 _measure_perf_stats() {
   local desc="$1" timeout_secs="$2" repo="$3" runs="$4"
   shift 4
-  local durations_file sorted_file run
+  local durations_file gated_file sorted_file run
   durations_file="$repo/.sley-perf-durations"
+  gated_file="$repo/.sley-perf-gated-durations"
   sorted_file="$durations_file.sorted"
   : >"$durations_file"
+  : >"$gated_file"
+  __PERF_CONTENDED=0
   for run in $(seq 1 "$runs"); do
     _run_perf_sley_timed "$timeout_secs" "$repo" "$@"
     if [[ "$__SLEY_RC" -ne 0 ]]; then
@@ -355,11 +408,14 @@ _measure_perf_stats() {
       return 1
     fi
     printf '%s\n' "$__SLEY_MS" >>"$durations_file"
+    printf '%s\n' "$__SLEY_GATED_MS" >>"$gated_file"
+    __PERF_CONTENDED=$((__PERF_CONTENDED + __SLEY_CONTENDED))
   done
   LC_ALL=C sort -n "$durations_file" >"$sorted_file"
   __PERF_MEDIAN=$(_median_ms "$runs" <"$sorted_file")
   __PERF_P95=$(_p95_ms "$runs" <"$sorted_file")
   __PERF_MAX=$(tail -n 1 "$sorted_file")
+  __PERF_GATED_MEDIAN=$(LC_ALL=C sort -n "$gated_file" | _median_ms "$runs")
 }
 
 _should_confirm_perf() {
@@ -396,7 +452,70 @@ _combine_perf_batches() {
   __PERF_RUNS="$total_runs"
 }
 
+_measure_verify_perf() {
+  local label="$1" repo="$2" median_budget="$3" max_budget="$4"
+  shift 4
+  local platform batch_dir batch raw_median raw_max total_contended
+  local -a calibration=() raw_batches=() gated_batches=()
+  platform=$(_perf_platform)
+  [[ "$platform" != Darwin ]] || calibration=(--calibrate)
+  _measure_perf_stats "$label" 15 "$repo" "$SLEY_PERF_RUNS" \
+    ${calibration[@]+"${calibration[@]}"} "$@"
+  __PERF_RUNS="$SLEY_PERF_RUNS"
+
+  # Keep the existing batch-majority rule when even the adjusted median
+  # breaches. The wall maximum still covers every observed sample.
+  if _should_confirm_perf "$platform" "$__PERF_GATED_MEDIAN" "$__PERF_MAX" \
+    "$median_budget" "$max_budget"; then
+    batch_dir=$(_tmpdir)
+    raw_batches+=("$batch_dir/raw.initial")
+    gated_batches+=("$batch_dir/gated.initial")
+    cp "$repo/.sley-perf-durations" "${raw_batches[0]}"
+    cp "$repo/.sley-perf-gated-durations" "${gated_batches[0]}"
+    total_contended=$__PERF_CONTENDED
+    echo "  PERF: $label median-only breach; collecting two confirmation batches"
+    for batch in 1 2; do
+      _measure_perf_stats "$label confirmation" 15 "$repo" "$SLEY_PERF_RUNS" \
+        ${calibration[@]+"${calibration[@]}"} "$@"
+      raw_batches+=("$batch_dir/raw.$batch")
+      gated_batches+=("$batch_dir/gated.$batch")
+      cp "$repo/.sley-perf-durations" "${raw_batches[$batch]}"
+      cp "$repo/.sley-perf-gated-durations" "${gated_batches[$batch]}"
+      total_contended=$((total_contended + __PERF_CONTENDED))
+      echo "  PERF: $label confirmation $batch raw median ${__PERF_MEDIAN}ms, adjusted median ${__PERF_GATED_MEDIAN}ms, raw maximum ${__PERF_MAX}ms"
+    done
+    _combine_perf_batches "$SLEY_PERF_RUNS" "$batch_dir/raw" "${raw_batches[@]}"
+    raw_median=$__PERF_MEDIAN
+    raw_max=$__PERF_MAX
+    _combine_perf_batches "$SLEY_PERF_RUNS" "$batch_dir/gated" "${gated_batches[@]}"
+    __PERF_GATED_MEDIAN=$__PERF_MEDIAN
+    __PERF_MEDIAN=$raw_median
+    __PERF_MAX=$raw_max
+    __PERF_CONTENDED=$total_contended
+  fi
+
+  echo "  PERF: $label raw median ${__PERF_MEDIAN}ms / ${median_budget}ms, maximum ${__PERF_MAX}ms / ${max_budget}ms (files ${SLEY_PERF_CHANGED_FILES}, runs ${__PERF_RUNS})"
+  if ((__PERF_CONTENDED > 0)); then
+    echo "  PERF: $label adjusted median ${__PERF_GATED_MEDIAN}ms (contention in ${__PERF_CONTENDED}/${__PERF_RUNS} samples)"
+  fi
+}
+
 echo "=== sley: performance budget policy ==="
+
+policy_rc=0
+_perf_sample --test-policy || policy_rc=$?
+_assert_exit "perf calibration: both probes must show contention and adjustment stays capped" 0 "$policy_rc"
+
+slow_sample_dir=$(_tmpdir)
+slow_sample=$(_perf_sample 1 5 "$slow_sample_dir/output" "$slow_sample_dir/rc" \
+  "$(command -v sleep)" 0.2)
+read -r slow_wall slow_gated _ <<<"$slow_sample"
+_assert_file_content "perf calibration: deliberately slow command completes" 0 "$slow_sample_dir/rc"
+if ((slow_gated > 60 && slow_gated <= slow_wall)); then
+  _pass "perf calibration: real command delay still breaches the median budget"
+else
+  _fail "perf calibration: real command delay still breaches the median budget"
+fi
 
 # Each call pins SLEY_PERF_BUDGET_MULTIPLIER to 1 so a slow host that sets it
 # still checks the platform policy exactly.
@@ -689,62 +808,18 @@ _run_perf_sley_timed 15 "$repo" verify --json
 _assert_exit "verify perf: large shared subtree discovery exits 0" 0 "$__SLEY_RC"
 _assert_contains "verify perf: discovers ancestor manifest command" "node app-test.js" "$__SLEY_OUT"
 _assert_contains "verify perf: discovers repo-root manifest command" "node root-test.js" "$__SLEY_OUT"
-_measure_perf_stats "verify perf: large shared subtree discovery" 15 "$repo" \
-  "$SLEY_PERF_RUNS" verify --json
-discovery_median="$__PERF_MEDIAN"
-discovery_max="$__PERF_MAX"
 discovery_median_budget=$(_perf_budget_ms \
   "$VERIFY_DISCOVERY_MEDIAN_BUDGET_MS" \
   "$VERIFY_DISCOVERY_DARWIN_MEDIAN_BUDGET_MS")
 discovery_max_budget=$(_perf_budget_ms \
   "$VERIFY_DISCOVERY_MAX_BUDGET_MS" \
   "$VERIFY_DISCOVERY_DARWIN_MAX_BUDGET_MS")
-discovery_report_runs="$SLEY_PERF_RUNS"
-
-# Hosted macOS runners can occasionally sustain contention across an entire
-# seven-sample batch. Confirm only that narrow case: a command failure or a
-# coarse-maximum breach remains immediately fatal, while a median-only breach
-# gets two fresh batches on the same already-warm fixture. The median of three
-# batch medians lets one transient slow batch be outvoted while two slow batches
-# remain a failure. The maximum still covers all 21 observed samples.
-if _should_confirm_perf \
-  "$(_perf_platform)" \
-  "$discovery_median" \
-  "$discovery_max" \
-  "$discovery_median_budget" \
-  "$discovery_max_budget"; then
-  discovery_initial_median="$discovery_median"
-  discovery_initial_max="$discovery_max"
-  discovery_initial_durations="$repo/.sley-perf-durations.initial"
-  cp "$repo/.sley-perf-durations" "$discovery_initial_durations"
-  discovery_confirmation_files=()
-
-  echo "  PERF: verify discovery median-only breach; collecting two confirmation batches"
-  for discovery_confirmation_batch in 1 2; do
-    _measure_perf_stats "verify perf: large shared subtree confirmation" 15 \
-      "$repo" "$SLEY_PERF_RUNS" verify --json
-    discovery_confirmation_file="$repo/.sley-perf-durations.confirmation-$discovery_confirmation_batch"
-    cp "$repo/.sley-perf-durations" "$discovery_confirmation_file"
-    discovery_confirmation_files+=("$discovery_confirmation_file")
-    echo "  PERF: verify discovery confirmation ${discovery_confirmation_batch} median ${__PERF_MEDIAN}ms, maximum ${__PERF_MAX}ms"
-  done
-
-  _combine_perf_batches \
-    "$SLEY_PERF_RUNS" \
-    "$repo/.sley-perf-durations.combined" \
-    "$discovery_initial_durations" \
-    "${discovery_confirmation_files[@]}"
-  discovery_report_runs="$__PERF_RUNS"
-  discovery_median="$__PERF_MEDIAN"
-  discovery_max="$__PERF_MAX"
-  echo "  PERF: verify discovery initial median ${discovery_initial_median}ms, maximum ${discovery_initial_max}ms; three-batch median ${discovery_median}ms, maximum across ${discovery_report_runs} samples ${discovery_max}ms"
-fi
-
-echo "  PERF: verify discovery median ${discovery_median}ms / ${discovery_median_budget}ms, maximum ${discovery_max}ms / ${discovery_max_budget}ms (files ${SLEY_PERF_CHANGED_FILES}, runs ${discovery_report_runs})"
+_measure_verify_perf "verify discovery" "$repo" "$discovery_median_budget" \
+  "$discovery_max_budget" verify --json
 _assert_ms_le "verify perf: large shared subtree discovery median" \
-  "$discovery_median" "$discovery_median_budget"
+  "$__PERF_GATED_MEDIAN" "$discovery_median_budget"
 _assert_ms_le "verify perf: large shared subtree discovery maximum" \
-  "$discovery_max" "$discovery_max_budget"
+  "$__PERF_MAX" "$discovery_max_budget"
 
 repo=$(_new_perf_repo)
 mkdir -p "$repo/.sley" "$repo/tests"
@@ -788,64 +863,20 @@ _assert_contains "verify perf: reports required command pass" '"status":"passed"
 _assert_file_content "verify perf: grouped required command runs once" "1" "$repo/tests/count"
 _assert_checkrun_invocations "verify perf: fixture-owned Checkrun initial run" \
   1 "$checkrun_state/expected-args" "$repo/.home"
-_measure_perf_stats "verify perf: large registry" 15 "$repo" \
-  "$SLEY_PERF_RUNS" verify --run-required --json
-registry_median="$__PERF_MEDIAN"
-registry_max="$__PERF_MAX"
 registry_median_budget=$(_perf_budget_ms \
   "$VERIFY_REQUIRED_REGISTRY_MEDIAN_BUDGET_MS" \
   "$VERIFY_REQUIRED_REGISTRY_DARWIN_MEDIAN_BUDGET_MS")
 registry_max_budget=$(_perf_budget_ms \
   "$VERIFY_REQUIRED_REGISTRY_MAX_BUDGET_MS" \
   "$VERIFY_REQUIRED_REGISTRY_DARWIN_MAX_BUDGET_MS")
-registry_report_runs="$SLEY_PERF_RUNS"
-
-# Same contention policy as the discovery path above: hosted macOS runners can
-# occasionally sustain contention across an entire seven-sample batch. A
-# median-only breach on Darwin gets two confirmation batches on the same
-# already-warm fixture; the median of three batch medians lets one transient
-# slow batch be outvoted while two slow batches remain a failure. The maximum
-# still covers every observed sample.
-if _should_confirm_perf \
-  "$(_perf_platform)" \
-  "$registry_median" \
-  "$registry_max" \
-  "$registry_median_budget" \
-  "$registry_max_budget"; then
-  registry_initial_median="$registry_median"
-  registry_initial_max="$registry_max"
-  registry_initial_durations="$repo/.sley-perf-durations.initial"
-  cp "$repo/.sley-perf-durations" "$registry_initial_durations"
-  registry_confirmation_files=()
-
-  echo "  PERF: verify registry median-only breach; collecting two confirmation batches"
-  for registry_confirmation_batch in 1 2; do
-    _measure_perf_stats "verify perf: large registry confirmation" 15 \
-      "$repo" "$SLEY_PERF_RUNS" verify --run-required --json
-    registry_confirmation_file="$repo/.sley-perf-durations.confirmation-$registry_confirmation_batch"
-    cp "$repo/.sley-perf-durations" "$registry_confirmation_file"
-    registry_confirmation_files+=("$registry_confirmation_file")
-    echo "  PERF: verify registry confirmation ${registry_confirmation_batch} median ${__PERF_MEDIAN}ms, maximum ${__PERF_MAX}ms"
-  done
-
-  _combine_perf_batches \
-    "$SLEY_PERF_RUNS" \
-    "$repo/.sley-perf-durations.combined" \
-    "$registry_initial_durations" \
-    "${registry_confirmation_files[@]}"
-  registry_report_runs="$__PERF_RUNS"
-  registry_median="$__PERF_MEDIAN"
-  registry_max="$__PERF_MAX"
-  echo "  PERF: verify registry initial median ${registry_initial_median}ms, maximum ${registry_initial_max}ms; three-batch median ${registry_median}ms, maximum across ${registry_report_runs} samples ${registry_max}ms"
-fi
-
-echo "  PERF: verify required registry median ${registry_median}ms / ${registry_median_budget}ms, maximum ${registry_max}ms / ${registry_max_budget}ms (files ${SLEY_PERF_CHANGED_FILES}, runs ${registry_report_runs})"
+_measure_verify_perf "verify required registry" "$repo" "$registry_median_budget" \
+  "$registry_max_budget" verify --run-required --json
 _assert_ms_le "verify perf: large registry median" \
-  "$registry_median" "$registry_median_budget"
+  "$__PERF_GATED_MEDIAN" "$registry_median_budget"
 _assert_ms_le "verify perf: large registry maximum" \
-  "$registry_max" "$registry_max_budget"
+  "$__PERF_MAX" "$registry_max_budget"
 _assert_checkrun_invocations "verify perf: fixture-owned Checkrun measured runs" \
-  "$((registry_report_runs + 1))" "$checkrun_state/expected-args" "$repo/.home"
+  "$((__PERF_RUNS + 1))" "$checkrun_state/expected-args" "$repo/.home"
 
 echo "=== sley: hook performance ==="
 
