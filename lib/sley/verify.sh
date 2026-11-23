@@ -8,7 +8,7 @@
 
 # Project manifest filenames that map to suggested verify commands. The case in
 # _sley_project_manifest_commands owns the per-manifest command vocabulary; this
-# is the single list the ancestor-walk and repo-root scans iterate.
+# is the list shared by changed-file, ancestor, and repo-root discovery.
 _SLEY_MANIFEST_NAMES=(
   package.json pyproject.toml Cargo.toml go.mod
   Makefile makefile justfile Justfile BUCK TARGETS
@@ -84,10 +84,9 @@ _sley_make_like_commands() {
 }
 
 _sley_project_manifest_commands() {
-  local source="$1" context="${2:-manifest}" base dir_q
+  local source="$1" context="${2:-manifest}" dir suffix
   [[ -f "$source" ]] || return 0
-  base=$(basename "$source")
-  case "$base" in
+  case "${source##*/}" in
     package.json)
       _sley_package_json_commands "$source" "$context"
       ;;
@@ -112,8 +111,15 @@ _sley_project_manifest_commands() {
       _sley_make_like_commands "$source" just "$context"
       ;;
     BUCK | TARGETS)
-      dir_q=$(_sley_shell_quote "$(dirname "$source")")
-      _sley_manifest_command "buck2 test ${dir_q}:..." "$source" test "$context"
+      dir=$(dirname -- "$source") || return
+      suffix=:...
+      if [[ "$dir" == -* ]]; then
+        # Shell quoting preserves a leading dash, so use a cell-qualified
+        # recursive target that Buck2 will accept as a target argument.
+        dir="//$dir"
+        suffix=/...
+      fi
+      _sley_manifest_command "buck2 test $(_sley_shell_quote "$dir")$suffix" "$source" test "$context"
       ;;
   esac
 }
@@ -1493,7 +1499,7 @@ _sley_verify() {
     fi
     return 0
   fi
-  local files commands="" file dir source
+  local files commands="" file file_base dir source
   files=$(_sley_selected_files) || return 2
   if [[ -z "$files" ]]; then
     [[ "$_SLEY_SCOPE_JSON" == "1" ]] && echo '{"commands":[]}' || echo "sley verify: no matching changed files"
@@ -1508,9 +1514,14 @@ _sley_verify() {
   declare -A _seen_dirs
   while IFS= read -r file; do
     [[ -n "$file" ]] || continue
-    # A changed file may itself be a manifest with workflow commands; nearby
-    # manifest discovery below handles broader project-local test/build hints.
-    commands+=$(_sley_project_manifest_commands "$file" changed-file)$'\n'
+    # Check the name before starting the command substitution. Large diffs
+    # can contain hundreds of ordinary files with nothing to parse here.
+    file_base="${file##*/}"
+    for source in "${_SLEY_MANIFEST_NAMES[@]}"; do
+      [[ "$file_base" == "$source" ]] || continue
+      commands+=$(_sley_project_manifest_commands "$file" changed-file)$'\n'
+      break
+    done
     # Parameter-expansion `dirname` — `${file%/*}` when there's a slash, else
     # ".". Saves a fork per file (a 100-file change set walking 5 levels deep
     # otherwise spawns ~600 `dirname` subprocesses).

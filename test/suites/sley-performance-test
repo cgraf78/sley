@@ -804,10 +804,22 @@ cat >"$repo/packages/app/package.json" <<'EOF'
 EOF
 _write_changed_tree "$repo" "$SLEY_PERF_CHANGED_FILES"
 
-_run_perf_sley_timed 15 "$repo" verify --json
+# Observe process launches separately from the timed samples below.
+basename_probe=$(_mock_bin)
+basename_log="$basename_probe/invoked"
+cat >"$basename_probe/basename" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$@" >>"$SLEY_PERF_BASENAME_LOG"
+PATH="$SLEY_PERF_BASENAME_PATH" exec basename "$@"
+EOF
+chmod +x "$basename_probe/basename"
+basename_path="$PATH"
+SLEY_PERF_BASENAME_LOG="$basename_log" SLEY_PERF_BASENAME_PATH="$basename_path" \
+  PATH="$basename_probe:$PATH" _run_perf_sley_timed 15 "$repo" verify --json
 _assert_exit "verify perf: large shared subtree discovery exits 0" 0 "$__SLEY_RC"
 _assert_contains "verify perf: discovers ancestor manifest command" "node app-test.js" "$__SLEY_OUT"
 _assert_contains "verify perf: discovers repo-root manifest command" "node root-test.js" "$__SLEY_OUT"
+_assert_file_missing "verify perf: manifest discovery avoids external basename" "$basename_log"
 discovery_median_budget=$(_perf_budget_ms \
   "$VERIFY_DISCOVERY_MEDIAN_BUDGET_MS" \
   "$VERIFY_DISCOVERY_DARWIN_MEDIAN_BUDGET_MS")
@@ -820,6 +832,26 @@ _assert_ms_le "verify perf: large shared subtree discovery median" \
   "$__PERF_GATED_MEDIAN" "$discovery_median_budget"
 _assert_ms_le "verify perf: large shared subtree discovery maximum" \
   "$__PERF_MAX" "$discovery_max_budget"
+
+printf '\n' >>"$repo/packages/app/package.json"
+_run_perf_sley_timed 15 "$repo" verify --json
+_assert_exit "verify: changed manifest discovery exits 0" 0 "$__SLEY_RC"
+_assert_contains "verify: labels changed manifest source" \
+  '"source":"packages/app/package.json","context":"changed-file"' "$__SLEY_OUT"
+
+mkdir -p "$repo/-option"
+printf '# fixture\n' >"$repo/-option/BUCK"
+git -C "$repo" add -- -option/BUCK
+git -C "$repo" commit -qm "seed dash-prefixed manifest"
+printf '# changed\n' >>"$repo/-option/BUCK"
+_run_perf_sley_timed 15 "$repo" verify --json
+_assert_exit "verify: dash-prefixed BUCK discovery exits 0" 0 "$__SLEY_RC"
+_assert_contains "verify: Buck2 pattern cannot be parsed as an option" \
+  "buck2 test '//-option'/..." "$__SLEY_OUT"
+_assert_contains "verify: dash-prefixed source is preserved" \
+  '"source":"-option/BUCK","context":"changed-file"' "$__SLEY_OUT"
+_assert_not_contains "verify: dash-prefixed manifest emits no dirname diagnostic" \
+  'dirname:' "$__SLEY_OUT"
 
 repo=$(_new_perf_repo)
 mkdir -p "$repo/.sley" "$repo/tests"
