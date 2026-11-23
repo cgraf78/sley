@@ -12,18 +12,36 @@ SLEY_REPO_ROOT="$(cd -- "$SLEY_TEST_DIR/.." && pwd -P)"
 
 echo "=== sley: manpages ==="
 
-while IFS= read -r command; do
-  page="$SLEY_REPO_ROOT/man/man1/$command.1"
-  _assert_file_exists "manpage exists: $command" "$page"
-  content=$(cat "$page")
-  _assert_contains "manpage NAME section: $command" ".SH NAME" "$content"
-  _assert_contains "manpage names command: $command" "$command \\" "$content"
-done < <(
-  git -C "$SLEY_REPO_ROOT" ls-files -- 'bin/*' |
-    xargs -n 1 basename |
-    sort
-)
+_check_command_pages() {
+  local inventory path command page content
+  inventory=$(_tmpdir) || return
+  inventory="$inventory/commands"
+  git -C "$SLEY_REPO_ROOT" ls-files -z -- 'bin/*' >"$inventory" || return
+  [[ -s "$inventory" ]] || return 1
+  while IFS= read -r -d '' path; do
+    command=${path##*/}
+    page="$SLEY_REPO_ROOT/man/man1/$command.1"
+    _assert_file_exists "manpage exists: $command" "$page"
+    content=$(cat "$page")
+    _assert_contains "manpage NAME section: $command" ".SH NAME" "$content"
+    _assert_contains "manpage names command: $command" "$command \\" "$content"
+  done <"$inventory"
+}
 
+_check_command_pages || _fail "manpage inventory: cannot enumerate tracked commands"
+probe_status=0
+probe_output=$(
+  # shellcheck disable=SC2329 # Used by _check_command_pages below.
+  git() {
+    printf '%s\0' bin/sley
+    return 17
+  }
+  _check_command_pages
+) || probe_status=$?
+_assert_exit "manpage inventory: propagates a failed Git listing" 17 "$probe_status"
+_assert_eq "manpage inventory: does not check partial Git output" "" "$probe_output"
+
+content=$(cat "$SLEY_REPO_ROOT/man/man1/sley.1")
 _assert_contains "manpage documents verify bridge" "Checkrun verify bridge" "$content"
 
 readme_content=$(cat "$SLEY_REPO_ROOT/README.md")
