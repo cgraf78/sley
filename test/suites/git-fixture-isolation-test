@@ -9,6 +9,19 @@ test_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 
 _mock_home
 export GIT_CONFIG_NOSYSTEM=1
+
+fixture_colon_tmp=$(_tmpdir)/has:colon
+mkdir "$fixture_colon_tmp"
+fixture_status=0
+# The child shell expands its own positional parameter.
+# shellcheck disable=SC2016
+fixture_output=$(TMPDIR="$fixture_colon_tmp" "$BASH" -c '
+  . "$1"
+  printf "fixture setup continued\n"
+' bash "$test_dir/helpers.sh" 2>&1) || fixture_status=$?
+_assert_exit "isolation: rejects a temporary root that cannot be used in PATH" 1 "$fixture_status"
+_assert_contains "isolation: explains how to select a usable TMPDIR" \
+  'TMPDIR must not contain a colon' "$fixture_output"
 export GIT_ALLOW_PROTOCOL=file
 
 outside=$(_tmpdir)
