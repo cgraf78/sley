@@ -1139,38 +1139,25 @@ _sley_verify_explain_cache_lookup() {
 }
 
 _sley_verify_run_required() {
-  # Thin trap-discipline wrapper around the real implementation.
-  #
-  # Two problems would exist if the signal traps were installed directly in
-  # the impl function:
-  #   1. The trap is set on the caller's shell (the function is not a
-  #      subshell), so it persists after the function returns. Callers /
-  #      tests that rely on default INT/TERM/HUP behavior would be quietly
-  #      mutated for the rest of the session.
-  #   2. A handler without `exit` swallows Ctrl-C and lets the loop march on
-  #      to the next required command — user-hostile and gives the appearance
-  #      that Ctrl-C is broken.
-  #
-  # The wrapper captures the caller's prior trap state for each signal,
-  # delegates to the impl (which installs its own traps with `exit` codes
-  # matching the standard 128+signum convention), and restores the prior
-  # traps on every normal return path. The signal path bypasses the
-  # restore (we `exit` directly), which is the right thing for an
-  # interactive CLI but means signal-during-test cases will terminate the
-  # test shell — documented tradeoff.
-  local _saved_int _saved_term _saved_hup _rc
-  _saved_int=$(trap -p INT)
-  _saved_term=$(trap -p TERM)
-  _saved_hup=$(trap -p HUP)
-  _sley_verify_run_required_impl "$@"
-  _rc=$?
-  # `trap -p SIG` prints the literal command to reinstate the trap (e.g.
-  # `trap -- 'cmd' SIG`); when no prior trap was set it prints nothing, so
-  # we fall back to `trap - SIG` (reset to default).
-  eval "${_saved_int:-trap - INT}"
-  eval "${_saved_term:-trap - TERM}"
-  eval "${_saved_hup:-trap - HUP}"
-  return "$_rc"
+  # Ready already provides a private phase and its guardian. A standalone
+  # invocation needs the same ownership, with traps restored in the caller.
+  if [[ "${_sley_verify_guarded_identity[1]:-}" == "$BASHPID" ]]; then
+    # An extension can call verification and then keep working in the phase.
+    # The payload's temporary traps must remain within this subshell.
+    (_sley_verify_run_required_impl "$@")
+  else
+    _sley_ensure_ready
+    _sley_ready_supervise verify _sley_ready_supervised_command \
+      "required verification" _sley_verify_run_required_impl "$@"
+  fi
+}
+
+_sley_verify_cancel_required() {
+  # This trap runs in the managed payload. Leave the caller alive and keep
+  # later signals from interrupting the token-checked cache lock release.
+  trap '' INT TERM HUP
+  _sley_verify_cache_lock_drop
+  exit "$1"
 }
 
 # Emit a cached-pass result for the current command: log it, bump the cached
@@ -1210,18 +1197,9 @@ _sley_verify_run_required_impl() {
   # stale reclaim in `_sley_verify_cache_lock_reclaim` is the defensive
   # backstop for the SIGKILL / power-loss case where the trap cannot fire.
   #
-  # Each handler clears the trap first (so a signal during cleanup doesn't
-  # recurse), releases `$lock_dir` only if it still carries this run's
-  # `$lock_token` (a no-op when empty, while still waiting on another
-  # owner's lock, or after a successor re-acquired the path), then exits
-  # with the conventional `128 + signum` code so the caller sees a real
-  # signal-style exit rather than a swallowed Ctrl-C.
-  # The wrapper above restores the caller's prior trap state on normal
-  # return; signal exits bypass that restore, which is correct for an
-  # interactive sley CLI (the shell is terminating anyway).
-  trap 'trap - INT TERM HUP; _sley_verify_cache_lock_release "$lock_dir" "$lock_token"; exit 130' INT
-  trap 'trap - INT TERM HUP; _sley_verify_cache_lock_release "$lock_dir" "$lock_token"; exit 143' TERM
-  trap 'trap - INT TERM HUP; _sley_verify_cache_lock_release "$lock_dir" "$lock_token"; exit 129' HUP
+  trap '_sley_verify_cancel_required 130' INT
+  trap '_sley_verify_cancel_required 143' TERM
+  trap '_sley_verify_cancel_required 129' HUP
 
   command -v jq >/dev/null 2>&1 || {
     echo "sley verify: jq is required to run required verification commands" >&2

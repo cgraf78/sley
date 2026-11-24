@@ -96,7 +96,7 @@ EOF
 }
 
 _sley_ready_supervision_error() {
-  printf 'sley ready: cannot supervise %s: %s\n' "$1" "$2" >&2
+  printf 'sley %s: cannot supervise %s: %s\n' "${_sley_ready_supervision_command:-ready}" "$1" "$2" >&2
 }
 
 _sley_ready_register_owned_process() {
@@ -219,9 +219,24 @@ _sley_ready_worker_fallback_cancel() {
 }
 
 _sley_ready() {
-  # `ready` is part of the sourceable API, so temporary signal handlers must
-  # not replace traps owned by the calling shell after this invocation ends.
-  local _arg _saved_int _saved_term _saved_hup _rc _worker_rc
+  local arg
+  for arg in "$@"; do
+    case "$arg" in
+      -h | --help | help)
+        _sley_ready_usage
+        return 0
+        ;;
+    esac
+  done
+  _sley_ready_supervise ready _sley_ready_impl "$@"
+}
+
+_sley_ready_supervise() {
+  # Both operations are sourceable. Restore the caller's signal traps after
+  # the worker finishes and after the supervisor handles cancellation.
+  local _sley_ready_supervision_command="$1" worker="$2"
+  shift 2
+  local _saved_int _saved_term _saved_hup _rc _worker_rc
   local _sley_ready_pid="" _sley_ready_signal_status=0 _sley_ready_signal_name=""
   local _sley_ready_delivery_signal=""
   local _sley_ready_root_identity="" _sley_ready_root_record=""
@@ -232,15 +247,6 @@ _sley_ready() {
   local _sley_ready_worker_dead="" _sley_ready_gate_attempt
   local _sley_ready_startup_failed=0 _sley_ready_startup_error=""
   local _sley_ready_registered_cleanup_done=0
-  for _arg in "$@"; do
-    case "$_arg" in
-      -h | --help | help)
-        _sley_ready_usage
-        return 0
-        ;;
-    esac
-  done
-
   _saved_int=$(trap -p INT)
   _saved_term=$(trap -p TERM)
   _saved_hup=$(trap -p HUP)
@@ -293,7 +299,7 @@ _sley_ready() {
       done
       [[ -f "$_sley_ready_worker_gate" && ! -e "$_sley_ready_worker_abort" ]] || exit 2
       [[ "$(<"$_sley_ready_worker_gate")" == "$_sley_ready_worker_gate_token" ]] || exit 2
-      _sley_ready_impl "$@" </dev/tty
+      "$worker" "$@" </dev/tty
     )
     _sley_ready_pid=$!
   else
@@ -317,7 +323,7 @@ _sley_ready() {
       done
       [[ -f "$_sley_ready_worker_gate" && ! -e "$_sley_ready_worker_abort" ]] || exit 2
       [[ "$(<"$_sley_ready_worker_gate")" == "$_sley_ready_worker_gate_token" ]] || exit 2
-      _sley_ready_impl "$@"
+      "$worker" "$@"
     ) <&0 &
     _sley_ready_pid=$!
     [[ "$_sley_ready_had_monitor" == "1" ]] && set -m
@@ -1198,6 +1204,9 @@ _sley_ready_cleanup_background_jobs() {
 
 _sley_ready_run_guarded_command() {
   local command_rc
+  # Sourced verification can reuse this guardian's group. A nonzero array
+  # index keeps inherited environment strings from impersonating the proof.
+  local -a _sley_verify_guarded_identity=([1]="$BASHPID")
   if "$@"; then
     command_rc=0
   else
@@ -1330,6 +1339,7 @@ _sley_ready_guardian() {
 }
 
 _sley_ready_run_owned() {
+  local description="${_sley_ready_owned_description:-formatter}"
   local child_rc started_pid started_identity started_group child_control child_run
   local child_had_monitor=0
   local _sley_ready_owned_record=""
@@ -1345,7 +1355,7 @@ _sley_ready_run_owned() {
     _sley_ready_abort_launch "$started_pid" "$child_control"
     _sley_ready_finish_child_launch
     _sley_ready_supervision_failure="process identity is unavailable"
-    _sley_ready_supervision_error formatter "$_sley_ready_supervision_failure"
+    _sley_ready_supervision_error "$description" "$_sley_ready_supervision_failure"
     return 2
   fi
   if ! started_group=$(_sley_ready_process_group "$started_pid") ||
@@ -1353,7 +1363,7 @@ _sley_ready_run_owned() {
     _sley_ready_abort_launch "$started_pid" "$child_control"
     _sley_ready_finish_child_launch
     _sley_ready_supervision_failure="dedicated process group is unavailable"
-    _sley_ready_supervision_error formatter "$_sley_ready_supervision_failure"
+    _sley_ready_supervision_error "$description" "$_sley_ready_supervision_failure"
     return 2
   fi
   active_child_pid=$started_pid
@@ -1367,7 +1377,7 @@ _sley_ready_run_owned() {
     active_child_group=""
     _sley_ready_finish_child_launch
     _sley_ready_supervision_failure="ownership record could not be published"
-    _sley_ready_supervision_error formatter "$_sley_ready_supervision_failure"
+    _sley_ready_supervision_error "$description" "$_sley_ready_supervision_failure"
     return 2
   fi
   active_child_record=$_sley_ready_owned_record
@@ -1380,7 +1390,7 @@ _sley_ready_run_owned() {
     active_child_record=""
     _sley_ready_finish_child_launch
     _sley_ready_supervision_failure="launch gate could not be published"
-    _sley_ready_supervision_error formatter "$_sley_ready_supervision_failure"
+    _sley_ready_supervision_error "$description" "$_sley_ready_supervision_failure"
     return 2
   }
   _sley_ready_finish_child_launch
@@ -1396,6 +1406,22 @@ _sley_ready_run_owned() {
   active_child_record=""
   rm -rf -- "$child_control"
   return "$child_rc"
+}
+
+_sley_ready_supervised_command() {
+  # A standalone operation uses the same ownership journal and cleanup as a
+  # single active command in ready, without any concurrent phase workers.
+  local _sley_ready_owned_description="$1"
+  shift
+  local active_child_pid="" active_child_identity="" active_child_group="" active_child_record=""
+  local _sley_ready_launching_child=0 _sley_ready_pending_status=0 _sley_ready_deferred_signals=0
+  local _sley_ready_cleanup_active=0 _sley_ready_cleanup_done=0
+  local -a phase_pids=() phase_identities=() phase_groups=() phase_record_files=()
+  local -a phase_control_dirs=() phase_stdout_files=() phase_stderr_files=()
+  trap '_sley_ready_cancel_impl 130' INT
+  trap '_sley_ready_cancel_impl 143' TERM
+  trap '_sley_ready_cancel_impl 129' HUP
+  _sley_ready_run_owned "$@"
 }
 
 _sley_ready_cancel_impl() {
