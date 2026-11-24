@@ -948,6 +948,16 @@ _sley_verify_cache_parse_lookup() {
 #     unless its creator was killed there; the grace period recovers that.
 _SLEY_VERIFY_CACHE_LOCK_GRACE_SECONDS=60
 
+_sley_verify_cache_lock_mkdir() {
+  # Ubuntu ships GNU mkdir alongside uutils, whose mkdir can report success
+  # after losing the directory creation race.
+  if type -P gnumkdir >/dev/null 2>&1; then
+    command gnumkdir "$1"
+  else
+    mkdir "$1"
+  fi
+}
+
 # Acquire the cache lock for `receipt`, polling for up to ~5s. On success,
 # set the caller's `lock_dir` and `lock_token` (dynamic scope) and return 0;
 # otherwise leave both empty and return 1 so the caller runs unlocked.
@@ -976,7 +986,7 @@ _sley_verify_cache_lock_acquire() {
     "${BASHPID:-$$}" "${HOSTNAME:-$(uname -n 2>/dev/null)}" "$started" "$token"
   lock_dir="$target" lock_token="$token"
   while [[ "$attempts" -lt 50 ]]; do
-    if mkdir "$target" 2>/dev/null; then
+    if _sley_verify_cache_lock_mkdir "$target" 2>/dev/null; then
       printf '%s' "$meta" >"$target/owner.meta" 2>/dev/null && return 0
       # Without metadata neither the trap nor other waiters could tell whose
       # lock this is; drop it and run unlocked instead. Nobody reclaims a
@@ -1085,7 +1095,7 @@ _sley_verify_cache_lock_reclaim() {
   local owner_pid owner_host owner_token
   # Pre-check without the mutex so waiting on a live lock never touches it.
   _sley_verify_cache_lock_is_stale "$lock_path" || return 0
-  if ! mkdir "$mutex" 2>/dev/null; then
+  if ! _sley_verify_cache_lock_mkdir "$mutex" 2>/dev/null; then
     # A reclaimer killed inside this short critical section leaks the
     # mutex; past the grace period treat it as abandoned too.
     if _sley_verify_cache_lock_expired "$mutex"; then
