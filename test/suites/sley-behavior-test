@@ -5939,6 +5939,47 @@ _verify_lock_token() {
   awk -F= '$1=="token" {print $2; exit}' "$1/owner.meta" 2>/dev/null
 }
 
+echo "=== sley: verify cache lock rejects false-success mkdir collisions ==="
+
+# Ubuntu's plain mkdir can report success after losing a creation race.
+# Provide that result deterministically, beside a working GNU mkdir shim.
+verify_mkdir_bin=$(_mock_bin)
+verify_real_mkdir=$(type -P mkdir)
+cat >"$verify_mkdir_bin/mkdir" <<'EOF'
+#!/usr/bin/env bash
+if [[ $# -eq 1 && -d "$1" ]]; then exit 0; fi
+exec "$TEST_REAL_MKDIR" "$@"
+EOF
+cat >"$verify_mkdir_bin/gnumkdir" <<'EOF'
+#!/usr/bin/env bash
+exec "$TEST_REAL_MKDIR" "$@"
+EOF
+chmod +x "$verify_mkdir_bin/mkdir" "$verify_mkdir_bin/gnumkdir"
+
+mkdir "$verify_expected_lock_dir"
+printf 'pid=%s\nhost=%s\nstarted=0\ntoken=live\n' "$$" "${HOSTNAME:-$(uname -n)}" \
+  >"$verify_expected_lock_dir/owner.meta"
+verify_mkdir_rc=0
+PATH="$verify_mkdir_bin:$PATH" TEST_REAL_MKDIR="$verify_real_mkdir" _verify_lock_script <<'EOF' || verify_mkdir_rc=$?
+# Skip the polling delay while the fixture's live holder remains active.
+sleep() { :; }
+_sley_verify_cache_lock_acquire "$VERIFY_RECEIPT"
+EOF
+_assert_eq "verify lock: a false-success mkdir cannot take a live lock" 1 "$verify_mkdir_rc"
+_assert_eq "verify lock: false-success mkdir preserves the live owner" live "$(_verify_lock_token "$verify_expected_lock_dir")"
+
+mkdir "$verify_expected_lock_dir.reclaim"
+printf 'pid=999999999\nhost=%s\nstarted=0\ntoken=stale\n' "${HOSTNAME:-$(uname -n)}" \
+  >"$verify_expected_lock_dir/owner.meta"
+PATH="$verify_mkdir_bin:$PATH" TEST_REAL_MKDIR="$verify_real_mkdir" _verify_lock_script <<'EOF'
+_sley_verify_cache_lock_reclaim "$VERIFY_LOCK_DIR"
+EOF
+_assert_eq "verify lock: a false-success mkdir cannot take the reclaim mutex" stale "$(_verify_lock_token "$verify_expected_lock_dir")"
+if [[ ! -d "$verify_expected_lock_dir.reclaim" ]]; then
+  _fail "verify lock: false-success mkdir removed the reclaim holder's mutex"
+fi
+rm -rf "$verify_expected_lock_dir" "$verify_expected_lock_dir.reclaim"
+
 echo "=== sley: verify cache lock is acquired in the calling process ==="
 
 # The run-required loop's signal trap releases `lock_dir`. When the lock was
@@ -5947,7 +5988,7 @@ echo "=== sley: verify cache lock is acquired in the calling process ==="
 # token that proves ownership) in the caller's own shell.
 rm -rf "$verify_expected_lock_dir"
 lock_proc_out=$(
-  _verify_lock_script <<'EOF'
+  PATH="$verify_mkdir_bin:$PATH" TEST_REAL_MKDIR="$verify_real_mkdir" _verify_lock_script <<'EOF'
 _sley_verify_cache_lock_acquire "$VERIFY_RECEIPT" >/dev/null || exit 9
 printf 'dir=%s\ntoken=%s\npid=%s\n' "$lock_dir" "${lock_token:-}" "$$"
 EOF
