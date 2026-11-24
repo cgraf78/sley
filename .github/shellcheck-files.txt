@@ -38,6 +38,7 @@ program	test/suites/sley-behavior-test
 program	test/suites/sley-performance-test
 program	test/suites/timeout-test
 program	test/suites/vcs-producer-errors-test
+program	test/suites/verify-cancellation-test
 program	test/suites/vscode-vocab-sync-test
 program	test/suites/vscode-test
 program	test/suites/xdg-paths-test

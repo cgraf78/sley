@@ -1,0 +1,238 @@
+#!/usr/bin/env bash
+# Check standalone, sourced, and ready-owned verification cancellation.
+
+set -uo pipefail
+
+test_dir=$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
+# shellcheck disable=SC1091
+# shellcheck source=test/helpers.sh
+. "$test_dir/helpers.sh"
+
+_mock_home
+fixture=$(_tmpdir)
+
+if python3 - "$test_dir/.." "$fixture" "$BASH" <<'PY'
+import json
+import os
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+from shlex import quote
+
+sley_root, fixture, bash = map(Path, sys.argv[1:])
+sley_root = sley_root.resolve()
+repo = fixture / "repo"
+for directory in (repo / "src", repo / "tests", repo / ".sley"):
+    directory.mkdir(parents=True)
+(repo / "src/input.txt").write_text("initial\n")
+hold = repo / "tests/hold.py"
+hold.write_text("""#!/usr/bin/env python3
+import os
+import signal
+import subprocess
+import sys
+from pathlib import Path
+
+root = Path(os.environ["SLEY_VERIFY_CANCEL_FIXTURE"])
+def cancel(signum, _frame):
+    (root / "delivered").write_text(str(signum))
+for signum in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+    signal.signal(signum, cancel)
+child = subprocess.Popen([sys.executable, "-c", '''
+import signal
+import sys
+from pathlib import Path
+def cancel(signum, _frame):
+    Path(sys.argv[1]).with_name("child-delivered").write_text(str(signum))
+    sys.exit(128 + signum)
+for signum in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+    signal.signal(signum, cancel)
+Path(sys.argv[1]).touch()
+signal.pause()
+''', str(root / "child-ready")])
+(root / "pids.tmp").write_text(f"{os.getpid()} {child.pid}\\n")
+(root / "pids.tmp").rename(root / "pids")
+sys.exit(child.wait())
+""")
+hold.chmod(0o700)
+(repo / ".sley/verify.json").write_text(json.dumps({"rules": [{
+    "paths": ["src/**"],
+    "commands": [
+        {"cmd": "./tests/hold.py", "required": True, "cache": {"enabled": True}},
+        {"cmd": 'touch "$SLEY_VERIFY_CANCEL_FIXTURE/unexpected"', "required": True},
+    ],
+}]}))
+for args in (["init", "-q", "--template="], ["add", "."], [
+    "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+    "-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null", "commit", "-qm", "fixture",
+]):
+    subprocess.run(["git", *args], cwd=repo, check=True)
+(repo / "src/input.txt").write_text("changed\n")
+
+
+def until(predicate, description):
+    deadline = time.monotonic() + 8
+    while time.monotonic() < deadline:
+        if predicate():
+            return
+        time.sleep(0.01)
+    raise AssertionError(f"timed out waiting for {description}")
+
+
+def exists(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+def kill_group(group):
+    try:
+        os.killpg(group, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+
+
+def check(label, argv, signum, *, path=None):
+    root = fixture / label
+    root.mkdir()
+    cache = root / "cache"
+    tmp = root / "tmp"
+    tmp.mkdir()
+    env = {
+        **os.environ,
+        "PATH": path or os.environ["PATH"],
+        "XDG_CONFIG_HOME": str(root / "config"),
+        "XDG_CACHE_HOME": str(root / "xdg-cache"),
+        "XDG_DATA_HOME": str(root / "data"),
+        "XDG_STATE_HOME": str(root / "state"),
+        "XDG_RUNTIME_DIR": str(root / "runtime"),
+        "SLEY_VERIFY_CANCEL_FIXTURE": str(root),
+        "SLEY_VERIFY_CACHE_DIR": str(cache),
+        "TMPDIR": str(tmp),
+    }
+    proc = subprocess.Popen(
+        argv, cwd=repo / "src", env=env, start_new_session=True,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+    pids = ()
+    group = None
+    try:
+        until(lambda: (root / "pids").exists() and (root / "child-ready").exists(),
+              f"{label} verifier and child")
+        pids = tuple(map(int, (root / "pids").read_text().split()))
+        group = os.getpgid(pids[0])
+        assert list(cache.rglob("owner.meta")), f"{label} did not acquire a cache lock"
+        proc.send_signal(signum)
+        stdout, stderr = proc.communicate(timeout=5)
+        assert proc.returncode == 128 + signum, (label, proc.returncode, stdout, stderr)
+        until(lambda: not any(map(exists, pids)), f"{label} reaping")
+        assert not list(cache.rglob("*.lock")), (label, "held cache lock")
+        assert not (root / "unexpected").exists(), (label, "ran a later command")
+        assert not list(tmp.glob("sley-ready-supervisor.*")), (label, "supervisor temp leak")
+        assert (root / "delivered").exists() or (root / "child-delivered").exists(), (
+            label, "required command tree got no graceful signal"
+        )
+        if label == "sourced":
+            assert (root / "caller-returned").read_text() == str(128 + signum)
+            assert not (root / "caller-trap").exists()
+    finally:
+        if proc.poll() is None or any(map(exists, pids)):
+            for owned_group in {proc.pid, group} - {None}:
+                kill_group(owned_group)
+            proc.wait(timeout=3)
+        proc.stdout.close()
+        proc.stderr.close()
+
+
+cli = sley_root / "bin/sley"
+check("cli", [cli, "verify", "--run-required"], signal.SIGTERM)
+check("ambient-phase-marker", [bash, "-c", r'''
+export _sley_verify_managed=1 _sley_verify_guarded_identity=$$
+exec "$@"
+''', "_", cli, "verify", "--run-required"], signal.SIGTERM)
+check("json-hup", [cli, "verify", "--run-required", "--json"], signal.SIGHUP)
+check("sourced", [bash, "-c", r'''
+source "$1"
+trap 'touch "$SLEY_VERIFY_CANCEL_FIXTURE/caller-trap"' INT TERM HUP
+options_before=$-
+start=$PWD
+traps_before=$(trap -p INT TERM HUP)
+status=0
+sley_verify --run-required || status=$?
+[[ "$PWD" == "$start" && "$-" == "$options_before" ]] || exit 11
+[[ "$(trap -p INT TERM HUP)" == "$traps_before" ]] || exit 12
+printf '%s' "$status" >"$SLEY_VERIFY_CANCEL_FIXTURE/caller-returned"
+exit "$status"
+''', "_", sley_root / "lib/sley/sley.sh"], signal.SIGINT)
+check("ready", [cli, "ready", "--exclude", "check", "--exclude", "secrets", "--exclude", "status"],
+      signal.SIGTERM)
+
+checkrun_root = os.environ.get("SLEY_TEST_CHECKRUN_ROOT")
+if checkrun_root:
+    checkrun = Path(checkrun_root) / "bin/checkrun"
+    assert checkrun.is_file(), "the requested Checkrun checkout has no CLI"
+    mock_bin = fixture / "bin"
+    mock_bin.mkdir()
+    (mock_bin / "govulncheck").symlink_to(hold)
+    (repo / "go.mod").write_text("module example.invalid/cancel\ngo 1.23\n")
+    (repo / ".sley/verify.json").write_text(json.dumps({"rules": [{
+        "paths": ["src/**"],
+        "commands": [{
+            "cmd": f'{quote(str(checkrun))} verify --tool govulncheck .',
+            "required": True,
+            "cache": {"enabled": True},
+        }],
+    }]}))
+    path = str(mock_bin) + os.pathsep + os.environ["PATH"]
+    check("checkrun-verify", [cli, "verify", "--run-required"], signal.SIGTERM, path=path)
+    check("checkrun-ready", [cli, "ready", "--exclude", "check", "--exclude", "secrets",
+                             "--exclude", "status"], signal.SIGTERM, path=path)
+
+# A formatter extension has the same group ownership as a readiness phase.
+# Nested verification must stay in that group and restore the caller's trap.
+same_group = repo / "tests/same-group.py"
+same_group.write_text("""#!/usr/bin/env python3
+import os
+assert os.getpgrp() == int(os.environ["SLEY_VERIFY_EXPECTED_PGID"])
+""")
+same_group.chmod(0o700)
+(repo / ".sley/verify.json").write_text(json.dumps({"rules": [{
+    "paths": ["src/**"],
+    "commands": [{"cmd": "./tests/same-group.py", "required": True}],
+}]}))
+formatter_config = fixture / "formatter-config"
+formatter_extensions = formatter_config / "sley/extensions.d"
+formatter_extensions.mkdir(parents=True)
+(formatter_extensions / "50-verify.sh").write_text(r'''
+sley_hook_format() {
+  local before
+  trap 'exit 87' TERM
+  before=$(trap -p TERM)
+  SLEY_VERIFY_EXPECTED_PGID=$(_sley_ready_process_group "$BASHPID") || return 2
+  export SLEY_VERIFY_EXPECTED_PGID
+  sley_verify --run-required || return 2
+  [[ "$(trap -p TERM)" == "$before" ]] || return 2
+  : >"$SLEY_VERIFY_FORMATTER_DONE"
+}
+''')
+formatter_done = fixture / "formatter-done"
+result = subprocess.run(
+    [cli, "ready", "--fix", "--exclude", "check", "--exclude", "secrets", "--exclude", "verify"],
+    cwd=repo,
+    env={**os.environ, "XDG_CONFIG_HOME": str(formatter_config),
+         "SLEY_VERIFY_FORMATTER_DONE": str(formatter_done)},
+    capture_output=True, text=True, timeout=8,
+)
+assert result.returncode == 0 and formatter_done.is_file(), (result.returncode, result.stderr)
+PY
+then
+  _pass "verify: cancellation reaps the required command, releases its lock, and returns"
+else
+  _fail "verify: cancellation reaps the required command, releases its lock, and returns"
+fi
+
+_test_summary

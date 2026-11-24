@@ -44,6 +44,8 @@ as the first argument, scan that commit message file instead of changed files.
 .B verify
 Discover and run broader local verification commands from manifests, verify
 registries, Sley extensions, and the built-in Checkrun verify bridge.
+Cancellation stops the active required command and returns 128 plus the
+signal number. A sourced invocation returns control to its caller.
 .TP
 .B ready
 Run the aggregate pre-submit readiness report. With
