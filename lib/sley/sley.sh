@@ -396,10 +396,16 @@ _sley_changes() {
     # which is wasted O(repo) work — millions of paths in a monorepo just to
     # answer "is this changed file tracked?".
     if [[ "$_SLEY_SCOPE_INCLUDE_UNTRACKED" == "1" ]]; then
-      case "$_REPO_TYPE" in
-        git) untracked_set=$(git ls-files --others --exclude-standard 2>/dev/null) ;;
-        sl) untracked_set=$(_repo_sl_machine status --no-status -u 2>/dev/null) ;;
-      esac
+      untracked_set=$(
+        case "$_REPO_TYPE" in
+          # Selection has already warned about any unsupported pathnames.
+          git) _repo_git_untracked_names 2>/dev/null ;;
+          sl) _repo_sl_machine status --no-status -u 2>/dev/null ;;
+        esac
+      ) || {
+        _sley_die "could not read $_REPO_TYPE untracked files"
+        return 2
+      }
     fi
     files_json=$(_sley_json_files "$files" "$untracked_set") || return $?
     printf '{"repo_type":"%s","root":"%s","scope":"%s","files":%s}\n' \
@@ -411,7 +417,7 @@ _sley_changes() {
 }
 
 _sley_dirty_counts() {
-  local staged=0 unstaged=0 untracked=0 pending=0 line
+  local staged=0 unstaged=0 untracked=0 pending=0 line status_lines
   # `SLEY_SKIP_UNTRACKED=1` disables the untracked-file walk in both repo
   # types. This is mainly for bare Git worktrees rooted at large directories:
   # `git status --untracked-files=all` can walk every file under that tree
@@ -421,8 +427,9 @@ _sley_dirty_counts() {
   [[ "$skip_untracked" == "1" ]] && untracked_flag="no"
   case "$_REPO_TYPE" in
     git)
-      # Long-form `--untracked-files=...` reads more clearly than `-u...` and
-      # protects against a future short-flag change.
+      # Capture the status before counting so a failed query cannot look like
+      # a clean worktree or publish counts from a partial response.
+      status_lines=$(git status --porcelain --untracked-files="$untracked_flag" 2>/dev/null) || return 2
       while IFS= read -r line; do
         [[ -n "$line" ]] || continue
         if [[ "${line:0:2}" == "??" ]]; then
@@ -431,16 +438,18 @@ _sley_dirty_counts() {
         fi
         [[ "${line:0:1}" != " " ]] && staged=$((staged + 1))
         [[ "${line:1:1}" != " " ]] && unstaged=$((unstaged + 1))
-      done < <(git status --porcelain --untracked-files="$untracked_flag" 2>/dev/null)
+      done <<<"$status_lines"
       ;;
     sl)
       # `pending` for the dirty signal counts only worktree changes — including
       # the active draft commit's files would conflate "is the worktree dirty?"
       # with "is there unsubmitted work?". Keep the `untracked` count separate
       # because Sapling supports it directly via `sl status -u`.
-      pending=$(_sley_count_file_list "$(_repo_sl_changed_names pending 0 2>/dev/null)")
+      status_lines=$(_repo_sl_changed_names pending 0 2>/dev/null) || return 2
+      pending=$(_sley_count_file_list "$status_lines")
       if [[ "$skip_untracked" != "1" ]]; then
-        untracked=$(_sley_count_file_list "$(_repo_sl_machine status --no-status -u 2>/dev/null)")
+        status_lines=$(_repo_sl_machine status --no-status -u 2>/dev/null) || return 2
+        untracked=$(_sley_count_file_list "$status_lines")
       fi
       ;;
   esac
@@ -509,7 +518,10 @@ _sley_status() {
       fi
       ;;
   esac
-  _sley_dirty_counts || return $?
+  _sley_dirty_counts || {
+    _sley_die "could not read $_REPO_TYPE worktree status"
+    return 2
+  }
   # Dirty state is derived from the numeric counts before display JSON is
   # rendered, so changing the JSON field order cannot change control flow.
   dirty=$(_sley_dirty_from_counts \

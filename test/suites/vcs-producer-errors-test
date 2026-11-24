@@ -1,0 +1,179 @@
+#!/usr/bin/env bash
+# Exercise partial VCS output and producer failures through the public CLI.
+
+set -euo pipefail
+
+test_dir=$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
+# Checkrun checks individual files without following sourced fixtures.
+# shellcheck disable=SC1091
+# shellcheck source=test/helpers.sh
+. "$test_dir/helpers.sh"
+
+_mock_home
+export XDG_CONFIG_HOME="$HOME/config" XDG_CACHE_HOME="$HOME/cache"
+export XDG_STATE_HOME="$HOME/state" XDG_DATA_HOME="$HOME/data" XDG_RUNTIME_DIR="$HOME/runtime"
+mkdir -m 700 "$XDG_RUNTIME_DIR"
+export GIT_ALLOW_PROTOCOL=file
+
+sley="$test_dir/../bin/sley"
+repo=$(_tmpdir)
+mock_bin=$(_mock_bin)
+stdout="$HOME/stdout"
+stderr="$HOME/stderr"
+SLEY_TEST_REAL_GIT=$(command -v git)
+export SLEY_TEST_REAL_GIT SLEY_TEST_GIT_PATH="$PATH"
+export SLEY_TEST_UNTRACKED_MARKER="$HOME/untracked-read"
+
+git -C "$repo" init --quiet --initial-branch=main --template=''
+git -C "$repo" config user.name Fixture
+git -C "$repo" config user.email fixture@example.invalid
+git -C "$repo" config commit.gpgsign false
+git -C "$repo" commit --quiet --allow-empty -m baseline
+git -C "$repo" branch upstream
+git -C "$repo" branch --set-upstream-to=upstream main >/dev/null
+printf 'committed\n' >"$repo/committed.txt"
+git -C "$repo" add committed.txt
+git -C "$repo" commit --quiet -m changed
+printf 'staged\n' >"$repo/staged.txt"
+git -C "$repo" add staged.txt
+printf 'untracked\n' >"$repo/untracked.txt"
+printf 'quoted untracked\n' >"$repo/quote\".txt"
+
+cat >"$mock_bin/git" <<'MOCK'
+#!/usr/bin/env bash
+# Emit the same bytes the real producer would supply, then fail the query.
+# An installed Git launcher may resolve its payload again using PATH.
+export PATH="$SLEY_TEST_GIT_PATH"
+case "$SLEY_TEST_FAILED_QUERY:$*" in
+  git-status-empty:'status --porcelain '*) exit 17 ;;
+  upstream-ref:'rev-parse --verify --quiet @{upstream}' | head-ref:'rev-parse --verify --quiet HEAD')
+    exit 128
+    ;;
+  untracked-metadata:ls-files*' --others --exclude-standard')
+    "$SLEY_TEST_REAL_GIT" "$@" || exit "$?"
+    [[ ! -e "$SLEY_TEST_UNTRACKED_MARKER" ]] || exit 17
+    : >"$SLEY_TEST_UNTRACKED_MARKER"
+    exit 0
+    ;;
+  staged:'diff -z --cached '* | upstream:'diff -z --name-only --diff-filter=ACMDR '*...HEAD | \
+    git-status:'status --porcelain '*)
+    "$SLEY_TEST_REAL_GIT" "$@" || exit "$?"
+    exit 17
+    ;;
+esac
+exec "$SLEY_TEST_REAL_GIT" "$@"
+MOCK
+
+export SLEY_TEST_SL_REPO
+SLEY_TEST_SL_REPO=$(_tmpdir)
+mkdir "$SLEY_TEST_SL_REPO/.sl"
+cat >"$mock_bin/sl" <<'MOCK'
+#!/usr/bin/env bash
+args=$*
+case "${args% --config ui.color=never}" in
+  root) printf '%s\n' "$SLEY_TEST_SL_REPO" ;;
+  'log -r . -T {phase}')
+    [[ "$SLEY_TEST_FAILED_QUERY" != sl-phase ]] || exit 17
+    printf 'draft'
+    ;;
+  'log -r . -T {activebookmark}') printf 'work' ;;
+  'log -r sort(draft() & ::., topo) -T '*) printf 'parent\ntip\n' ;;
+  'status --change parent '*) printf 'parent.txt\n' ;;
+  'status --change tip '*)
+    printf 'tip.txt\n'
+    [[ "$SLEY_TEST_FAILED_QUERY" != sl-draft ]]
+    ;;
+  'status --no-status -a -m')
+    printf 'pending.txt\n'
+    [[ "$SLEY_TEST_FAILED_QUERY" != sl-pending ]]
+    ;;
+  'status --no-status -u')
+    printf 'untracked.txt\n'
+    [[ "$SLEY_TEST_FAILED_QUERY" != sl-untracked ]]
+    ;;
+  *) exit 99 ;;
+esac
+MOCK
+chmod +x "$mock_bin/git" "$mock_bin/sl"
+
+sl_files=$(
+  cd "$SLEY_TEST_SL_REPO"
+  PATH="$mock_bin:$PATH" SLEY_TEST_FAILED_QUERY='' "$sley" changes
+)
+_assert_eq "changes: healthy Sapling draft stack and pending output" \
+  $'parent.txt\ntip.txt\npending.txt' "$sl_files"
+
+run_sley_fixture() {
+  local failure=$1 repo_dir=$2
+  shift 2
+  (
+    cd "$repo_dir" || exit 1
+    PATH="$mock_bin:$PATH" SLEY_TEST_FAILED_QUERY="$failure" "$sley" "$@"
+  ) >"$stdout" 2>"$stderr"
+}
+
+assert_vcs_error() {
+  local failure=$1 repo_dir=$2 command=$3 status=0
+  shift 3
+  run_sley_fixture "$failure" "$repo_dir" "$command" "$@" || status=$?
+  _assert_exit "$command: $failure query failure exits 2" 2 "$status"
+  _assert_eq "$command: $failure query failure emits no result" "" "$(<"$stdout")"
+  _assert_contains "$command: $failure query failure reports an error" \
+    'could not read' "$(<"$stderr")"
+}
+
+assert_vcs_error staged "$repo" changes
+assert_vcs_error staged "$repo" ready --json --exclude check --exclude secrets --exclude verify
+assert_vcs_error upstream "$repo" changes --json
+assert_vcs_error upstream-ref "$repo" changes
+assert_vcs_error head-ref "$repo" changes
+assert_vcs_error git-status "$repo" status --json
+assert_vcs_error git-status-empty "$repo" status --json
+assert_vcs_error untracked-metadata "$repo" changes --json --include-untracked
+assert_vcs_error sl-phase "$SLEY_TEST_SL_REPO" changes
+assert_vcs_error sl-draft "$SLEY_TEST_SL_REPO" changes
+assert_vcs_error sl-pending "$SLEY_TEST_SL_REPO" status --json
+assert_vcs_error sl-untracked "$SLEY_TEST_SL_REPO" status --json
+
+status=0
+run_sley_fixture git-status-empty "$repo" ready --json --exclude check --exclude secrets --exclude verify ||
+  status=$?
+_assert_exit "ready: an unreadable status phase exits 2" 2 "$status"
+_assert_contains "ready: an unreadable status phase reports an error" \
+  '"name":"status","status":"error","exit_code":2' "$(<"$stdout")"
+
+run_sley_fixture '' "$repo" changes --json --include-untracked
+if command -v jq >/dev/null 2>&1; then
+  quoted_path_check=(jq -e 'any(.files[]; .path == "quote\".txt" and .tracked == false)')
+else
+  quoted_path_check=(python3 -c '
+import json
+import sys
+with open(sys.argv[1]) as output:
+    files = json.load(output)["files"]
+sys.exit(not any(entry["path"] == "quote\".txt" and entry["tracked"] is False for entry in files))
+')
+fi
+if "${quoted_path_check[@]}" "$stdout" >/dev/null; then
+  _pass "changes: a quoted Git pathname is classified as untracked"
+else
+  _fail "changes: a quoted Git pathname is classified as untracked"
+fi
+
+# An unrelated upstream (merge-base status 1) retains local changes. Pointing
+# that same ref to a missing object is a Git failure even if local diffs work.
+tree=$(git -C "$repo" rev-parse 'upstream^{tree}')
+unrelated=$(git -C "$repo" commit-tree "$tree" -m unrelated)
+git -C "$repo" update-ref refs/heads/upstream "$unrelated"
+run_sley_fixture '' "$repo" changes
+_assert_eq "changes: a disjoint upstream retains staged changes" staged.txt "$(<"$stdout")"
+
+git_dir=$(git -C "$repo" rev-parse --absolute-git-dir)
+rm -- "$git_dir/objects/${unrelated:0:2}/${unrelated:2}"
+assert_vcs_error missing-upstream-object "$repo" changes
+
+git -C "$repo" branch --unset-upstream
+run_sley_fixture '' "$repo" changes
+_assert_eq "changes: a branch without an upstream retains staged changes" staged.txt "$(<"$stdout")"
+
+_test_summary

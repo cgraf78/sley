@@ -147,7 +147,10 @@ _sley_selected_files_for_filters() {
     cat "$_SLEY_SELECTED_FILES_CACHE_FILE"
     return 0
   fi
-  files=$(_repo_changed_names "$_SLEY_SCOPE_CHANGE" "$_SLEY_SCOPE_INCLUDE_UNTRACKED") || return 2
+  files=$(_repo_changed_names "$_SLEY_SCOPE_CHANGE" "$_SLEY_SCOPE_INCLUDE_UNTRACKED") || {
+    _sley_die "could not read $_REPO_TYPE changed files"
+    return 2
+  }
   # All commands compose from this changed-file stream so mutating operations
   # cannot accidentally rediscover unrelated files by walking a massive repo.
   printf '%s\n' "$files" |
