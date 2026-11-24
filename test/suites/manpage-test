@@ -16,7 +16,8 @@ _check_command_pages() {
   local inventory path command page content
   inventory=$(_tmpdir) || return
   inventory="$inventory/commands"
-  git -C "$SLEY_REPO_ROOT" ls-files -z -- 'bin/*' >"$inventory" || return
+  GIT_TEST_ASSUME_DIFFERENT_OWNER=1 \
+    _test_checkout_files "$SLEY_REPO_ROOT" 'bin/*' >"$inventory" || return
   [[ -s "$inventory" ]] || return 1
   while IFS= read -r -d '' path; do
     command=${path##*/}
@@ -31,7 +32,7 @@ _check_command_pages() {
 _check_command_pages || _fail "manpage inventory: cannot enumerate tracked commands"
 probe_status=0
 probe_output=$(
-  # shellcheck disable=SC2329 # Used by _check_command_pages below.
+  # shellcheck disable=SC2329 # Called by _test_checkout_files.
   git() {
     printf '%s\0' bin/sley
     return 17
