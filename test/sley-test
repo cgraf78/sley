@@ -47,7 +47,8 @@ check_runtime_shell_inventory() {
       inventory=$(mktemp) || return
     fi
     trap 'rm -f -- "$inventory"' EXIT
-    git -C "$root" -c "safe.directory=$root" ls-files -z -- bin lib share >"$inventory" || return
+    GIT_TEST_ASSUME_DIFFERENT_OWNER=1 \
+      _test_checkout_files "$root" bin lib share >"$inventory" || return
     while IFS= read -r -d '' file; do
       case "$file" in
         *.sh | *.sh.template)
@@ -88,9 +89,7 @@ check_runtime_shell_inventory() {
 
 inventory_status=0
 inventory_error=$(
-  # Container jobs can have a different uid from the source checkout.
-  export GIT_TEST_ASSUME_DIFFERENT_OWNER=1
-  # shellcheck disable=SC2329 # Used by check_runtime_shell_inventory below.
+  # shellcheck disable=SC2329 # Called by _test_checkout_files.
   git() {
     command git "$@" || return
     return 17
@@ -106,7 +105,7 @@ fi
 # One unusual pathname must not stand in for two intended entries.
 inventory_status=0
 inventory_error=$(
-  # shellcheck disable=SC2329 # Used by check_runtime_shell_inventory below.
+  # shellcheck disable=SC2329 # Called by _test_checkout_files.
   git() {
     printf '%s\0' $'lib/first.sh\nlib/second.sh'
   }
@@ -116,7 +115,7 @@ if [[ "$inventory_status" != 1 || "$inventory_error" != *'runtime shell inventor
   printf '%s\n' 'sley-test: runtime shell inventory did not preserve pathname boundaries' >&2
   exit 1
 fi
-GIT_TEST_ASSUME_DIFFERENT_OWNER=1 check_runtime_shell_inventory "${runtime_shell_files[@]}"
+check_runtime_shell_inventory "${runtime_shell_files[@]}"
 # Shared CI lints once in its dedicated job; local runs still lint by default.
 if [[ "${SLEY_SKIP_SHELLCHECK:-0}" != 1 ]]; then
   shellcheck -x -P SCRIPTDIR \

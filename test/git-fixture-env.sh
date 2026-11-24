@@ -10,3 +10,11 @@ unset GIT_CONFIG GIT_CONFIG_COUNT GIT_CONFIG_PARAMETERS GIT_CONFIG_SYSTEM GIT_TE
 # Keep the caller's config files out of Git commands too. Fixtures that need
 # a writable global config can still opt in through _mock_home.
 export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
+
+# Container fixtures can have a different uid from the source checkout.
+# Trust that checkout for this read without importing caller Git config.
+_test_checkout_files() {
+  local checkout=$1
+  shift
+  git -C "$checkout" -c "safe.directory=$checkout" ls-files -z -- "$@"
+}
