@@ -399,15 +399,14 @@ _repo_git_changed_names() {
       ) || return 2
       ;;
     changed)
-      # `set -o pipefail` inside the subshell so a failing `git diff` propagates
-      # through the `awk` dedup. Without this, an inaccessible repo or locked
-      # index would emit an empty list and the caller would silently report
-      # "no matching changed files" — a fail-open quality gate.
+      # Pipefail propagates failures through the path readers and dedup. Each
+      # producer must also stop the brace group on failure, since its exit
+      # status would otherwise come from only the last producer.
       (
         set -o pipefail
         {
-          _repo_git_unpushed_names ACMDR
-          git diff -z --cached --name-only --diff-filter=ACMDR 2>/dev/null | _repo_emit_safe_paths
+          _repo_git_unpushed_names ACMDR || return 2
+          git diff -z --cached --name-only --diff-filter=ACMDR 2>/dev/null | _repo_emit_safe_paths || return 2
           git diff -z --name-only --diff-filter=ACMDR 2>/dev/null | _repo_emit_safe_paths
         } | awk 'NF && !seen[$0]++'
       ) || return 2
@@ -418,26 +417,36 @@ _repo_git_changed_names() {
   esac
 
   if [[ "$include_untracked" == "1" ]]; then
-    (
-      set -o pipefail
-      git ls-files -z --others --exclude-standard 2>/dev/null | _repo_emit_safe_paths
-    ) || rc=2
+    _repo_git_untracked_names || rc=2
   fi
   return "$rc"
 }
 
+_repo_git_untracked_names() (
+  # Share one path encoding between selection and JSON tracked-state lookup.
+  set -o pipefail
+  git ls-files -z --others --exclude-standard 2>/dev/null | _repo_emit_safe_paths
+)
+
 _repo_git_upstream_base() {
   local upstream head base
-  upstream=$(git rev-parse --verify --quiet '@{upstream}') || return 1
-  head=$(git rev-parse --verify --quiet HEAD) || return 1
-  base=$(git merge-base "$upstream" "$head" 2>/dev/null) || return 1
+  upstream=$(git rev-parse --verify --quiet '@{upstream}') || return $?
+  head=$(git rev-parse --verify --quiet HEAD) || return $?
+  base=$(git merge-base "$upstream" "$head" 2>/dev/null) || return $?
   [[ "$base" != "$head" ]] || return 1
   printf '%s\n' "$base"
 }
 
 _repo_git_unpushed_names() {
   local diff_filter="$1" base
-  base=$(_repo_git_upstream_base) || return 0
+  base=$(_repo_git_upstream_base) || {
+    # Git uses status 1 for a missing ref or no common ancestor. A higher
+    # status can mean a corrupt object or failed query, so the scope is unknown.
+    case "$?" in
+      1) return 0 ;;
+      *) return 2 ;;
+    esac
+  }
   # See `_repo_emit_safe_paths` and the `staged` branch above for why we route
   # every changed-name source through the NUL-safe pipeline.
   (
@@ -468,7 +477,7 @@ _repo_sl_draft_stack_changed_names() {
 }
 
 _repo_sl_changed_names() {
-  local scope="$1" include_untracked="$2" rc=0
+  local scope="$1" include_untracked="$2" rc=0 phase
   # Pending/draft callers operate on existing-file content.
   local pending_flags=("-a" "-m")
   case "$scope" in
@@ -476,9 +485,8 @@ _repo_sl_changed_names() {
       _repo_sl_machine status --no-status "${pending_flags[@]}" 2>/dev/null || return 2
       ;;
     changed)
-      # `set -o pipefail` inside the subshell so a failing `sl status` cannot
-      # be masked by `awk`'s clean exit — see the matching guard in
-      # `_repo_git_changed_names` for the silent-fail-open hazard.
+      # As with Git, the earlier queries must succeed before the working-copy
+      # status can complete the stream.
       (
         set -o pipefail
         {
@@ -486,8 +494,9 @@ _repo_sl_changed_names() {
           # even when the working copy is clean. Include the full draft stack so
           # stacked diffs cannot reuse a cache key that only proved the active
           # commit.
-          if [[ "$(_repo_sl_current_phase)" == "draft" ]]; then
-            _repo_sl_draft_stack_changed_names "${pending_flags[@]}"
+          phase=$(_repo_sl_current_phase) || return 2
+          if [[ "$phase" == "draft" ]]; then
+            _repo_sl_draft_stack_changed_names "${pending_flags[@]}" || return 2
           fi
           _repo_sl_machine status --no-status "${pending_flags[@]}" 2>/dev/null
         } | awk 'NF && !seen[$0]++'
